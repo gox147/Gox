@@ -23,6 +23,7 @@
 - [项目状态](#项目状态)
 - [快速开始](#快速开始)
 - [首屏示例：单双栏自适应列表页](#首屏示例单双栏自适应列表页)
+- [折叠屏四场景（30 秒演示）](#折叠屏四场景30-秒演示)
 - [能力总览](#能力总览)
 - [语言与内置对象](#语言与内置对象)
 - [GUI 桌面应用](#gui-桌面应用)
@@ -260,6 +261,31 @@ render(
 2. **坐标单位是两套** —— `reservedRegions()` 的 x/y/width/height 是**设备像素**（折痕、挖孔），
    `safeAreaStyle()` 与脚本显式写的尺寸属性是 **dp**（内核每帧乘 `Display.Scale`）。
    折痕避让时不要把前者直接喂给布局属性，先除 `pixelRatio`。
+
+---
+
+## 折叠屏四场景（30 秒演示）
+
+![折叠屏适配四场景](docs/foldable-demo/foldable-30s.gif)
+
+一个窗口跑通四件事：**单双栏自适应 / 折痕与挖孔避让 / Tabletop 上下分屏 / 窗口跨物理屏**。
+可跑源码在 [`apps/foldable-demo`](apps/foldable-demo/README.md)，教程在
+[docs/foldable-adaptation.md](docs/foldable-adaptation.md)。
+
+上面这段 GIF **不是手绘示意图**：`gfx/foldable_showcase_test.go` 挂载真实应用、合成点击、
+抓真实帧再编码（`GOX_FOLDABLE_SHOTS=1 go test ./gfx -run TestFoldableShowcase`），
+每一帧的文案都由节点树断言把关 —— 状态不对就抓不到图，物料没法"美化"到偏离实际。
+
+| 场景 | 一句话 | 关键 API |
+|---|---|---|
+| **S1 单双栏自适应** | 列数只信宽度，不信姿态 | `panes(width)` / `widthClass()` / `useWindowInfo()` |
+| **S2 折痕 / 挖孔避让** | `avoidReserved` 是 opt-in，内核默认不动你的布局 | `useReservedRegions()` + `avoidReserved="all"` |
+| **S3 Tabletop** | 横折 = 上预览 + 下操作台，判据是组合态 | `posture === "half-open" && hinge.orientation === "horizontal"` |
+| **S4 跨屏拖拽** | 窗口换物理屏时能读到什么 | `screens()` / `screenOf()` / `onWindowDisplayChange()` |
+
+**Tabletop 不进 `posture` 枚举**，也不进 `layoutMode().suggested` —— 官方口径（2026-11-04 拍板）
+是应用层用 `(姿态, 折痕方向)` 组合判据，理由与责任划分见
+[`01-native-host-spec-草案.md` §4.1](01-native-host-spec-草案.md)。
 
 ---
 
@@ -679,6 +705,8 @@ go run ./packager app.js --gui --target linux/amd64    # 纯 Go 交叉编译，�
 | [docs/gui-patterns.md](docs/gui-patterns.md) | 用户态模式手册（路由、状态、主题等惯用法） |
 | [docs/gui-model-binding.md](docs/gui-model-binding.md) | `model` 双向绑定：接口设计、语义表、与 Vue 的对照、反例 |
 | [docs/foldable-adaptation.md](docs/foldable-adaptation.md) | 折叠屏适配教程：纯读数短路订阅的坑、折痕避让单位换算、三端验证范围 |
+| [01-native-host-spec-草案.md](01-native-host-spec-草案.md) | 原生宿主上报规范草案：字段与单位、**Tabletop 归属拍板**（§4.1）、各端上报注意、验收口径 |
+| [apps/foldable-demo](apps/foldable-demo/README.md) | 折叠屏四场景 demo 源码与 [30 秒演示物料](docs/foldable-demo/)（GIF 由测试真实抓帧生成） |
 | [docs/platform-config.md](docs/platform-config.md) | 多平台配置：gox.json 字段、权限清单、图标规范、`gox build` 各目标 |
 | [docs/desktop-distribution.md](docs/desktop-distribution.md) | 桌面应用分发：图标、签名、各平台打包格式 |
 | [docs/js-runtime-api-tutorial.md](docs/js-runtime-api-tutorial.md) | 运行时 API 教程：函数类型、回调桥、内存管理、新增 API 的流程 |

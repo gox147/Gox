@@ -758,6 +758,16 @@ func (n *GuiNode) wireReactiveChild(getter object.Value) {
 			object.PopWiringScope()
 			return object.UndefinedSingleton
 		}
+		// 拆树前把**旧子树占过的像素范围**标脏。
+		//
+		// 结构替换后旧节点不在树上了, diffRects 只能看到"新树里还在的节点"
+		// 的盒子变化 —— 旧子树比新子树宽/高出来的那部分没有任何节点认领，
+		// 于是永远留在帧缓冲里（切换场景/切单双栏时右侧残留一条旧卡片就是
+		// 这么来的）。与弹层收起必须整帧标脏是同一条理由，这里按旧子树的
+		// 包围盒精确标，不做整帧。
+		if r := subtreeBounds(slot); r.W > 0 && r.H > 0 {
+			markDirtyRectFor(slot, r)
+		}
 		// 先跑上一代的 onCleanup 再拆树: 清理回调可能还要读一眼即将销毁的
 		// 子树 (顺序反过来它看到的就是空树)。
 		runCleanups(slot)
@@ -786,6 +796,41 @@ func (n *GuiNode) wireReactiveChild(getter object.Value) {
 	if dispose != nil {
 		slot.effects = append(slot.effects, dispose)
 	}
+}
+
+// subtreeBounds 求子树里所有"有盒子"节点的包围盒 (拆树前的旧位置取证)。
+func subtreeBounds(n *GuiNode) Rect {
+	var out Rect
+	var walk func(*GuiNode)
+	walk = func(x *GuiNode) {
+		if x.Box.W > 0 && x.Box.H > 0 {
+			if out.W == 0 && out.H == 0 {
+				out = x.Box
+			} else {
+				x0, y0 := minInt(out.X, x.Box.X), minInt(out.Y, x.Box.Y)
+				x1 := maxInt(out.X+out.W, x.Box.X+x.Box.W)
+				y1 := maxInt(out.Y+out.H, x.Box.Y+x.Box.H)
+				out = Rect{X: x0, Y: y0, W: x1 - x0, H: y1 - y0}
+			}
+		}
+		for _, c := range x.Children {
+			walk(c)
+		}
+	}
+	walk(n)
+	return out
+}
+
+// markDirtyRectFor 按节点归属把一块矩形标脏 (结构替换后旧区域的清理走它)。
+func markDirtyRectFor(n *GuiNode, r Rect) {
+	a := appOfNode(n)
+	if a == nil {
+		return
+	}
+	a.mu.Lock()
+	a.needDraw = true
+	a.extraDirty = append(a.extraDirty, r)
+	a.mu.Unlock()
 }
 
 // runCleanups 逆序执行并清空节点登记的 onCleanup 回调 (后注册的先执行,

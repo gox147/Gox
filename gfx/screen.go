@@ -278,6 +278,14 @@ func notifyEnvChanged() {
 			recordWarn("gx/screen onDisplayChange: 回调抛错: %v", err)
 		}
 	}
+	// 屏表变了 ⇒ 布局可能跟着变（折痕/保留区直接参与 avoidReserved 的可用区
+	// 计算），必须让**所有**窗口整帧重排。
+	//
+	// 少了这一步的表现：报告完姿态后，读数文案（订阅型）当场就变，但写了
+	// avoidReserved 的容器纹丝不动 —— 布局只在"某次红绘制恰好重排整棵树"时
+	// 才重算，于是避让要等到下一次 resize/切页才生效。这不是缓存问题，是
+	// "环境变化没有通知布局"。
+	markAllWindowsDirty()
 }
 
 // NotifyDisplaysChanged 让宿主/后端宣告"显示器环境变了" (插拔屏 / DPI 变化 /

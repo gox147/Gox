@@ -24,6 +24,7 @@
 - [Project status](#project-status)
 - [Quick start](#quick-start)
 - [Hero example: adaptive one/two-column list](#hero-example-adaptive-onetwo-column-list)
+- [Four foldable scenarios (30-second demo)](#four-foldable-scenarios-30-second-demo)
 - [Capability map](#capability-map)
 - [Language and built-ins](#language-and-built-ins)
 - [GUI desktop apps](#gui-desktop-apps)
@@ -275,6 +276,33 @@ render(
    (hinge, punch-hole cutouts), while `safeAreaStyle()` and explicitly written size attributes are in
    **dp** (the kernel multiplies by `Display.Scale` every frame). Don't feed the former straight into
    layout attributes when avoiding the hinge — divide by `pixelRatio` first.
+
+---
+
+## Four foldable scenarios (30-second demo)
+
+![Four foldable scenarios](docs/foldable-demo/foldable-30s.gif)
+
+One window covers four things: **one/two-column adaptation / hinge and cutout avoidance / Tabletop
+split / moving a window across physical displays**. Runnable source lives in
+[`apps/foldable-demo`](apps/foldable-demo/README.md), the tutorial in
+[docs/foldable-adaptation.md](docs/foldable-adaptation.md).
+
+That GIF is **not a mock-up**: `gfx/foldable_showcase_test.go` mounts the real app, synthesizes clicks,
+captures real frames and encodes them (`GOX_FOLDABLE_SHOTS=1 go test ./gfx -run TestFoldableShowcase`).
+Every frame's text is asserted against the node tree — if the state is wrong, no frame gets captured, so
+the artwork cannot drift away from reality.
+
+| Scenario | In one line | Key API |
+|---|---|---|
+| **S1 one/two column** | Column count trusts width only, never posture | `panes(width)` / `widthClass()` / `useWindowInfo()` |
+| **S2 hinge / cutout avoidance** | `avoidReserved` is opt-in; the kernel never moves your layout by default | `useReservedRegions()` + `avoidReserved="all"` |
+| **S3 Tabletop** | Horizontal fold = preview on top, controls below; judged by a composite state | `posture === "half-open" && hinge.orientation === "horizontal"` |
+| **S4 cross-display** | What a script can observe when its window changes displays | `screens()` / `screenOf()` / `onWindowDisplayChange()` |
+
+**Tabletop does not enter the `posture` enum**, nor `layoutMode().suggested` — the official ruling
+(2026-11-04) is a composite `(posture, hinge orientation)` predicate at the application layer. Reasons and
+responsibility split: [`01-native-host-spec-草案.md` §4.1](01-native-host-spec-草案.md).
 
 ---
 
@@ -721,6 +749,8 @@ Full figures, how to run them and the pass/fail thresholds:
 | [docs/gui-patterns.md](docs/gui-patterns.md) | Userland patterns manual (routing, state, theming idioms) |
 | [docs/gui-model-binding.md](docs/gui-model-binding.md) | `model` two-way binding: interface design, semantics table, comparison with Vue, counter-examples |
 | [docs/foldable-adaptation.md](docs/foldable-adaptation.md) | Foldable adaptation tutorial: the pure-read short-circuit pitfall, hinge-avoidance unit conversion, three-platform verification scope |
+| [01-native-host-spec-草案.md](01-native-host-spec-草案.md) | Native host reporting spec draft: fields and units, **Tabletop ownership ruling** (§4.1), per-platform notes, acceptance criteria |
+| [apps/foldable-demo](apps/foldable-demo/README.md) | Foldable four-scenario demo source plus the [30-second demo assets](docs/foldable-demo/) (GIF generated from real captured frames) |
 | [docs/platform-config.md](docs/platform-config.md) | Multi-platform config: gox.json fields, permission list, icon specs, `gox build` targets |
 | [docs/desktop-distribution.md](docs/desktop-distribution.md) | Desktop distribution: icons, signing, per-platform packaging |
 | [docs/js-runtime-api-tutorial.md](docs/js-runtime-api-tutorial.md) | Runtime API tutorial: function types, callback bridge, memory management, how to add an API |

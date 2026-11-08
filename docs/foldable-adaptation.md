@@ -114,9 +114,23 @@ const body = () => {
 
 `foldable_demo.js` 的 Tabletop 档就是这么演示的（横折痕、上下分栏）。
 
-> 注：Tabletop 归 posture 枚举还是 layoutMode().suggested 还是 demo 层组合，是
-> 看板单 rc2XuQ 的待拍板项。在拍板前，上面这种「posture + 横折痕 division」的
-> demo 层组合写法是稳定可用的。
+**2026-11-04 拍板（看板单 rc2XuQ）：Tabletop 不进 posture 枚举，也不进
+`layoutMode().suggested`，就在应用层用组合判据。** 规格与理由见
+[`01-native-host-spec-草案.md` §4.1](../01-native-host-spec-草案.md)。
+
+```js
+// 唯一判据（纯函数，放在 lib 里可单测）
+export const isTabletop = (posture, hinge) =>
+  posture === "half-open" && !!hinge && hinge.orientation === "horizontal";
+```
+
+两条都要满足：只看 `posture === "half-open"` 会把所有竖折半开也判成 Tabletop；
+只看横折痕会把"平展横放"判进来。
+
+> ⚠️ **别用 `layoutMode().suggested === "tablet"` 判 Tabletop**。半折横屏时
+> `suggested` 仍然是 `"dual"`（两块可用区，建议分两块），`"tablet"` 的含义是
+> "宽档但没折" —— 两者正交。旧的 `apps/foldable-demo` 正是这么写错的，
+> 结果 Tabletop 那一档永远显示"当前不是 Tabletop"。
 
 ## 5. 权限与能力：拒绝与不支持都要能看
 
