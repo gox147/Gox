@@ -1,0 +1,108 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# GPU 呈现跑批：gfx/gpu 三轨核销 + 4K 呈现基准 + 像素级 A/B
+#
+# 为什么需要这个文件：G-1 核销时确认 CI 此前没有任何 -tags gpu 跑批 ——
+# gfx/gpu 的单元测试与像素级 A/B 只靠本地手跑，回归无人钉住。本工作流把
+# 它们搬进 CI，同时执行口径纪律：
+#
+#   - ubuntu-latest 没有 GPU 硬件，wgpu 轨只拿软件适配器 —— **兜底口径**：
+#     数字不进 bench-all.sh 的 nightly 闸门、不对外；它钉住的是
+#     「像素零退化」与「不比现状回退」两条回归线，不是性能数字。
+#   - 硬件数字的接入位：`hardware` job 用 self-hosted runner 标签
+#     [gpu-hardware] 占位，labels 不匹配时自动 skip，不阻塞 PR；
+#     有硬件 runner 挂上后本 job 无需改动即为可信口径。
+#
+# 与其它工作流的关系：与 ci.yml 互不阻塞（本工作流失败说明 GPU 回归，
+# 不拦普通提交；需要变闸门时靠分支保护把对应 job 设为 required）。
+# 产物：bench-results/present-4k-*.txt 上传 7 天，硬件接上后同位对齐。
+# ─────────────────────────────────────────────────────────────────────────────
+name: gpu-present
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "gfx/**"
+      - "cmd/gox/gpu_present_init.go"
+      - "scripts/bench-present-4k.sh"
+      - "scripts/gpu-track-audit.sh"
+      - ".github/workflows/gpu-present.yml"
+  pull_request:
+    paths:
+      - "gfx/**"
+      - "scripts/bench-present-4k.sh"
+      - ".github/workflows/gpu-present.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: gpu-present-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ── 无硬件兜底口径：单元测试 + 三轨核销 + 4K A/B 基准 + 像素级 A/B ──
+  no-hardware:
+    name: 兜底口径 (软件适配器, 不进闸门)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      # Xvfb: 4K 呈现基准需要 4K 虚拟屏（脚本内会自带 xvfb-run）
+      - name: 安装 Xvfb
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends xvfb
+
+      # 1) 单元测试（含像素级 A/B TestGPUPresentPixelExact，软件后端即可验零退化）
+      - name: go test -tags gpu ./gfx/gpu
+        run: go test -tags gpu ./gfx/gpu -v 2>&1 | tee gpu-test.txt
+
+      # 2) 三轨核销表：每条构建轨在这台 runner 上实际走的路径（可审计）
+      - name: scripts/gpu-track-audit.sh
+        run: ./scripts/gpu-track-audit.sh 2>&1 | tee gpu-track-audit.txt
+
+      # 3) 4K 呈现基准：CPU blit vs GPU 合成同口径对照。
+      #    显式声明兜底口径，防止数字被误读为硬件性能。
+      - name: bench-present-4k.sh (兜底口径)
+        run: |
+          ./scripts/bench-present-4k.sh 2>&1 | tee gpu-bench-full.txt
+          echo "::notice::以下 GPU 数字为无硬件兜底口径（wgpu-software），不进闸门、不对外"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: gpu-present-no-hardware
+          path: |
+            gpu-test.txt
+            gpu-track-audit.txt
+            gpu-bench-full.txt
+            bench-results/present-4k-*.txt
+          retention-days: 7
+
+  # ── 硬件可信口径：占位。self-hosted runner 打 [gpu-hardware] 标签即启用；
+  #    当前仓库没有这类 runner，job 恒 skip —— 不会因为缺 runner 而报红。
+  hardware:
+    name: 硬件口径 (可信, 进闸门候选)
+    runs-on: [self-hosted, gpu-hardware]
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: 三轨核销 + 4K 基准 (硬件)
+        run: |
+          ./scripts/gpu-track-audit.sh 2>&1 | tee gpu-track-audit-hw.txt
+          ./scripts/bench-present-4k.sh 2>&1 | tee gpu-bench-hw.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: gpu-present-hardware
+          path: |
+            gpu-track-audit-hw.txt
+            gpu-bench-hw.txt
+            bench-results/present-4k-*.txt
+          retention-days: 90

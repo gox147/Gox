@@ -9,7 +9,8 @@
 //
 //	构建                           含本包实现      cgo  交叉编译
 //	go build ./cmd/gox              nogpu 空实现     无    ✅ (默认, 现状不变)
-//	go build -tags gpu ./cmd/gox    wgpu 纯 Go       无    ✅ (Vulkan/DX12/Metal/GLES)
+//	go build -tags gpu ./cmd/gox    wgpu 纯 Go       无    ⚠️ (win/linux 可交叉;
+//	                                                     darwin 需本机 cgo, wasm 无 GPU 轨)
 //	go build -tags gpu_cgo ...      cgo 原生        有    ❌ (需目标平台工具链)
 //
 // 未启用任何 tag 时本包是**空壳**: New 恒失败, Available 恒 false, 不引入
@@ -33,7 +34,9 @@
 //
 //   - wgpu 轨: 纯 Go WebGPU (gogpu/wgpu), 自带 WGSL 着色器编译器,
 //     Vulkan / DX12 / Metal / GLES / Software 五后端, 无 GPU 硬件时退到
-//     Software 后端。体积 +5.89 MB (实测), 但交叉编译不丢。
+//     Software 后端。体积 +6.16 MB (29.06→35.21, 实测), windows/linux
+//     交叉编译不丢; darwin 目标因 goffi/purego fakecgo 符号冲突需本机
+//     cgo 工具链, js/wasm 无 GPU 轨 (见 scripts/gpu-track-audit.sh --xcompile)。
 //   - cgo 轨: import "C" 直调 GLES / Metal。驱动兼容出问题时切这条,
 //     代价是发版矩阵要从「1 台 Linux 交叉编译」改成「3 台 runner 各编各的」,
 //     且 Linux 上动态链 glibc。
