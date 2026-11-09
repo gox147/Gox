@@ -583,3 +583,133 @@ WeakSet 76%→93.9%（filter 口径）。
 - 自测陷阱：WeakMap.set 返回 this 后 `r instanceof WeakMap` 此前为 false ——
   与 §11.1.5 同根因，已修。
 - Map/Set 剩余失败集中在迭代器 helper 与构造器 iterable 形态（非本批范围）。
+
+---
+
+# 阶梯可达性表（C-2 / rAhhQ8，2026-11-09 夜批：基于最新基线重跑聚类）
+
+> 口径（现编现跑，commit 身份见下）：引擎 **8bc52e1**（nightly/c3-crash-cleanup-20261106
+> 头，即 C-3 批次收口后的失败面）；test262 快照 /tmp/test262（main tarball，
+> 2026-11-04 下载，与 C-0/C-3 基线同源——language 23832 / built-ins 23861 用例总数
+> 与基线逐位一致，快照身份由此钉住）。跑批 `-jobs` 默认 32、分片固定 128，
+> 与 §七 假设 4 相同。
+
+## 12.1 现编现跑三口径（与 2026-11-06 基线逐位对齐，零漂移）
+
+```bash
+go build -o /tmp/gox-bin ./cmd/gox && git rev-parse HEAD   # 8bc52e1e5179…
+gox test262 -root /tmp/test262 -suite language  -json /tmp/nr-language.json  -quiet
+gox test262 -root /tmp/test262 -suite built-ins -json /tmp/nr-builtins.json -quiet
+```
+
+| 套件 | 通过/总数 | 合规率 | vs 基线（2026-11-06） |
+|------|-----------|--------|----------------------|
+| language | 20570/23832 | 86.3125% | 逐位一致 |
+| built-ins | 17992/23861 | 75.4034% | 逐位一致 |
+| 全量 | 38562/47693 | 80.8546% | 逐位一致 |
+
+## 12.2 失败面刷新：从「大簇主导」到「扁平长尾」（对 2026-10-10 基线）
+
+C-3（harness 369 条登记 + crash 清扫）与前几批簇攻坚之后，失败面结构剧变：
+
+| 维度 | 2026-10-10（35.69% 基线） | 2026-11-09（75.40% 现值） |
+|------|--------------------------|--------------------------|
+| 失败总数 | 14951 | 5869 |
+| 簇总数（depth=3） | 522 | **438** |
+| Top 1 簇 | Array/prototype 1708（11.15%） | Array/prototype 256（**4.36%**） |
+| Top 10 占失败面 | 42.75% | 约 24% |
+| harness 依赖 | 369 | **0**（已全部登记） |
+| crash | 52 | **6** |
+| 假阳性退潮 | 20 | 8 |
+
+形态分布（之和 = 5869，判据同 §一）：语义偏差 4372（74.5%）｜功能零实现 1483
+（25.3%）｜假阳性退潮 8｜crash 6。**失败面已经没有"便宜的大块"了**：现在的
+Top 15 全部在 78–256 条区间，且 12/15 是语义偏差——从 75% 往上走，每 1pp
+都要逐方法对齐规范，没有整段搬运的机会（除了下面 Tier 表里点名的零实现簇）。
+
+Top 15 簇（`--top 15 --depth 3`，完整清单复现命令见 §12.5）：
+
+| # | 目录族 | 形态 | 簇规模 | 族基线 |
+|---|--------|------|-------:|--------|
+| 1 | built-ins/Array/prototype | 语义偏差 | 256 | 89.5% |
+| 2 | built-ins/String/prototype | 语义偏差 | 201 | 79.9% |
+| 3 | built-ins/RegExp/prototype | 语义偏差 | 155 | 58.7% |
+| 4 | built-ins/RegExp/property-escapes | 语义偏差 | 146 | 63.6% |
+| 5 | built-ins/Iterator/prototype | 语义偏差 | 129 | 75.5% |
+| 6 | built-ins/Object/defineProperty | 语义偏差 | 119 | 89.1% |
+| 7 | built-ins/TypedArrayConstructors/internals | 语义偏差 | 108 | 34.2% |
+| 8 | built-ins/Atomics/waitAsync | 功能零实现 | 100 | 0.0%（不做） |
+| 9 | built-ins/Temporal/ZonedDateTime | 语义偏差 | 99 | 89.0% |
+| 10 | built-ins/Object/defineProperties | 语义偏差 | 95 | 85.0% |
+| 11 | built-ins/TypedArray/prototype | 语义偏差 | 93 | 93.1% |
+| 12 | built-ins/AsyncDisposableStack/prototype | 功能零实现 | 91 | 0.0% |
+| 13 | built-ins/Object/prototype | 语义偏差 | 81 | 59.3% |
+| 14 | built-ins/DisposableStack/prototype | 功能零实现 | 80 | 0.0% |
+| 15 | built-ins/Temporal/Duration | 语义偏差 | 78 | 85.2% |
+
+## 12.3 阶梯可达性表（70 / 80 / 90 / 95%）
+
+**「不做」扣除**（2026-11-04 拍板：Intl / Atomics / SharedArrayBuffer / BigInt）：
+Atomics+SAB+BigInt 路径前缀命中 37 簇 485 条，Intl 关键字口径失败 10 条，
+合计 **495 条不计入可达池**。可达池 = 5869 − 495 = **5374 条 / 401 簇**；
+built-ins 可达天花板 = (17992+5374)/23861 = **97.93%**（95% 在池内，可达）。
+
+累计法：簇按规模降序整簇吃进（一簇一根因，不吃半簇），吃到失败数降穿阈值。
+
+| 档位 | 状态 | 允许失败 | 需吃掉 | 整簇数 | 其中零实现/语义 | 估时（人日） |
+|------|------|--------:|-------:|-------:|----------------|-------------:|
+| 70% | ✅ 已达成（2026-11-06 批次，75.40%） | 7158 | — | — | — | — |
+| 80% | **7 簇可达** | 4772 | ≥1097 | 7（1114 条） | 0 / 7 | **≈28** |
+| 90% | 53 簇 | 2386 | ≥3483 | 53（3491 条） | 10 / 43 | **≈98** |
+| 95% | 138 簇 | 1193 | ≥4676 | 138（4678 条） | 34 / 103 | **≈170** |
+
+80% 档的全部 7 簇（前 6 簇 1006 条 = 79.62%，差半步；第 7 簇整簇吃进后累计
+1114 条 = **80.07%**，跨过 80% 线）：
+
+| 簇 | 条数 | 族基线 | 估时 |
+|----|-----:|--------|-----:|
+| built-ins/Array/prototype | 256 | 89.5% | 6.4d |
+| built-ins/String/prototype | 201 | 79.9% | 5.0d |
+| built-ins/RegExp/prototype | 155 | 58.7% | 3.9d |
+| built-ins/RegExp/property-escapes | 146 | 63.6% | 3.6d |
+| built-ins/Iterator/prototype | 129 | 75.5% | 3.2d |
+| built-ins/Object/defineProperty | 119 | 89.1% | 3.0d |
+| built-ins/TypedArrayConstructors/internals | 108 | 34.2% | 2.7d |
+
+**估时模型（启发式，非承诺；改参数要连同本表一起改）**：语义偏差 40 条/人日
+（参考 §8 历史夜批实测：单夜 171–253 条含归因）；功能零实现每簇固定 2 人日
+设计 + 120 条/人日（整块补实现）；crash / 假阳性退潮每簇 0.5 人日。按此模型
+80% 档无零实现簇（纯语义，慢但真合规）；90% 档开始要吃 10 个零实现簇
+（DisposableStack 族、Atomics 之外的剩余能力块）；95% 档 34 个。
+
+**长尾（80% 之后的主要成本，验收 C-2 特别标注项）**：可达池 401 簇里
+**332 簇 < 20 条、合计 1524 条（占池 28.3%）**；其中 ≤5 条的微簇 235 个、
+530 条。这些簇的开单成本（归因+回归）远高于用例本身——到 90% 以后，
+"按簇开单"模式失效，应改按**根因横切**（同一错误消息全文检索跨目录聚簇）
+推进，或接受 90–95% 区间按 opportunity-driven（顺手修）而非计划驱动。
+
+## 12.4 给 C-4 第一批（2026-11-06~11-27 窗口）的选簇建议
+
+按本表，两周批次吃 **Top 3–4 簇（Array/prototype + String/prototype +
+RegExp/prototype ± property-escapes）≈ +612~758 条 ≈ +2.6~3.2pp**，批末
+built-ins 约 78.0–78.6%；第二批（12 月上旬）吃 Object/defineProperty +
+Iterator/prototype + TypedArrayConstructors/internals 即可触 80% 线并抬地板。
+
+## 12.5 复现命令
+
+```bash
+go build -o /tmp/gox-bin ./cmd/gox
+gox test262 -root /tmp/test262 -suite built-ins -json /tmp/nr-builtins.json -quiet
+python3 scripts/test262-cluster.py --results /tmp/nr-builtins.json --top 15
+python3 scripts/test262-cluster.py --results /tmp/nr-builtins.json --top 500 --json /tmp/nr-all.json
+# 阶梯累计与「不做」扣除的脚本化口径见本节表格生成逻辑（task rAhhQ8 评论留档）
+```
+
+## 12.6 遗留与假设
+
+1. 估时模型是本批新增的启发式，两个系数（40 条/人日、零实现 2d+120 条/日）
+   来自历史夜批均值，未经逐簇校准；仅用于排期量级判断。
+2. 「不做」的 Intl 10 条失败按关键字口径从可达池扣除；若未来 Intl 拍板翻案，
+   天花板从 97.93% 再上浮约 0.04pp（可忽略）。
+3. test262 快照为 tarball（非 git checkout），身份靠用例总数与基线逐位一致钉住；
+   下次升快照需整表重算。
