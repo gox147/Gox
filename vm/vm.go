@@ -187,6 +187,17 @@ type VM struct {
 	globalICVal     [256]object.Value
 	globalICFound   [256]bool
 
+	// globalThis 缓存 (T3-4 热点优化二): sloppy 裸调用 (fib(n-1) 这类无接收者
+	// 调用) 的 this 归一要取 globalThis，此前每次 normalizedThis 都走
+	// globals.Get("globalThis") 的字符串 map 查找 —— fib28 剖面里
+	// Environment.Get 14% CPU 全部来自这里（每次递归调用一次）。
+	// 失效判据与 globalIC 同源：globalThis 绑定值只能经 Environment 写方法
+	// 变更（全部带版本自增），版本不符即重查。缓存的是 Get 的原样返回值
+	// （含 Accessor），与直查行为逐字节一致 —— 纯 memo，不改任何语义。
+	globalThisCacheVer   uint64
+	globalThisCacheValid bool
+	globalThisCacheVal   object.Value
+
 	// fnCache 是 FunctionMetadata → CompiledFunction 的按 VM 复用缓存
 	// (T2-4 热点优化)。同一编译单元里每次执行到 OP_CLOSURE 都会新建一个
 	// 闭包, 但其 fn 部分 (指令/常量/位置表/参数元数据) 只取决于 metadata,

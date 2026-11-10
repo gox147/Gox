@@ -174,10 +174,26 @@ func (vm *VM) unwindFramesTo(startIdx int) {
 // 记下的流程教训（先找汇聚点，再改调用点）。
 
 func (vm *VM) globalThisValue() object.Value {
-	if g, ok := vm.globals.Get("globalThis"); ok {
-		return g
+	// T3-4 热点优化二: 版本化 memo。热路径（每次 sloppy 裸调用一次）从
+	// 字符串 map 查找降为一次整型比较。fib28 剖面: Environment.Get
+	// ("globalThis") 占 CPU ~14%，几乎全部由此调用链贡献。
+	// 裸 VM（globals 未装配）按注释意图回退 undefined（原实现直查会 panic）。
+	if vm.globals == nil {
+		return object.UndefinedSingleton
 	}
-	return object.UndefinedSingleton
+	if vm.globalThisCacheValid && vm.globalThisCacheVer == vm.globals.Version() {
+		return vm.globalThisCacheVal
+	}
+	var v object.Value
+	if g, ok := vm.globals.Get("globalThis"); ok {
+		v = g
+	} else {
+		v = object.UndefinedSingleton
+	}
+	vm.globalThisCacheVer = vm.globals.Version()
+	vm.globalThisCacheValid = true
+	vm.globalThisCacheVal = v
+	return v
 }
 
 // normalizedThis 实现 sloppy 模式的 this 归一: 非箭头函数被以 undefined/null
