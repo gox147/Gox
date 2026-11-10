@@ -66,7 +66,7 @@ flex 布局 + JSX + 信号驱动更新，win32 / X11 / cocoa 窗口后端）、�
 把边界写在前面，比让读者踩坑再回头更省事：
 
 - **不适合做 Web 后端或替代 Node.js** —— 不支持 CommonJS（`require`）与 npm 生态的大多数包，见 [兼容性矩阵](docs/compat-matrix.md)。
-- **不适合 CPU 密集的计算任务** —— 纯解释器，无 JIT，`fib28` 比 goja 慢约 3 倍、比 V8 慢一个数量级，见 [性能](#性能)。
+- **不适合 CPU 密集的计算任务** —— 纯解释器，无 JIT，`fib28` 纯计算落后 goja（同为纯解释器）约 1.7×（2026-10-31 CI 复验口径，T3-4 热点优化后待 CI 复测定稿）、落后 V8 一个数量级以上，见 [性能](#性能)。与 V8/JIT 栈的差距是**"纯解释器 vs JIT"的固有差距**，不能都算 gox 的实现缺陷；同类可比基线是 goja。
 - **不适合需要完整 ES 规范的生产系统** —— test262 `built-ins` 合规率 62%，`Temporal` / `RegExp` 等子集仍有成块缺口。
 - **不适合"一次写完到处跑"的幻想** —— 三端形态（折叠屏、安全区、权限）差异真实存在，需要按平台适配。
 
@@ -672,8 +672,16 @@ go run ./packager app.js --gui --target linux/amd64    # 纯 Go 交叉编译，�
 
 ## 性能
 
-> 数字来自 CI runner 上的公开基准（`bench-results/`，AMD EPYC 7763）与官网实测页（Apple M2）。
+> **数字真相源**：`docs/performance.md`（口径、测量条件、复现命令、历史存档全在那一份文件里；
+> 本节与官网只引用、不手抄新数字 —— 引用与源不一致时以 `docs/performance.md` 为准并修本节）。
+> 下表数字来自 CI runner 上的公开基准（`bench-results/`，AMD EPYC）。
 > **含未达标项** —— 口径与阈值全部公开。
+>
+> **口径免责（引用任何 bun / node / V8 对比数字时必须连同本段）**：gox 是**纯解释器**
+> （零 cgo、直接遍历字节码、刻意不做 JIT）。与 node(V8/JIT)、bun(JavaScriptCore/JIT)
+> 的算力差距主要是**"纯解释器 vs JIT"的固有差距**，不能都算 gox 的实现缺陷；
+> **goja 同为纯解释器，才是同类基线**。跨运行时四栈完整台账见
+> `bench-results/CROSS-RUNTIME-LEDGER.md` 与 `docs/performance.md` §3.2。
 
 | 指标 | gox | goja（纯解释器对照） | node / V8（JIT 对照） |
 |---|---:|---:|---:|
@@ -682,7 +690,15 @@ go run ./packager app.js --gui --target linux/amd64    # 纯 Go 交叉编译，�
 | 1 万定时器 | 168 ms | 116 ms | 139 ms |
 | 常驻内存 RSS | 25 MB | 10 MB | 42 MB |
 
-**结论**：启动与内存与同类解释器同级；纯计算算力**未达 goja 同级**（`fib28` 慢约 3 倍），
+> ⚠ 上表是 2026-10-28 的 CI 基线快照（T2-4 热点优化批次之前）。**该批次之后 gox 的
+> `fib28` 已降至 ~200 ms 级**（2026-10-31 复验，gox ≈196–204 ms vs goja ≈115–119 ms，
+> 差距 ~1.7×，见 `docs/performance.md` §3.2）；T3-4 第二批热点优化（globalThis 缓存、
+> 全局 IC 写后直通，2026-11-10）再降约 9–12%（本机 A/B），最终数字以 bench workflow
+> 在 CI runner 上复测并重建 `bench-results/baseline.json` 后由 `docs/performance.md`
+> 更新为准。
+
+**结论**：启动与内存与同类解释器同级；纯计算算力**未达 goja 同级**
+（阈值：`gox_fib28 ≤ goja_fib28 × 1.25`，口径见 `docs/performance.md` §3.1），
 这是纯解释器 + 无 JIT 的直接代价，不作为优化目标。**UI 无 GC 毛刺达标**
 （重压聚合 p95 帧间隔 5.95ms ≤ 16.7ms；单次 GC 停顿 max 1.382ms ≤ 5ms）。
 
