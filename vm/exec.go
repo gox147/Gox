@@ -320,6 +320,23 @@ func (vm *VM) runFrom(startFrameIdx int) error {
 				idx := int(operand) & (len(vm.globalICKey) - 1)
 				if vm.globalICVersion == vm.globals.Version() && vm.globalICKey[idx] == s {
 					val, found = vm.globalICVal[idx], vm.globalICFound[idx]
+				} else if s == vm.lastStoreKey && vm.lastStoreVer == vm.globals.Version() {
+					// T3-4 热点优化三: 写后直通。STORE_GLOBAL 每次都 bump
+					// 版本 (IC 整体失效)，紧接着的下一次迭代同名字读就得重填
+					// —— `t = add(t, i)` 循环里 t/i 每迭代各一次 map Get。
+					// storeGlobalBinding 的纯赋值路径已把 (名字, 值, 版本) 记
+					// 在 lastStore 三槽，此处 O(1) 直取，语义与 Get 等价
+					// (版本相符 ⇒ 自该次写以来无任何绑定变更)。
+					val, found = vm.lastStoreVal, true
+					if vm.globalICVersion != vm.globals.Version() {
+						vm.globalICVersion = vm.globals.Version()
+						for i := range vm.globalICKey {
+							vm.globalICKey[i] = nil
+						}
+					}
+					vm.globalICKey[idx] = s
+					vm.globalICVal[idx] = val
+					vm.globalICFound[idx] = found
 				} else {
 					if vm.globalICVersion != vm.globals.Version() {
 						vm.globalICVersion = vm.globals.Version()
@@ -372,7 +389,7 @@ func (vm *VM) runFrom(startFrameIdx int) error {
 					}
 					continue
 				}
-				if err := vm.storeGlobalBinding(s.Value, val); err != nil {
+				if err := vm.storeGlobalBinding(s, val); err != nil {
 					return err
 				}
 			}
@@ -397,7 +414,7 @@ func (vm *VM) runFrom(startFrameIdx int) error {
 					}
 					continue
 				}
-				if err := vm.storeGlobalBinding(s.Value, val); err != nil {
+				if err := vm.storeGlobalBinding(s, val); err != nil {
 					return err
 				}
 			}
@@ -416,7 +433,7 @@ func (vm *VM) runFrom(startFrameIdx int) error {
 					continue
 				}
 				if _, exists := vm.globals.Get(s.Value); exists {
-					if err := vm.storeGlobalBinding(s.Value, val); err != nil {
+					if err := vm.storeGlobalBinding(s, val); err != nil {
 						return err
 					}
 				} else {

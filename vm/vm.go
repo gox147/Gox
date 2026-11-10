@@ -198,6 +198,15 @@ type VM struct {
 	globalThisCacheValid bool
 	globalThisCacheVal   object.Value
 
+	// 全局写后直通三槽 (T3-4 热点优化三): storeGlobalBinding 的纯赋值路径
+	// (Set / DeclareImplicit，均不执行用户代码) 记录最后一次写入的
+	// (名字字符串对象, 值, 写入后版本)。LOAD_GLOBAL 在 IC 因版本 bump 失效
+	// 且请求名字与之一致时直取此槽，免一次全局 map Get。任何其他绑定变更
+	// 路径都会 bump 版本 ⇒ lastStoreVer 不符即自然失效，无需显式清理。
+	lastStoreKey *object.String
+	lastStoreVal object.Value
+	lastStoreVer uint64
+
 	// fnCache 是 FunctionMetadata → CompiledFunction 的按 VM 复用缓存
 	// (T2-4 热点优化)。同一编译单元里每次执行到 OP_CLOSURE 都会新建一个
 	// 闭包, 但其 fn 部分 (指令/常量/位置表/参数元数据) 只取决于 metadata,
@@ -308,7 +317,8 @@ func (vm *VM) RunCompiledAsync(c *compiler.Compiler) error {
 
 // driveMainUnit 驱动主单元生成器直到完成。
 
-func (vm *VM) storeGlobalBinding(name string, val object.Value) error {
+func (vm *VM) storeGlobalBinding(s *object.String, val object.Value) error {
+	name := s.Value
 	if cur, exists := vm.globals.Get(name); exists {
 		if acc, isAcc := cur.(*object.Accessor); isAcc {
 			if acc.Setter != nil && object.IsCallable(acc.Setter) {
@@ -322,9 +332,20 @@ func (vm *VM) storeGlobalBinding(name string, val object.Value) error {
 			// 无 setter 的访问器: 写入被忽略 (见上注)。
 			return nil
 		}
-		return vm.globals.Set(name, val)
+		if err := vm.globals.Set(name, val); err != nil {
+			return err
+		}
+		// T3-4 热点优化三: 记写后直通三槽 (纯赋值路径不执行用户代码，
+		// 本次写即「IC 校验点之后的唯一变更」，LOAD_GLOBAL 可安全直取)。
+		vm.lastStoreVer = vm.globals.Version()
+		vm.lastStoreKey = s
+		vm.lastStoreVal = val
+		return nil
 	}
 	// 隐式赋值创建的全局: globalThis 的自有可配置属性。
 	vm.globals.DeclareImplicit(name, val)
+	vm.lastStoreVer = vm.globals.Version()
+	vm.lastStoreKey = s
+	vm.lastStoreVal = val
 	return nil
 }
