@@ -348,7 +348,15 @@ func sameConstantSlice(pool *bytecode.ConstantPool, slice []object.Value) bool {
 	return &pc[0] == &slice[0]
 }
 
+// ⚠ 负向自测提交（T3-1 防退潮闸门端到端验证，勿合并）：
+// 在每次闭包调用里注入固定开销，模拟"引擎被悄悄改慢"。预期 bench.yml 在
+// PR 上变红并因分支保护阻断合并；验证完成后本分支将被关闭并删除。
+var gateSlowSink int
+
 func (vm *VM) callClosure(closure *object.Closure, args []object.Value) error {
+	for i := 0; i < 1000; i++ {
+		gateSlowSink += i * 7
+	}
 	fn := closure.Fn
 	if fn == nil {
 		return fmt.Errorf("VM: closure has no function")
