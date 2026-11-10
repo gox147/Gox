@@ -72,6 +72,14 @@ on:
       - 'stdlib/**'
       - 'scripts/check-compliance.py'
       - '.github/workflows/test262.yml'
+  # [T3-1] 防退潮闸门进 PR 合并门（2026-11-10 拍板）：性能改 vm/compiler 时最
+  #   容易把合规率一起带掉（rFXXbq / rNaKtx 与热点优化抢同一批代码），所以
+  #   test262 的"全量合并口径地板"必须卡在合并路径上 —— 红了不让合并。
+  #   pull_request 同样**不加 paths 过滤**（required check 可能不报告状态 ⇒
+  #   无关 PR 被永久卡门）。PR 上下文里跳过"刷新基线"与"回写徽章"两步
+  #   （合并前不能动 main 的基线文件，见对应 step 的 if 条件）。
+  pull_request:
+    branches: [main]
 
 permissions:
   contents: write # 把更新后的徽章数据（docs/test262-compliance*.json）与基线提交回 main
@@ -248,8 +256,9 @@ jobs:
 
       # 只有闸门过了才刷新基线 —— 所以基线恒等于「上一次通过闸门时的合规率」，
       # 一次回归不会把基线一起拉低而把后续所有轮次都洗白。
+      # [T3-1] PR 上下文不刷新：基线只属于 main，PR 红/绿都不改它。
       - name: 刷新合规率基线
-        if: ${{ success() }}
+        if: ${{ success() && github.event_name != 'pull_request' }}
         run: |
           set -euo pipefail
           python3 scripts/check-compliance.py \
@@ -257,8 +266,9 @@ jobs:
             --baseline "${{ matrix.baseline }}" \
             --update-baseline
 
+      # [T3-1] PR 上下文不回写：徽章/基线只反映 main 的状态，PR 不动它们。
       - name: 提交徽章数据与基线回 main
-        if: ${{ success() }}
+        if: ${{ success() && github.event_name != 'pull_request' }}
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"

@@ -64,6 +64,15 @@ on:
     # 每天 UTC 03:17（北京时间 11:17）：避开整点，GitHub 的排队高峰通常在整点前后
     - cron: '17 3 * * *'
   workflow_dispatch:
+  # [T3-1] 防退潮闸门进 PR 合并门（2026-11-10 拍板）：bench 成为 main 的必需检查，
+  #   红了不让合并。此前"只 nightly 不进 PR"的理由（runner 噪声 → 噪声性红）由
+  #   check-bench.py 的既有设计消化：fib28/timers 判的是同源脚本比值（机器差异被
+  #   约掉）+ MIN_ABS 噪声带宽，rss/startup 跨机型自动降级为只记录 —— 闸门在
+  #   云 runner 上判的是"比值退化"，不是绝对毫秒，噪声性红的教训已有对应防线。
+  #   注意：pull_request 触发**不加 paths 过滤** —— required check 若可能不报告
+  #   状态，不触碰这些路径的 PR 会被永远卡在合并门上（比噪声性红更糟）。
+  pull_request:
+    branches: [main]
 
 permissions:
   contents: read
