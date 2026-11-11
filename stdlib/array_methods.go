@@ -767,31 +767,66 @@ func setupArrayProto() *object.Object {
 
 	// ===== 迭代器方法 (ES6): 返回真正的迭代器对象 =====
 
+	// newArrayLikeIterator 实现 CreateArrayIterator(O, kind) 对非 Array
+	// 接收者的泛型路径（规范 sec-createarrayiterator / sec-%arrayiterator%.next）:
+	// 每次 next 动态读 O.length 与 O[k] —— TypedArray（含 resizable buffer
+	// 的 grow/shrink mid-iteration）、类数组对象、字符串包装对象由此覆盖。
+	// 此前 keys/values/entries 只接受真 Array, 其余接收者一律 TypeError。
+	newArrayLikeIterator := func(kind string, this object.Value) object.Value {
+		if this == nil || isUndefinedValue(this) || isNullValue(this) {
+			return thisTypeError("Array", kind, this)
+		}
+		obj := toObjectValue(this)
+		i := int64(0)
+		get := func(k int64) object.Value {
+			if v, ok := obj.GetProperty(strconv.FormatInt(k, 10)); ok && v != nil {
+				return v
+			}
+			return object.UndefinedSingleton
+		}
+		return &object.JSIterator{Name: "Array", NextFn: func() (object.Value, bool) {
+			var n int64
+			if lv, ok := obj.GetProperty("length"); ok && lv != nil {
+				n = toLength(lv)
+			}
+			if i >= n {
+				return object.UndefinedSingleton, true
+			}
+			k := i
+			i++
+			switch kind {
+			case "keys":
+				return object.NewInt(k), false
+			case "entries":
+				return object.NewArray([]object.Value{object.NewInt(k), get(k)}), false
+			default:
+				return get(k), false
+			}
+		}}
+	}
+
 	// keys(): 迭代索引
 	p.SetBuiltinProperty("keys", object.NewBuiltinMethod("keys", func(this object.Value, args ...object.Value) object.Value {
-		arr, ok := this.(*object.Array)
-		if !ok {
-			return thisTypeError("Array", "keys", this)
+		if arr, ok := this.(*object.Array); ok {
+			return object.NewArrayIndexIterator(arr)
 		}
-		return object.NewArrayIndexIterator(arr)
+		return newArrayLikeIterator("keys", this)
 	}))
 
 	// values(): 迭代元素
 	p.SetBuiltinProperty("values", object.NewBuiltinMethod("values", func(this object.Value, args ...object.Value) object.Value {
-		arr, ok := this.(*object.Array)
-		if !ok {
-			return thisTypeError("Array", "values", this)
+		if arr, ok := this.(*object.Array); ok {
+			return object.NewArrayIterator(arr)
 		}
-		return object.NewArrayIterator(arr)
+		return newArrayLikeIterator("values", this)
 	}))
 
 	// entries(): 迭代 [index, element] 对
 	p.SetBuiltinProperty("entries", object.NewBuiltinMethod("entries", func(this object.Value, args ...object.Value) object.Value {
-		arr, ok := this.(*object.Array)
-		if !ok {
-			return thisTypeError("Array", "entries", this)
+		if arr, ok := this.(*object.Array); ok {
+			return object.NewArrayEntryIterator(arr)
 		}
-		return object.NewArrayEntryIterator(arr)
+		return newArrayLikeIterator("entries", this)
 	}))
 
 	// ===== ES2023 findLast 系列 =====
@@ -881,11 +916,17 @@ func setupArrayProto() *object.Object {
 			return errVal
 		}
 		start, count := spliceArgs(int(l.n), args)
-		cp := make([]object.Value, 0, int(l.n)+len(args))
+		// 规范 sec-array.prototype.tospliced: insertCount = max(len(args)-2, 0)。
+		// 参数少于 2 个时插入项为空 —— 不能直接 args[2:]（slice 越界 panic）。
+		var items []object.Value
+		if len(args) >= 2 {
+			items = args[2:]
+		}
+		cp := make([]object.Value, 0, int(l.n)+len(items))
 		for i := 0; i < start; i++ {
 			cp = append(cp, l.get(int64(i)))
 		}
-		cp = append(cp, args[2:]...)
+		cp = append(cp, items...)
 		for i := start + count; i < int(l.n); i++ {
 			cp = append(cp, l.get(int64(i)))
 		}
@@ -1103,7 +1144,10 @@ func setupArrayProto() *object.Object {
 			return mv
 		}
 		n := int(l.n)
-		if n == 0 || len(args) < 1 {
+		// 注意: 不能因 n == 0 早退 —— 规范 sec-array.prototype.copywithin
+		// 第 8-11 步对 target/start/end 的 ToInteger 无条件执行, 空数组上
+		// 带毒 valueOf 的参数仍必须抛 abrupt (return-abrupt-from-* 族)。
+		if len(args) < 1 {
 			return l.obj
 		}
 		// 规范: every / target / start / end 依次 ToIntegerOrInfinity, 任一步
@@ -1122,7 +1166,9 @@ func setupArrayProto() *object.Object {
 				return serr
 			}
 		}
-		if len(args) > 2 {
+		if len(args) > 2 && !isUndefinedValue(args[2]) {
+			// 规范第 11 步: end 为 undefined 时 relativeEnd = len —— 与
+			// "未传参"同义, 不得走 ToInteger(把区间清空, undefined-end.js)。
 			var eerr object.Value
 			end, eerr = specIndexClamp(args[2], n)
 			if eerr != nil {
@@ -1136,14 +1182,41 @@ func setupArrayProto() *object.Object {
 		if target+count > n {
 			count = n - target
 		}
-		// 与目标重叠时按方向拷贝，避免覆盖未读的源
+		// 与目标重叠时按方向拷贝，避免覆盖未读的源。
+		// 规范 sec-array.prototype.copywithin 逐位走 HasProperty → Get →
+		// Set(..., true) / DeletePropertyOrThrow —— has/get 的陷阱投掷记入
+		// l.err, set/delete 的失败 (冻结/只读/代理陷阱) 直接返回错误值。
+		// 此前批量读写且从不查错, abrupt completion 全部被吞
+		// (return-abrupt-from-* 族)。
+		copyBit := func(i int64) object.Value {
+			from := int64(start) + i
+			to := int64(target) + i
+			if l.has(from) {
+				if l.err != nil {
+					return l.err
+				}
+				v := l.get(from)
+				if l.err != nil {
+					return l.err
+				}
+				return l.setOrThrow(to, v)
+			}
+			if l.err != nil {
+				return l.err
+			}
+			return l.deleteOrThrow(to)
+		}
 		if start < target && target < start+count {
 			for i := count - 1; i >= 0; i-- {
-				l.set(int64(target+i), l.get(int64(start+i)))
+				if err := copyBit(int64(i)); err != nil {
+					return err
+				}
 			}
 		} else {
 			for i := 0; i < count; i++ {
-				l.set(int64(target+i), l.get(int64(start+i)))
+				if err := copyBit(int64(i)); err != nil {
+					return err
+				}
 			}
 		}
 		return l.obj

@@ -1406,7 +1406,7 @@ func (c *Compiler) compileCallExpression(node *ast.CallExpression) error {
 	//   [fn, obj] → 实参 → CALL_METHOD。
 	// 求值序也顺带修正: 旧路径先算实参再算 obj[k], 规范是 obj → k → 实参。
 	if member, ok := node.Function.(*ast.MemberExpression); ok && member.Computed &&
-		member.Private == "" && !hasSpreadArgs(node.Arguments) {
+		member.Private == "" {
 		if _, isSuperObj := member.Object.(*ast.SuperExpression); !isSuperObj {
 			if err := c.compileExpression(member.Object); err != nil {
 				return err
@@ -1417,6 +1417,16 @@ func (c *Compiler) compileCallExpression(node *ast.CallExpression) error {
 			} // [obj, obj, key]
 			c.emitter.EmitNoOperand(bytecode.OP_GET_INDEX) // [obj, fn]
 			c.emitter.EmitNoOperand(bytecode.OP_SWAP)      // [fn, obj]
+			// 带 spread 的计算成员调用 (obj[k](...args)): 实参收进数组后走
+			// CALL_METHOD_SPREAD —— 接收者绑定必须与非 spread 路径一致。
+			// 此前该形态落入通用裸调用路径, receiver 丢失成 undefined。
+			if hasSpreadArgs(node.Arguments) {
+				if err := c.compileArgumentsArray(node.Arguments); err != nil {
+					return err
+				} // [fn, obj, argsArray]
+				c.emitter.EmitNoOperand(bytecode.OP_CALL_METHOD_SPREAD)
+				return nil
+			}
 			for _, arg := range node.Arguments {
 				if err := c.compileExpression(arg); err != nil {
 					return err
@@ -1429,7 +1439,7 @@ func (c *Compiler) compileCallExpression(node *ast.CallExpression) error {
 	}
 
 	// 检查是否是方法调用: obj.method(args)
-	if member, ok := node.Function.(*ast.MemberExpression); ok && !member.Computed && !hasSpreadArgs(node.Arguments) {
+	if member, ok := node.Function.(*ast.MemberExpression); ok && !member.Computed {
 		// super.method(args): 从父 prototype 取方法, this 绑定当前 this
 		if _, isSuperObj := member.Object.(*ast.SuperExpression); isSuperObj {
 			if c.evalSuperHome != nil {
@@ -1479,6 +1489,17 @@ func (c *Compiler) compileCallExpression(node *ast.CallExpression) error {
 			c.emitter.Emit(bytecode.OP_GET_PROP, idx) // [obj, fn]
 		}
 		c.emitter.EmitNoOperand(bytecode.OP_SWAP) // [fn, obj]
+		// 带 spread 的方法调用 (obj.m(...args)): 实参收进数组后走
+		// CALL_METHOD_SPREAD —— 接收者绑定必须与非 spread 路径一致。
+		// 此前该形态落入通用裸调用路径, receiver 丢失成 undefined
+		// (test262: Array/prototype/toLocaleString/invoke-element-* 等)。
+		if hasSpreadArgs(node.Arguments) {
+			if err := c.compileArgumentsArray(node.Arguments); err != nil {
+				return err
+			} // [fn, obj, argsArray]
+			c.emitter.EmitNoOperand(bytecode.OP_CALL_METHOD_SPREAD)
+			return nil
+		}
 		// 编译参数
 		for _, arg := range node.Arguments {
 			if err := c.compileExpression(arg); err != nil {

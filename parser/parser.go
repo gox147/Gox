@@ -1,6 +1,7 @@
 package parser
 
 import (
+	"errors"
 	"fmt"
 	"math/big"
 	"reflect"
@@ -2671,8 +2672,14 @@ func (p *Parser) parseFloatLiteral() ast.Expression {
 	lit := &ast.FloatLiteral{Token: p.curToken()}
 	value, err := strconv.ParseFloat(p.curToken().Literal, 64)
 	if err != nil {
-		p.addError(fmt.Sprintf("could not parse %q as float", p.curToken().Literal))
-		return nil
+		// 溢出/下溢（ErrRange）不是语法错误: ECMAScript Number 是 float64，
+		// 超范围字面量按规范求值为 ±Infinity（下溢为 0），ParseFloat 在该
+		// 情形下已返回对应极值，取之即可（如 1E+309 → +Inf）。
+		var ne *strconv.NumError
+		if !errors.As(err, &ne) || ne.Err != strconv.ErrRange {
+			p.addError(fmt.Sprintf("could not parse %q as float", p.curToken().Literal))
+			return nil
+		}
 	}
 	lit.Value = value
 	return lit
