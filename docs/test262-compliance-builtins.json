@@ -1,6 +1,1 @@
-{
-  "schemaVersion": 1,
-  "label": "test262 built-ins",
-  "message": "75.4%",
-  "color": "yellowgreen"
-}
+{"schemaVersion": 1, "label": "test262 built-ins", "message": "75.7%", "color": "green"}
