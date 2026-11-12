@@ -177,11 +177,15 @@ func (vm *VM) globalThisValue() object.Value {
 	// T3-4 热点优化二: 版本化 memo。热路径（每次 sloppy 裸调用一次）从
 	// 字符串 map 查找降为一次整型比较。fib28 剖面: Environment.Get
 	// ("globalThis") 占 CPU ~14%，几乎全部由此调用链贡献。
+	// T3-4 热点优化四: 失效判据改为 globalThis 绑定专用版本号
+	// (globals.GlobalThisVer)，不再被普通全局赋值 (OP_STORE_GLOBAL 的
+	// bumpVersion) 打穿；globals 指针比对防跨环境串值。
 	// 裸 VM（globals 未装配）按注释意图回退 undefined（原实现直查会 panic）。
 	if vm.globals == nil {
 		return object.UndefinedSingleton
 	}
-	if vm.globalThisCacheValid && vm.globalThisCacheVer == vm.globals.Version() {
+	if vm.globalThisCacheEnv == vm.globals && vm.globalThisCacheValid &&
+		vm.globalThisCacheVer == vm.globals.GlobalThisVer() {
 		return vm.globalThisCacheVal
 	}
 	var v object.Value
@@ -190,7 +194,8 @@ func (vm *VM) globalThisValue() object.Value {
 	} else {
 		v = object.UndefinedSingleton
 	}
-	vm.globalThisCacheVer = vm.globals.Version()
+	vm.globalThisCacheEnv = vm.globals
+	vm.globalThisCacheVer = vm.globals.GlobalThisVer()
 	vm.globalThisCacheValid = true
 	vm.globalThisCacheVal = v
 	return v

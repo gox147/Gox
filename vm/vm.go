@@ -194,6 +194,17 @@ type VM struct {
 	// 失效判据与 globalIC 同源：globalThis 绑定值只能经 Environment 写方法
 	// 变更（全部带版本自增），版本不符即重查。缓存的是 Get 的原样返回值
 	// （含 Accessor），与直查行为逐字节一致 —— 纯 memo，不改任何语义。
+	//	globalThisCacheVer   uint64
+	//	globalThisCacheValid bool
+	//	globalThisCacheVal   object.Value
+	//
+	// T3-4 热点优化四: 失效判据从「全局环境整体 version」收窄为「globalThis
+	// 绑定自身的 globalThisVer」。整体 version 会被普通全局赋值高频打穿
+	// (OP_STORE_GLOBAL —— fib28 的 `t = add(t, i)` 循环每迭代一次), memo 命中
+	// 率归零, 循环段每迭代重做一次 Get("globalThis") 字符串 map 查找;
+	// globalThis 绑定自身几乎从不变化, 按名字失效后命中回到 ~100%。
+	// globalThisCacheEnv 防跨环境串值: globals 指针被整体替换时强制重查。
+	globalThisCacheEnv   *runtime.Environment
 	globalThisCacheVer   uint64
 	globalThisCacheValid bool
 	globalThisCacheVal   object.Value

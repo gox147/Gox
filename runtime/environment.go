@@ -53,6 +53,35 @@ type Environment struct {
 	// 缓存 (OP_LOAD_GLOBAL) 以它做失效判据: 缓存快照版本 != 当前版本
 	// 即整体作废。热路径只有 Get/读取, 不触碰 version。
 	version uint64
+
+	// globalThisVer 只在「globalThis 这个名字的绑定本身」发生变更时自增
+	// (T3-4 热点优化三)。VM 的 globalThis memo (vm/frames.go
+	// globalThisValue) 以它做失效判据 —— 整体 version 会被普通全局赋值
+	// (OP_STORE_GLOBAL, 如 `t = add(t, i)` 的循环) 高频打穿, 用它判失效
+	// 会让 memo 在循环段每迭代重做一次字符串 map 查找。globalThis 绑定
+	// 自身几乎从不变化, 按名字收窄失效面后 memo 命中率回到 ~100%。
+	// 判据口径: 任何以 name=="globalThis" 落到全局环境写路径的操作
+	// (Set/Declare/DeclareGlobal/DeclareGlobalVar/DeclareImplicit/
+	// SetGlobalBindingValue/DefineGlobalBinding/DeleteGlobalBinding/
+	// DeclareLazy/materialize) 都自增; 无名字参数的整体复制 (CopyTo)
+	// 无条件自增兜底。
+	globalThisVer uint64
+}
+
+// globalThisBindingName 是 globalThis 绑定在全局环境里的名字。
+// 收窄失效面用: 写路径按名字比对, 只有不等于它的写才跳过 globalThisVer。
+
+const globalThisBindingName = "globalThis"
+
+// GlobalThisVer 返回 globalThis 绑定自身的变更版本号 (见 globalThisVer)。
+func (e *Environment) GlobalThisVer() uint64 { return e.globalThisVer }
+
+// noteGlobalThisWrite 在写路径收尾调用: name 命中 globalThis 绑定时自增
+// 专用版本号。必须与 bumpVersion 成对出现, 保持「任何写都可见」语义。
+func (e *Environment) noteGlobalThisWrite(name string) {
+	if name == globalThisBindingName {
+		e.globalThisVer++
+	}
 }
 
 // Version 返回绑定变更版本号。
@@ -116,6 +145,7 @@ func (e *Environment) Get(name string) (object.Value, bool) {
 func (e *Environment) DeclareLazy(name string, factory func() object.Value) {
 	e.store[name] = Binding{lazy: factory}
 	e.bumpVersion()
+	e.noteGlobalThisWrite(name)
 }
 
 // IsLazyName 报告 name 是否为尚未物化的惰性绑定。
@@ -145,6 +175,7 @@ func (e *Environment) materialize(name string) {
 		}
 	}
 	e.bumpVersion()
+	e.noteGlobalThisWrite(name)
 }
 
 // Set 修改变量值。
@@ -167,6 +198,7 @@ func (e *Environment) Set(name string, val object.Value) error {
 		binding.Value = val
 		e.store[name] = binding
 		e.bumpVersion()
+		e.noteGlobalThisWrite(name)
 		return nil
 	}
 	if e.outer != nil {
@@ -186,6 +218,7 @@ func (e *Environment) Declare(name string, val object.Value, isConst bool) {
 		IsConst: isConst,
 	}
 	e.bumpVersion()
+	e.noteGlobalThisWrite(name)
 }
 
 // DeclareGlobal 执行顶层声明并写入全局环境，同时实现全局重声明检查:
@@ -206,12 +239,17 @@ func (e *Environment) DeclareGlobal(name string, val object.Value, isConst, isFn
 			return fmt.Errorf("SyntaxError: Identifier '%s' has already been declared", name)
 		}
 	}
+	// 注意: 这里刻意**不 bump 整体 version** (保持 T2-4 全局 IC 的既有失效
+	// 行为不变)。T3-4 的 globalThis memo 只关心 globalThis 这一个名字的
+	// 绑定，noteGlobalThisWrite 已覆盖 (let/const/class 顶层重声明
+	// globalThis 会失效 memo)。
 	e.store[name] = Binding{
 		Value:     val,
 		IsConst:   isConst,
 		IsLexical: !isFnDecl,
 		IsFnDecl:  isFnDecl,
 	}
+	e.noteGlobalThisWrite(name)
 	return nil
 }
 
@@ -233,6 +271,7 @@ func (e *Environment) DeclareGlobalVar(name string, val object.Value) error {
 	}
 	e.store[name] = Binding{Value: val, IsVar: true}
 	e.bumpVersion()
+	e.noteGlobalThisWrite(name)
 	return nil
 }
 
@@ -242,6 +281,7 @@ func (e *Environment) DeclareGlobalVar(name string, val object.Value) error {
 func (e *Environment) DeclareImplicit(name string, val object.Value) {
 	e.store[name] = Binding{Value: val, IsImplicit: true}
 	e.bumpVersion()
+	e.noteGlobalThisWrite(name)
 }
 
 // BindingNames 返回全局环境中全部绑定名 (字典序，保证确定性)。
@@ -291,6 +331,7 @@ func (e *Environment) SetGlobalBindingValue(name string, val object.Value, desc 
 	b.Desc = &d
 	e.store[name] = b
 	e.bumpVersion()
+	e.noteGlobalThisWrite(name)
 	return true
 }
 
@@ -307,6 +348,7 @@ func (e *Environment) DefineGlobalBinding(name string, desc object.PropertyDescr
 	b.Desc = &d
 	e.store[name] = b
 	e.bumpVersion()
+	e.noteGlobalThisWrite(name)
 	return nil
 }
 
@@ -328,6 +370,7 @@ func (e *Environment) DeleteGlobalBinding(name string) bool {
 	}
 	delete(e.store, name)
 	e.bumpVersion()
+	e.noteGlobalThisWrite(name)
 	return true
 }
 
@@ -402,4 +445,5 @@ func (e *Environment) CopyTo(target *Environment) {
 		target.store[name] = binding
 	}
 	target.bumpVersion()
+	target.globalThisVer++
 }
