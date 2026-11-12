@@ -54,6 +54,52 @@ func isTemporalValue(v object.Value) bool {
 // binaryArithmetic 处理所有二元算术/位运算符。
 // 非 BigInt 路径保持原有的 double 语义不变。
 func (vm *VM) binaryArithmetic(op bytecode.Opcode, a, b object.Value) (object.Value, error) {
+	// T3-4 热点优化六: 数字+数字快路径 (与 addValues 同型)。跳过 BigInt
+	// 断言 ×2 与 toNumber 类型分派 ×2，Number+Number 结果与通用路径逐位一致。
+	if an, aIsNum := a.(*object.Number); aIsNum {
+		if bn, bIsNum := b.(*object.Number); bIsNum {
+			av, bv := an.Value, bn.Value
+			switch op {
+			case bytecode.OP_SUB:
+				return object.NewNumber(av - bv), nil
+			case bytecode.OP_MUL:
+				return object.NewNumber(av * bv), nil
+			case bytecode.OP_DIV:
+				if bv == 0 {
+					switch {
+					case av == 0:
+						return object.NewNumber(math.NaN()), nil
+					case av > 0:
+						return object.NewNumber(math.Inf(1)), nil
+					default:
+						return object.NewNumber(math.Inf(-1)), nil
+					}
+				}
+				return object.NewNumber(av / bv), nil
+			case bytecode.OP_MOD:
+				if bv == 0 {
+					return object.NewNumber(math.NaN()), nil
+				}
+				return object.NewNumber(math.Mod(av, bv)), nil
+			case bytecode.OP_POW:
+				return object.NewNumber(math.Pow(av, bv)), nil
+			case bytecode.OP_BIT_AND:
+				return object.NewNumber(float64(toInt32JS(av) & toInt32JS(bv))), nil
+			case bytecode.OP_BIT_OR:
+				return object.NewNumber(float64(toInt32JS(av) | toInt32JS(bv))), nil
+			case bytecode.OP_BIT_XOR:
+				return object.NewNumber(float64(toInt32JS(av) ^ toInt32JS(bv))), nil
+			case bytecode.OP_SHL:
+				return object.NewNumber(float64(toInt32JS(av) << (toUint32JS(bv) & 31))), nil
+			case bytecode.OP_SHR:
+				return object.NewNumber(float64(toInt32JS(av) >> (toUint32JS(bv) & 31))), nil
+			case bytecode.OP_USHR:
+				return object.NewNumber(float64(toUint32JS(av) >> (toUint32JS(bv) & 31))), nil
+			}
+			return object.UndefinedSingleton, nil
+		}
+	}
+
 	aBig, aIsBig := a.(*object.BigInt)
 	bBig, bIsBig := b.(*object.BigInt)
 
@@ -201,6 +247,24 @@ func toNumberValue(v object.Value) (object.Value, error) {
 // 与算术运算不同，关系比较允许 BigInt 与 Number 混合: 规范先做
 // ToPrimitive，再在"同为 BigInt"和"其余"两种情形下分别比较数学值。
 func relationalCompare(op bytecode.Opcode, a, b object.Value) (bool, error) {
+	// T3-4 热点优化六: 数字+数字快路径 (与 addValues/binaryArithmetic 同型)。
+	// 跳过 isTemporalValue 的两次接口动态分派与 BigInt 断言链；
+	// Number 既非 Temporal 也非 BigInt，结果与通用路径一致。
+	if an, aIsNum := a.(*object.Number); aIsNum {
+		if bn, bIsNum := b.(*object.Number); bIsNum {
+			av, bv := an.Value, bn.Value
+			switch op {
+			case bytecode.OP_LT:
+				return av < bv, nil
+			case bytecode.OP_GT:
+				return av > bv, nil
+			case bytecode.OP_LTE:
+				return av <= bv, nil
+			default:
+				return av >= bv, nil
+			}
+		}
+	}
 	// Temporal 对象的 valueOf 无条件抛 TypeError (spec: 各 Temporal 类的
 	// prototype.valueOf), 关系运算的 ToPrimitive(number) 因此必抛。
 	if isTemporalValue(a) || isTemporalValue(b) {

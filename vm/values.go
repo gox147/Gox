@@ -172,6 +172,16 @@ func concatStrings(a, b string) (string, error) {
 }
 
 func (vm *VM) addValues(a, b object.Value) (object.Value, error) {
+	// T3-4 热点优化六: 数字+数字快路径。热循环 (fib28 的 add/递归求和) 两个
+	// 操作数恒为 *Number，直接 double 相加返回，跳过下方 String×2 / Array /
+	// BigInt×2 的类型断言链与 toNumber 的类型分派 (pprof: toNumber + 断言链
+	// 合计 ~6% CPU)。Number+Number 的结果与走下方通用路径逐位一致
+	// (toNumber(*Number) 就是取 .Value)，无语义差。
+	if an, ok := a.(*object.Number); ok {
+		if bn, ok := b.(*object.Number); ok {
+			return object.NewNumber(an.Value + bn.Value), nil
+		}
+	}
 	// 字符串拼接
 	if aStr, ok := a.(*object.String); ok {
 		s, err := concatStrings(aStr.Value, toJSString(b))
