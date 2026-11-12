@@ -35,10 +35,15 @@ func (s *Stack) Push(v object.Value) {
 }
 
 // Pop 弹出并返回栈顶值。调用前必须确保栈非空。
+//
+// T3-4 热点优化五: 去掉逐次 nil 清写。收缩 len 后 GC 只扫描切片 [0, len)
+// 区间，弹栈留下的悬挂引用对 GC 不可见；真正需要清的路径是帧边界上的
+// Truncate / unwindFramesTo（它们本来就逐槽清零）。此前每次 Pop 的接口槽
+// nil 写入触发写屏障，fib28 剖面里 Pop 合计占 CPU ~14%（含内联副本）。
+// 2026-11-10 曾试删实测 ~1% 未达 <5% 纪律；2026-11-12 本机复测见 A/B。
 func (s *Stack) Pop() object.Value {
 	n := len(s.values) - 1
 	v := s.values[n]
-	s.values[n] = nil // 帮助 GC
 	s.values = s.values[:n]
 	return v
 }
