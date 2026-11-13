@@ -172,6 +172,137 @@ func isPrimitiveValue(v object.Value) bool {
 	return false
 }
 
+// symbolGetViaChain 实现规范的 Get(O, sym)：沿原型链取 Symbol 键属性，
+// 并展开访问器 getter（this = O）。返回 (值, 找到与否) 或 (nil, 应抛错误)。
+// 与 vm.getSymbolMember 同构，但供 stdlib 内建在无 VM 句柄时使用 ——
+// getter 展开走 object.CallFunction 回调桥，异常经 callbackThrown 取回。
+//
+// 仅对能拥有属性的值（*Object / SymbolPropertyStore / RegExp 实例）做查找；
+// 原始值按规范 Get 返回 undefined（找不到）。
+func symbolGetViaChain(obj object.Value, sym *object.Symbol) (object.Value, bool, object.Value) {
+	if sym == nil {
+		return nil, false, nil
+	}
+	switch obj.(type) {
+	case *object.Object, *object.RegExp:
+	default:
+		if _, ok := obj.(object.SymbolPropertyStore); !ok {
+			return nil, false, nil
+		}
+	}
+	desc, found := object.LookupSymbolPropertyDescriptorChain(obj, sym)
+	if !found {
+		return nil, false, nil
+	}
+	if acc, isAcc := desc.Value.(*object.Accessor); isAcc {
+		if acc.Getter != nil && object.IsCallable(acc.Getter) {
+			r := object.CallFunction(acc.Getter, obj)
+			if thr := callbackThrown(); thr != nil {
+				return nil, false, thr
+			}
+			if r == nil {
+				r = object.UndefinedSingleton
+			}
+			return r, true, nil
+		}
+		return object.UndefinedSingleton, true, nil
+	}
+	if desc.Value == nil {
+		return object.UndefinedSingleton, true, nil
+	}
+	return desc.Value, true, nil
+}
+
+// getMethodViaSymbol 实现规范的 GetMethod(O, sym)：Get 之后若值非
+// undefined/null 还必须是可调用的，否则 TypeError。返回 (nil, nil) 表示
+// "方法未定义"（规范里 GetMethod 的 undefined 出口）。
+func getMethodViaSymbol(obj object.Value, sym *object.Symbol) (object.Value, object.Value) {
+	m, found, errv := symbolGetViaChain(obj, sym)
+	if errv != nil {
+		return nil, errv
+	}
+	if !found || isUndefinedValue(m) || isNullValue(m) {
+		return nil, nil
+	}
+	if !object.IsCallable(m) {
+		return nil, object.NewTypeError("%s is not a function", sym.Inspect())
+	}
+	return m, nil
+}
+
+// builtinProtoMethod 取内建原型上注册的 sym 方法（identity 比较，用于
+// 区分"用户覆盖"与"引擎自带"）。用户在自己的对象上挂 @@replace 派发进去，
+// 而普通 RegExp 实例沿链查到的还是内建方法 —— 后者跳过派发、走字符串侧
+// 快路径，避免行为回归。
+func builtinProtoMethod(proto *object.Object, sym *object.Symbol) object.Value {
+	if proto == nil || sym == nil {
+		return nil
+	}
+	if desc, ok := proto.GetSymbolPropertyDescriptor(sym); ok && desc.Value != nil {
+		return desc.Value
+	}
+	if v, ok := proto.GetProperty(object.ToString(sym)); ok {
+		return v
+	}
+	return nil
+}
+
+// isRegExpValue 实现规范的 IsRegExp：对象型才查 @@match（Get 语义 ——
+// 存在但不可调用按 truthy 计，getter 抛错原样传播）；引擎内置 *RegExp
+// 直接为 true。非对象一律 false。
+func isRegExpValue(v object.Value) (bool, object.Value) {
+	if _, ok := object.UnwrapPrimitive(v).(*object.RegExp); ok {
+		return true, nil
+	}
+	m, found, errv := symbolGetViaChain(v, object.GetGlobalSymbol("Symbol.match"))
+	if errv != nil {
+		return false, errv
+	}
+	if found && !isUndefinedValue(m) && !isNullValue(m) {
+		return !isFalsy(m), nil
+	}
+	return false, nil
+}
+
+// dispatchSymbolMethod 是 String.prototype 五个正则协作方法（split/match/
+// matchAll/replace/search）共用的 @@method 派发骨架：args[0] 非
+// undefined/null 时取 GetMethod(args[0], sym)，存在且**不是内建原型方法**
+// 则以 args[0] 为 this 调用（参数 rest），返回 (结果, true)。
+func dispatchSymbolMethod(sym *object.Symbol, proto *object.Object, this object.Value, args []object.Value, rest ...object.Value) (object.Value, bool, object.Value) {
+	if len(args) < 1 || isUndefinedValue(args[0]) || isNullValue(args[0]) {
+		return nil, false, nil
+	}
+	fn, errv := getMethodViaSymbol(args[0], sym)
+	if errv != nil {
+		return nil, false, errv
+	}
+	if fn == nil {
+		return nil, false, nil
+	}
+	if fn == builtinProtoMethod(proto, sym) {
+		// 引擎自带方法：字符串侧快路径已实现等价逻辑，派发会丢语义
+		// （内建 [Symbol.replace] 不如字符串侧的 $& 展开完整）。
+		return nil, false, nil
+	}
+	r := object.CallFunction(fn, args[0], rest...)
+	if thr := callbackThrown(); thr != nil {
+		return nil, false, thr
+	}
+	if r == nil {
+		r = object.UndefinedSingleton
+	}
+	return r, true, nil
+}
+
+// argOrUndefined 取 args[i]，越界时补 undefined —— 派发调用的参数个数
+// 必须与实参个数一致（cstm-split-invocation 断言 args.length === 2）。
+func argOrUndefined(args []object.Value, i int) object.Value {
+	if i < len(args) {
+		return args[i]
+	}
+	return object.UndefinedSingleton
+}
+
 // setupStringProto 创建 String.prototype 对象。
 func setupStringProto() *object.Object {
 	p := object.NewObject()
@@ -255,11 +386,15 @@ func setupStringProto() *object.Object {
 		if errv != nil {
 			return errv
 		}
-		idx := 0
+		idx := int64(0)
 		if len(args) > 0 {
-			idx = int(toInt(args[0]))
+			v, errv := toIntE(args[0])
+			if errv != nil {
+				return errv
+			}
+			idx = v
 		}
-		ch, ok := object.CharAtUTF16(s.Value, idx)
+		ch, ok := object.CharAtUTF16(s.Value, int(idx))
 		if !ok {
 			return object.NewString("")
 		}
@@ -272,11 +407,15 @@ func setupStringProto() *object.Object {
 		if errv != nil {
 			return errv
 		}
-		idx := 0
+		idx := int64(0)
 		if len(args) > 0 {
-			idx = int(toInt(args[0]))
+			v, errv := toIntE(args[0])
+			if errv != nil {
+				return errv
+			}
+			idx = v
 		}
-		code, ok := object.CharCodeAtUTF16(s.Value, idx)
+		code, ok := object.CharCodeAtUTF16(s.Value, int(idx))
 		if !ok {
 			// 规范: 越界返回 NaN。旧实现返回 0x10FFFF 是错误的。
 			return object.NewNumber(math.NaN())
@@ -290,17 +429,21 @@ func setupStringProto() *object.Object {
 		if errv != nil {
 			return errv
 		}
-		idx := 0
+		idx := int64(0)
 		if len(args) > 0 {
-			idx = int(toInt(args[0]))
+			v, errv := toIntE(args[0])
+			if errv != nil {
+				return errv
+			}
+			idx = v
 		}
 		u := object.ToUTF16(s.Value)
-		if idx < 0 || idx >= len(u) {
+		if idx < 0 || idx >= int64(len(u)) {
 			return object.UndefinedSingleton
 		}
 		c := u[idx]
 		// 高代理项 + 低代理项 → 合并为增补平面码点
-		if c >= 0xD800 && c <= 0xDBFF && idx+1 < len(u) {
+		if c >= 0xD800 && c <= 0xDBFF && idx+1 < int64(len(u)) {
 			lo := u[idx+1]
 			if lo >= 0xDC00 && lo <= 0xDFFF {
 				return object.NewNumber(float64(0x10000 + (uint32(c)-0xD800)<<10 + (uint32(lo) - 0xDC00)))
@@ -311,6 +454,20 @@ func setupStringProto() *object.Object {
 
 	// split(separator, limit)
 	p.SetBuiltinProperty("split", object.NewBuiltinMethod("split", func(this object.Value, args ...object.Value) object.Value {
+		// 规范步骤 1: RequireObjectCoercible(this)
+		if !requireObjectCoercible(this) {
+			return thisTypeError("String", "split", this)
+		}
+		// 规范步骤 2: separator 非 undefined/null 时先走 @@split 派发 ——
+		// 此时**不得** ToString(this)（this 带毒 getter 不能先于派发触发，
+		// cstm-split-invocation 一族盯这条顺序）。
+		if r, done, errv := dispatchSymbolMethod(object.GetGlobalSymbol("Symbol.split"), object.RegExpProto.(*object.Object), this, args, this,
+			argOrUndefined(args, 1)); done || errv != nil {
+			if errv != nil {
+				return errv
+			}
+			return r
+		}
 		s, errv := thisStringCoerced(this, p, "split")
 		if errv != nil {
 			return errv
@@ -320,10 +477,15 @@ func setupStringProto() *object.Object {
 			return object.NewArray([]object.Value{object.NewString(s.Value)})
 		}
 
-		// limit 解析: 省略或负数表示不限，0 表示空数组
+		// limit 解析: 省略或负数表示不限，0 表示空数组。
+		// ToIntegerOrInfinity 的 abrupt 必须传播（return-abrupt-from-limit 族）。
 		limit := -1
 		if len(args) > 1 && !isUndefinedValue(args[1]) {
-			limit = int(toInt(args[1]))
+			l, errv := toIntE(args[1])
+			if errv != nil {
+				return errv
+			}
+			limit = int(l)
 		}
 		if limit == 0 {
 			return object.NewArray([]object.Value{})
@@ -384,10 +546,18 @@ func setupStringProto() *object.Object {
 		start := 0
 		end := n
 		if len(args) > 0 {
-			start = clampIndex(toInt(args[0]), n)
+			v, errv := toIntE(args[0])
+			if errv != nil {
+				return errv
+			}
+			start = clampIndex(v, n)
 		}
 		if len(args) > 1 && !isUndefinedValue(args[1]) {
-			end = clampIndex(toInt(args[1]), n)
+			v, errv := toIntE(args[1])
+			if errv != nil {
+				return errv
+			}
+			end = clampIndex(v, n)
 		}
 		if start > end {
 			start, end = end, start
@@ -405,10 +575,18 @@ func setupStringProto() *object.Object {
 		start := 0
 		end := n
 		if len(args) > 0 {
-			start = clampIndex(toInt(args[0]), n)
+			v, errv := toIntE(args[0])
+			if errv != nil {
+				return errv
+			}
+			start = clampIndex(v, n)
 		}
 		if len(args) > 1 && !isUndefinedValue(args[1]) {
-			end = clampIndex(toInt(args[1]), n)
+			v, errv := toIntE(args[1])
+			if errv != nil {
+				return errv
+			}
+			end = clampIndex(v, n)
 		}
 		if start >= end {
 			return object.NewString("")
@@ -425,12 +603,20 @@ func setupStringProto() *object.Object {
 		if len(args) < 1 {
 			return object.NewNumber(-1)
 		}
-		search := toStr(args[0])
+		svs, errv := toPrimitiveToString(args[0])
+		if errv != nil {
+			return errv
+		}
+		search := svs.Value
 		fromIdx := 0
 		if len(args) > 1 {
 			// 同时钳位下界与上界: 上界防切片越界 panic，
 			// 下界按规范是 max(position, 0) 而非从末尾倒数。
-			fromIdx = clampStringIndex(toInt(args[1]), object.UTF16Len(s.Value))
+			v, errv := toIntE(args[1])
+			if errv != nil {
+				return errv
+			}
+			fromIdx = clampStringIndex(v, object.UTF16Len(s.Value))
 		}
 		return object.NewNumber(float64(utf16IndexOf(s.Value, search, fromIdx)))
 	}))
@@ -444,11 +630,18 @@ func setupStringProto() *object.Object {
 		if len(args) < 1 {
 			return object.NewNumber(-1)
 		}
-		search := toStr(args[0])
+		svs, errv := toPrimitiveToString(args[0])
+		if errv != nil {
+			return errv
+		}
+		search := svs.Value
 		n := object.UTF16Len(s.Value)
 		fromIdx := n // 省略参数时等价于从末尾开始
 		if len(args) > 1 && !isUndefinedValue(args[1]) {
-			f := toFloat(args[1])
+			f, errv := toFloatE(args[1])
+			if errv != nil {
+				return errv
+			}
 			switch {
 			case math.IsInf(f, -1):
 				fromIdx = -1 // 规范: 起始位置为负直接返回 -1
@@ -470,10 +663,18 @@ func setupStringProto() *object.Object {
 		if len(args) < 1 {
 			return object.NewBoolean(false)
 		}
-		search := toStr(args[0])
+		svs, errv := toPrimitiveToString(args[0])
+		if errv != nil {
+			return errv
+		}
+		search := svs.Value
 		fromIdx := 0
 		if len(args) > 1 {
-			fromIdx = clampStringIndex(toInt(args[1]), object.UTF16Len(s.Value))
+			v, errv := toIntE(args[1])
+			if errv != nil {
+				return errv
+			}
+			fromIdx = clampStringIndex(v, object.UTF16Len(s.Value))
 		}
 		return object.NewBoolean(utf16IndexOf(s.Value, search, fromIdx) >= 0)
 	}))
@@ -487,11 +688,19 @@ func setupStringProto() *object.Object {
 		if len(args) < 1 {
 			return object.NewBoolean(false)
 		}
-		search := toStr(args[0])
+		svs, errv := toPrimitiveToString(args[0])
+		if errv != nil {
+			return errv
+		}
+		search := svs.Value
 		n := object.UTF16Len(s.Value)
 		pos := 0
 		if len(args) > 1 {
-			pos = clampStringIndex(toInt(args[1]), n)
+			v, errv := toIntE(args[1])
+			if errv != nil {
+				return errv
+			}
+			pos = clampStringIndex(v, n)
 		}
 		return object.NewBoolean(strings.HasPrefix(object.SliceUTF16(s.Value, pos, n), search))
 	}))
@@ -505,11 +714,19 @@ func setupStringProto() *object.Object {
 		if len(args) < 1 {
 			return object.NewBoolean(false)
 		}
-		search := toStr(args[0])
+		svs, errv := toPrimitiveToString(args[0])
+		if errv != nil {
+			return errv
+		}
+		search := svs.Value
 		n := object.UTF16Len(s.Value)
 		endPos := n
 		if len(args) > 1 && !isUndefinedValue(args[1]) {
-			endPos = clampStringIndex(toInt(args[1]), n)
+			v, errv := toIntE(args[1])
+			if errv != nil {
+				return errv
+			}
+			endPos = clampStringIndex(v, n)
 		}
 		return object.NewBoolean(strings.HasSuffix(object.SliceUTF16(s.Value, 0, endPos), search))
 	}))
@@ -584,6 +801,19 @@ func setupStringProto() *object.Object {
 
 	// replace(searchValue, replaceValue | replaceFn)
 	p.SetBuiltinProperty("replace", object.NewBuiltinMethod("replace", func(this object.Value, args ...object.Value) object.Value {
+		// 规范步骤 1: RequireObjectCoercible(this) 先于派发。
+		if !requireObjectCoercible(this) {
+			return thisTypeError("String", "replace", this)
+		}
+		// 规范步骤 2: searchValue 非 undefined/null 时先走 @@replace 派发
+		// （在 ToString(this) 之前 —— this 的毒 getter 不能先触发）。
+		if r, done, errv := dispatchSymbolMethod(object.GetGlobalSymbol("Symbol.replace"), object.RegExpProto.(*object.Object), this, args,
+			this, argOrUndefined(args, 1)); done || errv != nil {
+			if errv != nil {
+				return errv
+			}
+			return r
+		}
 		s, errv := thisStringCoerced(this, p, "replace")
 		if errv != nil {
 			return errv
@@ -662,8 +892,11 @@ func setupStringProto() *object.Object {
 			result := object.CallFunction(fn, object.UndefinedSingleton, object.NewString(matchStr))
 			return object.NewString(s.Value[:idx] + toStr(result) + s.Value[idx+len(search):])
 		}
-		replacement := toStr(args[1])
-		return object.NewString(strings.Replace(s.Value, search, replacement, 1))
+		rps, errv := toPrimitiveToString(args[1])
+		if errv != nil {
+			return errv
+		}
+		return object.NewString(strings.Replace(s.Value, search, rps.Value, 1))
 	}))
 
 	// replaceAll(searchValue, replaceValue | replaceFn)
@@ -671,11 +904,48 @@ func setupStringProto() *object.Object {
 		// 规范（2021 修订）: searchValue 的 IsRegExp/flags 检查先于 ToString(this)
 		// —— 本用例的 this 是 toString 即抛毒的对象, flags 检查必须先发生
 		// (test262 replaceAll/searchValue-flags-no-g-throws)。
-		if len(args) > 0 {
-			if re, isRe := args[0].(*object.RegExp); isRe && !re.Global {
-				return object.NewErrorWithName("TypeError",
-					"String.prototype.replaceAll called with a non-global RegExp argument")
+		if !requireObjectCoercible(this) {
+			return thisTypeError("String", "replaceAll", this)
+		}
+		if len(args) > 0 && !isUndefinedValue(args[0]) && !isNullValue(args[0]) {
+			isRe, errv := isRegExpValue(args[0])
+			if errv != nil {
+				return errv
 			}
+			if isRe {
+				if re, ok := object.UnwrapPrimitive(args[0]).(*object.RegExp); ok {
+					if !re.Global {
+						return object.NewErrorWithName("TypeError",
+							"String.prototype.replaceAll called with a non-global RegExp argument")
+					}
+				} else {
+					// 泛型对象: flags = ? ToString(? Get(searchValue, "flags"))，须含 "g"
+					flags, found, gerr := symbolGetViaChain(args[0], object.GetGlobalSymbol("Symbol.match"))
+					_ = flags // IsRegExp 已消费 @@match；这里只走字符串键 "flags"
+					if gerr != nil {
+						return gerr
+					}
+					if o, ok := object.UnwrapPrimitive(args[0]).(*object.Object); ok && !found {
+						if fv, has := o.GetProperty("flags"); has && !isUndefinedValue(fv) && !isNullValue(fv) {
+							fs, errv := toPrimitiveToString(fv)
+							if errv != nil {
+								return errv
+							}
+							if !strings.Contains(fs.Value, "g") {
+								return object.NewErrorWithName("TypeError",
+									"String.prototype.replaceAll called with a non-global RegExp argument")
+							}
+						}
+					}
+				}
+			}
+		}
+		if r, done, errv := dispatchSymbolMethod(object.GetGlobalSymbol("Symbol.replace"), object.RegExpProto.(*object.Object), this, args,
+			this, argOrUndefined(args, 1)); done || errv != nil {
+			if errv != nil {
+				return errv
+			}
+			return r
 		}
 		s, errv := thisStringCoerced(this, p, "replaceAll")
 		if errv != nil {
@@ -745,20 +1015,17 @@ func setupStringProto() *object.Object {
 		if errv != nil {
 			return errv
 		}
-		c := float64(0)
-		if len(args) > 0 {
-			c = toFloat(args[0])
-		}
-		if math.IsInf(c, 0) {
-			return object.NewErrorWithName("RangeError", "Invalid string length")
-		}
-		if math.IsNaN(c) {
-			c = 0
-		}
-		// count 省略 = 0; 旧代码直接 args[0], "".repeat() 无参会 panic
+		// 规范 ToIntegerOrInfinity: abrupt 传播，NaN→0，Infinity→RangeError
 		count := 0
 		if len(args) > 0 {
-			count = int(toInt(args[0]))
+			v, errv := toIntE(args[0])
+			if errv != nil {
+				return errv
+			}
+			if v >= math.MaxInt64/2 {
+				return object.NewErrorWithName("RangeError", "Invalid string length")
+			}
+			count = int(v)
 		}
 		if count < 0 {
 			return object.NewErrorWithName("RangeError", "Invalid count value: must be non-negative")
@@ -777,11 +1044,19 @@ func setupStringProto() *object.Object {
 		}
 		targetLen := 0
 		if len(args) > 0 {
-			targetLen = int(toInt(args[0]))
+			v, errv := toIntE(args[0])
+			if errv != nil {
+				return errv
+			}
+			targetLen = int(v)
 		}
 		padStr := " "
 		if len(args) > 1 && !isUndefinedValue(args[1]) {
-			padStr = toStr(args[1])
+			ps, errv := toPrimitiveToString(args[1])
+			if errv != nil {
+				return errv
+			}
+			padStr = ps.Value
 		}
 		// 长度以 UTF-16 码元计，不能用 Go 的字节长度
 		n := object.UTF16Len(s.Value)
@@ -806,11 +1081,19 @@ func setupStringProto() *object.Object {
 		}
 		targetLen := 0
 		if len(args) > 0 {
-			targetLen = int(toInt(args[0]))
+			v, errv := toIntE(args[0])
+			if errv != nil {
+				return errv
+			}
+			targetLen = int(v)
 		}
 		padStr := " "
 		if len(args) > 1 && !isUndefinedValue(args[1]) {
-			padStr = toStr(args[1])
+			ps, errv := toPrimitiveToString(args[1])
+			if errv != nil {
+				return errv
+			}
+			padStr = ps.Value
 		}
 		n := object.UTF16Len(s.Value)
 		if targetLen <= n || padStr == "" {
@@ -901,7 +1184,11 @@ func setupStringProto() *object.Object {
 		}
 		idx := int64(0)
 		if len(args) > 0 {
-			idx = toInt(args[0])
+			v, errv := toIntE(args[0])
+			if errv != nil {
+				return errv
+			}
+			idx = v
 		}
 		n := int64(object.UTF16Len(s.Value))
 		if idx < 0 {
@@ -919,6 +1206,18 @@ func setupStringProto() *object.Object {
 
 	// match(regexp): 匹配正则表达式，无匹配返回 null
 	p.SetBuiltinProperty("match", object.NewBuiltinMethod("match", func(this object.Value, args ...object.Value) object.Value {
+		// 规范步骤 1: RequireObjectCoercible(this) 必须先于派发（this=undefined
+		// 时即便 regexp 带 @@match 也要 TypeError）。
+		if !requireObjectCoercible(this) {
+			return thisTypeError("String", "match", this)
+		}
+		// 规范步骤 2: regexp 是对象时先走 @@match 派发（ToString(this) 之前）。
+		if r, done, errv := dispatchSymbolMethod(object.GetGlobalSymbol("Symbol.match"), object.RegExpProto.(*object.Object), this, args, this); done || errv != nil {
+			if errv != nil {
+				return errv
+			}
+			return r
+		}
 		s, errv := thisStringCoerced(this, p, "match")
 		if errv != nil {
 			return errv
@@ -982,6 +1281,16 @@ func setupStringProto() *object.Object {
 
 	// matchAll(regexp): 返回所有匹配（规范为迭代器，这里简化为数组）
 	p.SetBuiltinProperty("matchAll", object.NewBuiltinMethod("matchAll", func(this object.Value, args ...object.Value) object.Value {
+		if !requireObjectCoercible(this) {
+			return thisTypeError("String", "matchAll", this)
+		}
+		// 规范步骤 2: regexp 非 undefined/null 时先走 @@matchAll 派发。
+		if r, done, errv := dispatchSymbolMethod(object.GetGlobalSymbol("Symbol.matchAll"), object.RegExpProto.(*object.Object), this, args, this); done || errv != nil {
+			if errv != nil {
+				return errv
+			}
+			return r
+		}
 		s, errv := thisStringCoerced(this, p, "matchAll")
 		if errv != nil {
 			return errv
@@ -1042,6 +1351,16 @@ func setupStringProto() *object.Object {
 
 	// search(regexp): 返回第一个匹配的码元索引，未找到返回 -1
 	p.SetBuiltinProperty("search", object.NewBuiltinMethod("search", func(this object.Value, args ...object.Value) object.Value {
+		if !requireObjectCoercible(this) {
+			return thisTypeError("String", "search", this)
+		}
+		// 规范步骤 2: regexp 是对象时先走 @@search 派发（ToString(this) 之前）。
+		if r, done, errv := dispatchSymbolMethod(object.GetGlobalSymbol("Symbol.search"), object.RegExpProto.(*object.Object), this, args, this); done || errv != nil {
+			if errv != nil {
+				return errv
+			}
+			return r
+		}
 		s, errv := thisStringCoerced(this, p, "search")
 		if errv != nil {
 			return errv
@@ -1183,7 +1502,7 @@ func utf16LastIndexOf(s, search string, fromIdx int) int {
 
 // isCaseIgnorable 实现 Unicode Case_Ignorable（UAX #21 / 3.13 D138）：
 // Mn/Me/Cf/Lm/Sk，或 Word_Break ∈ {MidLetter, MidNumLet, Single_Quote}
-// 的标点（ASCII 里即 '.' ':' '\''）。Final_Sigma 判定要跳过这些字符。
+// 的标点（ASCII 里即 '.' ':' '\”）。Final_Sigma 判定要跳过这些字符。
 func isCaseIgnorable(r rune) bool {
 	switch r {
 	case 0x002E, 0x003A, 0x0027, 0x00B7, 0x05F4, 0x2027, 0x2024, 0x2018, 0x2019,
