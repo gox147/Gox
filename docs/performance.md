@@ -145,8 +145,8 @@ gox / node / bun / goja **四栈全通**的同口径对比由 T2-2 首跑入库�
   node(V8) ~10×（fib28 原值口径）。
 - gox 的启动（与 bun 同档）与空载 RSS（≈ node 的 ~0.37×）仍是强项。
 
-**2026-11-12 夜批**（T3-4 第三批：globalThis memo 失效面收窄 `1ee67ef` +
-Stack.Pop 去清写 `53c7d63` + 数字快路径 `7d0ac34`，EPYC 9K65 沙箱本机，
+**2026-11-12 夜批**（T3-4 第三批：globalThis memo 失效面收窄 `fb741e2` +
+Stack.Pop 去清写 `85e3bd9` + 数字快路径 `ac3380e`，EPYC 9K65 沙箱本机，
 `bench-20261112-125620.json`）：
 
 | 栈 | 启动 (ms) | fib28+10万次调用 (ms) | 1万次定时器 (ms) | 空载 RSS (KB) |
