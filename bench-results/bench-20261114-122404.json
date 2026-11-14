@@ -1,0 +1,50 @@
+{
+  "generated_at": "2026-11-14T12:24:04.388907+00:00",
+  "runs_per_metric": 3,
+  "startup_runs_per_metric": 9,
+  "method": "每项外部 wall time 跑 3 次取中位数 (startup 单独 9 次, 抑制毫秒级抖动); RSS = 进程常驻峰值 (GNU time VmHWM / BSD time maxrss); 脚本本体零依赖",
+  "host": {
+    "platform": "Linux-7.0.0-1019-azure-x86_64-with-glibc2.43",
+    "machine": "x86_64",
+    "cpu": "AMD EPYC 7763 64-Core Processor",
+    "cores": 4,
+    "python": "3.14.4"
+  },
+  "stacks": [
+    "gox",
+    "node",
+    "bun",
+    "goja"
+  ],
+  "note": "gox/node/bun/goja 各列同源脚本; goja 是纯解释器对照系 (与 gox 同类), node 是 V8(JIT)、bun 是 JavaScriptCore 对照; node 列是 Electron 主进程同构口径, 非完整 GUI 空壳; 未安装的栈不出现在 results 里 (stdout 会注明跳过)",
+  "results": [
+    {
+      "stack": "gox",
+      "startup_ms": 7,
+      "fib28_ms": 247,
+      "timers10k_ms": 173,
+      "rss_kb": 19976
+    },
+    {
+      "stack": "node",
+      "startup_ms": 30,
+      "fib28_ms": 36,
+      "timers10k_ms": 139,
+      "rss_kb": 44056
+    },
+    {
+      "stack": "bun",
+      "startup_ms": 8,
+      "fib28_ms": 15,
+      "timers10k_ms": 113,
+      "rss_kb": 15524
+    },
+    {
+      "stack": "goja",
+      "startup_ms": 6,
+      "fib28_ms": 203,
+      "timers10k_ms": 122,
+      "rss_kb": 7552
+    }
+  ]
+}

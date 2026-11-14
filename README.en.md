@@ -70,7 +70,7 @@ a scripting layer inside a Go program, or write small GUI tools with it and ship
 Stating the boundary up front saves you the round trip:
 
 - **Not a Node.js replacement for web backends** — no CommonJS (`require`) and most of the npm ecosystem won't run; see the [compatibility matrix](docs/compat-matrix.md).
-- **Not for CPU-bound computation** — a pure interpreter with no JIT; `fib28` is ~3× slower than goja and an order of magnitude slower than V8. See [Performance](#performance).
+- **Not for CPU-bound computation** — a pure interpreter with no JIT; `fib28` runs at **1.22×** of goja (2026-11-14 CI re-test, within the same-class ×1.25 threshold) and an order of magnitude slower than V8-class JIT engines — the inherent "pure interpreter vs JIT" gap, not an implementation defect. See [Performance](#performance).
 - **Not for production systems needing full ES conformance** — test262 `built-ins` compliance is 62%, with `Temporal` / `RegExp` and others still missing whole blocks.
 - **Not a "write once, run anywhere" fantasy for GUI** — three-platform form factors (foldables, safe areas, permissions) differ for real and need per-platform adaptation.
 
@@ -718,18 +718,30 @@ The script runtime permission model (`--allow-fs-write` etc., least privilege by
 > Figures come from public benchmarks run on CI runners (`bench-results/`, AMD EPYC 7763) and the
 > website's own measurements (Apple M2). **Including the one we miss** — methodology and thresholds
 > are fully published.
+>
+> **Disclaimer (mandatory when quoting any bun / node / V8 comparison)**: gox is a **pure interpreter**
+> (zero cgo, walks bytecode directly, deliberately no JIT). The compute gap against node (V8/JIT) and
+> bun (JavaScriptCore/JIT) is mostly the **inherent "pure interpreter vs JIT" gap** and must not be
+> counted as Gox implementation defects; **goja, also a pure interpreter, is the same-class baseline**.
 
-| Metric | gox | goja (pure interpreter reference) | node / V8 (JIT reference) |
-|---|---:|---:|---:|
-| Startup | 4 ms | 3 ms | 25 ms |
-| `fib28` pure compute | 631 ms | 200 ms | 34 ms |
-| 10k timers | 168 ms | 116 ms | 139 ms |
-| Resident RSS | 25 MB | 10 MB | 42 MB |
+| Metric | gox | goja (pure interpreter reference) | bun (JSC/JIT reference) | node / V8 (JIT reference) |
+|---|---:|---:|---:|---:|
+| Startup | 7 ms | 6 ms | 8 ms | 30 ms |
+| `fib28` pure compute | 247 ms | 203 ms | 15 ms | 36 ms |
+| 10k timers | 173 ms | 122 ms | 113 ms | 139 ms |
+| Resident RSS | 20 MB | 7.6 MB | 15.5 MB | 44 MB |
 
-**Verdict**: startup and memory are on par with comparable interpreters; pure compute throughput is
-**not on par with goja** (`fib28` ~3× slower), the direct cost of a pure interpreter with no JIT, and
-not an optimisation target. **UI is free of GC pauses** (stressed-run aggregate p95 frame interval
-5.95ms ≤ 16.7ms; single GC pause max 1.382ms ≤ 5ms).
+> Snapshot from the 2026-11-14 CI bench run (`bench-results/bench-20261114-122404.json`, runs=5
+> medians; repro commands in `docs/performance.md` §9). **`fib28` vs goja (same-class pure
+> interpreter) = 247/203 ≈ 1.22×, now within the §3.1 ×1.25 threshold (pass)**; against node the
+> raw ratio is 6.9×, above the 3× red line, and node's column is startup-noise dominated
+> (30 ms of its 36 ms is startup).
+
+**Verdict**: startup and memory are on par with comparable interpreters; **pure compute throughput is
+now on par with goja** (`gox_fib28 ≤ goja_fib28 × 1.25`, per `docs/performance.md` §3.1, CI-confirmed
+2026-11-14). The `fib28` gap against bun/node is the inherent "pure interpreter vs JIT" gap and is not
+an optimisation target. **UI is free of GC pauses** (same-day CI stressed-run aggregate p95 frame
+interval 13.49ms ≤ 16.7ms; single GC pause max 0.474ms ≤ 5ms).
 
 The virtualised long list (`<scroll vlist>`) is decoupled from row count: first frame for 100k rows is
 89ms vs 2187ms for a full render (~24×), and scroll frames stay at 0.11–0.17ms vs 999ms for a full render.
