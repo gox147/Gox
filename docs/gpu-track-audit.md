@@ -91,6 +91,18 @@ darwin 目标需要本机 cgo 工具链（`CGO_ENABLED=1` + Apple 工具链）�
 | GPU_Dirty（512²） | 147.9 ms | 与全帧几乎同速：软件 HAL 每 Draw 全量重建，脏区不省 |
 | GPU_UploadOnly | 2.68 ms | **唯一可迁移到真实硬件的数字**；硬件上应用 CPU 收益 ≈ 39.1 → 2.7ms（~14x） |
 
+## 复跑核销（2026-11-15，Linux x86_64 32 核沙箱，无硬件）
+
+`gpu-track-audit.sh` 全量复跑：三轨输出与 2026-11-08 基线逐项一致
+（nogpu=none / wgpu=software 兜底口径 / cgo=none），接入面结论不变
+（移动端未接入、swapchain TODO 1 处、CI 跑批文件在位）。
+`go test ./gfx/gpu` 与 `go test -tags gpu ./gfx/gpu` 均绿。
+`--xcompile` 矩阵复跑：windows/amd64、linux/arm64 ok；darwin/arm64
+fakecgo 符号冲突、js/wasm 构建约束排除，均与上表一致。
+
+CI 首跑验证：gpu-present.yml 入仓后从未被触发（path 过滤未命中），
+2026-11-15 以 workflow_dispatch 强制首跑 —— 结果见下方补充。
+
 ## 硬件覆盖待办（G-1 收尾条件）
 
 - [ ] 在带 GPU 硬件的机器（win32 / x11 / cocoa 各一）重跑

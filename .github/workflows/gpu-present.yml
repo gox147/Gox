@@ -85,8 +85,13 @@ jobs:
 
   # ── 硬件可信口径：占位。self-hosted runner 打 [gpu-hardware] 标签即启用；
   #    当前仓库没有这类 runner，job 恒 skip —— 不会因为缺 runner 而报红。
+  #    skip 守卫用仓库变量（Settings → Variables → Actions）：挂上硬件
+  #    runner 后置 GPU_HARDWARE_RUNNER=true 即启用本 job；不设置则直接
+  #    skip。不能只靠 runs-on 标签守卫 —— 标签不匹配时 job 会停在
+  #    queued 直到 timeout 报红（2026-11-15 首跑实测踩中）。
   hardware:
     name: 硬件口径 (可信, 进闸门候选)
+    if: vars.GPU_HARDWARE_RUNNER == 'true'
     runs-on: [self-hosted, gpu-hardware]
     timeout-minutes: 30
     steps:
