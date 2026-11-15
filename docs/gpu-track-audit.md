@@ -101,7 +101,13 @@ darwin 目标需要本机 cgo 工具链（`CGO_ENABLED=1` + Apple 工具链）�
 fakecgo 符号冲突、js/wasm 构建约束排除，均与上表一致。
 
 CI 首跑验证：gpu-present.yml 入仓后从未被触发（path 过滤未命中），
-2026-11-15 以 workflow_dispatch 强制首跑 —— 结果见下方补充。
+2026-11-15 以 workflow_dispatch 强制首跑。首跑踩出一个 CI 缺陷：
+hardware job 只有 runs-on 标签守卫，无 runner 时停在 queued 直到
+timeout 报红（注释声称「自动 skip」但 yaml 未实现）。已修复（f6c64d3）：
+`if: vars.GPU_HARDWARE_RUNNER == 'true'` 仓库变量守卫。修复后 push 触发
+复跑：兜底口径 job success（test + 核销表 + 4K 基准，产物上传），
+hardware job skipped —— 「CI gpu 跑批接入」验收项闭环。挂硬件 runner 后
+置仓库变量 `GPU_HARDWARE_RUNNER=true` 即启用硬件口径 job。
 
 ## 硬件覆盖待办（G-1 收尾条件）
 
