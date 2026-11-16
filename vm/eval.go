@@ -26,6 +26,16 @@ func (vm *VM) consumeEvalMark(fn object.Value) {
 	if v, ok := vm.globals.Get("eval"); ok && v == fn {
 		thisVal, callerStrict := vm.callerEvalContext()
 		object.SetDirectEvalThis(thisVal, callerStrict)
+		// 直接 eval 的「调用方非简单形参列表」标志: 规范
+		// sec-evaldeclarationinstantiation 5.d.ii —— 调用方函数带非简单形参
+		// (默认值/rest/解构) 时, eval 代码 varNames 含 "arguments" 是
+		// SyntaxError。判定依据闭包元数据 (编译期从 AST 写入, rest 解构 +
+		// 预收集形态的 IsRest 会被清掉, 不能运行期从 Parameters 推导)。
+		if frame := vm.currentFrame(); frame != nil && frame.Closure != nil && frame.Closure.Fn != nil {
+			object.SetDirectEvalNonSimpleParams(frame.Closure.Fn.HasNonSimpleParams)
+		} else {
+			object.SetDirectEvalNonSimpleParams(false)
+		}
 		// 直接 eval 的 new.target 上下文: 调用者帧的 new.target 与「该语境是否
 		// 允许 new.target」。规范只允许「非箭头函数体内的直接 eval」含 new.target。
 		nt, ntAllowed := vm.callerEvalNewTarget()

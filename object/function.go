@@ -57,6 +57,12 @@ type CompiledFunction struct {
 	BaseSlot int
 	// ArgumentsSlot 是 arguments 对象的槽位 (-1 表示未使用)
 	ArgumentsSlot int
+	// HasNonSimpleParams 报告形参列表是否「非简单」(任一形参带默认值 / rest /
+	// 解构模式)。规范 sec-evaldeclarationinstantiation 5.d.ii: 调用方为非简单
+	// 形参列表时, 直接 eval 里 `var arguments` 声明是 SyntaxError —— VM 在
+	// 消费直接 eval 标记时读此位, 经桥传给 eval 内建。由编译器从 AST 写入
+	// FunctionMetadata.HasNonSimpleParams, 装配时透传 (见 vm.metaToCompiledFunction)。
+	HasNonSimpleParams bool
 	// SkipArguments 为真表示函数体从未读取 arguments 槽位 (编译期指令流
 	// 扫描得出, 见 compiler.argumentsObserved)。VM 调用时跳过 arguments
 	// 对象物化 (T2-4 热点优化: 省 2 次堆分配/调用)。

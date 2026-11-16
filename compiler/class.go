@@ -764,6 +764,7 @@ func (c *Compiler) compileClassConstructor(fields []*ast.ClassField, ctor *ast.C
 	meta.CapturePrefixLen = computeCapturePrefixLen(fnIns, baseSlot, c.constants)
 	meta.ArgumentsSlot = argumentsSlot
 	meta.SkipArguments = !argumentsObserved(fnIns, argumentsSlot)
+	meta.HasNonSimpleParams = ctor != nil && hasNonSimpleParams(ctor.Parameters)
 	meta.IsStrict = c.strict
 	meta.Positions = toSrcPosList(fnSrcPositions)
 	return meta, nil

@@ -179,6 +179,53 @@ func TakeDirectEvalThis() (this Value, callerStrict bool, ok bool) {
 	return v, s, true
 }
 
+// directEvalNonSimple 记录「直接 eval 调用方函数是否为非简单形参列表」。
+// 规范 sec-evaldeclarationinstantiation 5.d.ii: 调用方
+// [[HasNonSimpleParameterList]] 为真时, eval 代码 varNames 含 "arguments"
+// 即 SyntaxError (无论 eval 是否严格)。一次性桥, 与 this 桥同纪律
+// (消费即清除)。
+var (
+	directEvalNonSimple    bool
+	hasDirectEvalNonSimple bool
+)
+
+// SetDirectEvalNonSimpleParams 由 vm 在确认「本次调用是直接 eval」后调用,
+// 写入调用者帧闭包的 HasNonSimpleParams。
+func SetDirectEvalNonSimpleParams(v bool) {
+	directEvalNonSimple = v
+	hasDirectEvalNonSimple = true
+}
+
+// TakeDirectEvalNonSimpleParams 取出并清除该标志。ok=false 表示本次不是
+// 直接 eval, 调用方不应做 5.d.ii 早错判定。
+func TakeDirectEvalNonSimpleParams() (nonSimple bool, ok bool) {
+	if !hasDirectEvalNonSimple {
+		return false, false
+	}
+	v := directEvalNonSimple
+	directEvalNonSimple = false
+	hasDirectEvalNonSimple = false
+	return v, true
+}
+
+// evalVarDeclaredNamesHook 是「eval 源码顶层 var 声明名收集」的实现 (vm 包
+// 注册, 有 parser/ast 可用)。stdlib 的 eval 内建据此做 5.d.ii 早错判定。
+type EvalVarNamesFunc func(string) []string
+
+var evalVarDeclaredNamesHook EvalVarNamesFunc
+
+// SetEvalVarDeclaredNamesHook 由 vm 包在 init 里注册实现。
+func SetEvalVarDeclaredNamesHook(f EvalVarNamesFunc) { evalVarDeclaredNamesHook = f }
+
+// EvalVarDeclaredNames 收集 eval 源码顶层的 var 声明名 (穿透块, 不进嵌套
+// 函数)。钩子未注册或解析失败时返回 nil。
+func EvalVarDeclaredNames(src string) []string {
+	if evalVarDeclaredNamesHook == nil {
+		return nil
+	}
+	return evalVarDeclaredNamesHook(src)
+}
+
 // directEvalNewTarget 记录「直接 eval 调用者帧生效的 new.target」以及该语境
 // 是否允许 eval 源码出现 new.target。规范 sec-scripts-static-semantics-early-
 // errors: NewTarget 只在「非箭头函数体内的直接 eval」合法 —— 由 VM 依调用者帧

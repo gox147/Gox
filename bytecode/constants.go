@@ -190,6 +190,13 @@ type FunctionMetadata struct {
 	// 与普通 async 函数区分 —— 而二者的函数对象 [[Prototype]] 不同
 	// (AsyncGeneratorFunction.prototype vs AsyncFunction.prototype)，故显式记。
 	IsAsyncGenerator bool
+	// HasNonSimpleParams 报告形参列表是否为「非简单」(任一形参带默认值 /
+	// rest / 解构模式)。规范 sec-evaldeclarationinstantiation 5.d.ii: 调用方
+	// 函数为非简单形参列表时, 直接 eval 里的 `var arguments` 声明是
+	// SyntaxError —— VM 消费直接 eval 标记时读此位, 经桥传给 eval 内建。
+	// 注意 IsRest 在 rest 解构 + 预收集形态下可能为 false (restPreCollected),
+	// 故该位必须在编译期从 AST 判定, 不能从 Parameters 推导。
+	HasNonSimpleParams bool
 	// SourceText 是函数的 [[SourceText]] (Function.prototype.toString 用)。
 	// 仅用户定义的函数/方法/类构造器携带; 内建与合成函数留空, toString 回退
 	// NativeFunction 形态。
