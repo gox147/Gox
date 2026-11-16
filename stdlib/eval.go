@@ -83,6 +83,22 @@ func setupEvalAndMisc(env *runtime.Environment) {
 			// 规范: 非字符串参数原样返回
 			return args[0]
 		}
+		// 直接 eval 的「调用方非简单形参列表」补充早错 (规范
+		// sec-evaldeclarationinstantiation 5.d.ii): 调用方函数带非简单形参
+		// (默认值/rest/解构) 时, eval 代码顶层 var 声明名含 "arguments" 是
+		// SyntaxError —— 无论 eval 代码是否严格。此时调用方函数的函数环境
+		// 存在 lexical-ish 的 arguments 绑定 (参数环境), eval 的 var 声明
+		// 与之冲突。须在执行 eval 体之前拦下 (否则 var 会落到全局)。
+		if isDirect {
+			if nonSimple, ok := object.TakeDirectEvalNonSimpleParams(); ok && nonSimple {
+				for _, name := range object.EvalVarDeclaredNames(src.Value) {
+					if name == "arguments" {
+						return object.NewErrorWithName("SyntaxError",
+							"SyntaxError: Cannot declare 'arguments' in direct eval code when the caller has non-simple parameter list")
+					}
+				}
+			}
+		}
 		if restrictedInit && evalInitRejectsRestricted(src.Value) {
 			// 返回 *object.Error → VM 作为异常抛出 (与 runGlobalEval 同口径)。
 			// 在编译/执行 eval 体之前抛出, 故体副作用 (如 executed=true) 不会发生。

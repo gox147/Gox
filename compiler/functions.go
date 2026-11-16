@@ -8,6 +8,21 @@ import (
 	"github.com/14752222/Gox/object"
 )
 
+// hasNonSimpleParams 判定形参列表是否「非简单」(任一形参带默认值 / rest /
+// 解构模式)。规范 [[HasNonSimpleParameterList]]。须从 AST 判定 —— Parameters
+// 规格里 rest 解构 + 预收集形态的 IsRest 会被清掉 (restPreCollected), 推导会漏。
+func hasNonSimpleParams(params []*ast.Parameter) bool {
+	for _, p := range params {
+		if p == nil {
+			continue
+		}
+		if p.Pattern != nil || p.Default != nil || p.Rest {
+			return true
+		}
+	}
+	return false
+}
+
 func (c *Compiler) compileParamBinding(params []*ast.Parameter, paramSlots []int) error {
 	// 预收集每个形参的绑定名, 供默认值求值时的 TDZ 判定 (见 paramTDZNames)。
 	paramNames := make([][]string, len(params))
@@ -343,6 +358,7 @@ func (c *Compiler) compileFunctionSelf(name, selfName string, params []*ast.Para
 	meta.IsAsync = false
 	meta.IsMethod = isMethod
 	meta.ParamPrologueEnd = paramPrologueEnd
+	meta.HasNonSimpleParams = hasNonSimpleParams(params)
 	meta.IsStrict = c.strict
 	meta.Positions = toSrcPosList(fnSrcPositions)
 	return meta, nil
@@ -484,6 +500,7 @@ func (c *Compiler) compileAsyncFunctionSelf(name, selfName string, params []*ast
 	meta.SkipArguments = !argumentsObserved(wrapperIns, argumentsSlot)
 	meta.IsAsync = true
 	meta.IsMethod = isMethod
+	meta.HasNonSimpleParams = hasNonSimpleParams(params)
 	meta.IsStrict = c.strict
 	return meta, nil
 }
@@ -613,6 +630,7 @@ func (c *Compiler) compileAsyncGeneratorSelf(name, selfName string, params []*as
 	// 故显式标记种类供 vm.createClosure 选择函数对象原型 (见 object.FuncPrototypeOf)。
 	meta.IsAsyncGenerator = true
 	meta.IsMethod = isMethod
+	meta.HasNonSimpleParams = hasNonSimpleParams(params)
 	meta.IsStrict = c.strict
 	return meta, nil
 }

@@ -29,6 +29,7 @@ func init() {
 	object.SetCompileSourceAllowingNewTarget(compileForBridgeAllowingNewTarget)
 	object.SetCompileSourceEval(compileForBridgeEval)
 	object.SetCompileSourceOpts(compileForBridgeWithOpts)
+	object.SetEvalVarDeclaredNamesHook(evalVarDeclaredNames)
 }
 
 // compileSource 编译 JS 源码。moduleMode 为 true 时模块有自己的命名空间,
@@ -161,26 +162,27 @@ func lastFunctionMeta(c *compiler.Compiler) *bytecode.FunctionMetadata {
 // CompiledFunction (createClosure 与编译桥共用)。
 func metaToCompiledFunction(meta *bytecode.FunctionMetadata, consts []object.Value) *object.CompiledFunction {
 	fn := &object.CompiledFunction{
-		Instructions:  meta.Instructions,
-		NumLocals:      meta.NumLocals,
-		NumParameters:  meta.NumParameters,
-		Length:         meta.Length,
-		Name:           meta.Name,
-		IsArrow:        meta.IsArrow,
-		IsGenerator:    meta.IsGenerator,
-		IsAsync:        meta.IsAsync,
-		IsMethod:       meta.IsMethod,
-		IsAsyncGenerator: meta.IsAsyncGenerator,
-		IsStrict:         meta.IsStrict,
-		SourceText:       meta.SourceText,
-		BaseSlot:       meta.BaseSlot,
-		ArgumentsSlot:  meta.ArgumentsSlot,
-		SkipArguments:  meta.SkipArguments,
-		SelfSlot:       meta.SelfSlot,
-		ParamPrologueEnd: meta.ParamPrologueEnd,
-		DeferParams:    meta.DeferParams,
-		Constants:      consts,
-		Positions:      srcPosList(meta.Positions), // T05: 函数体语句位置表
+		Instructions:       meta.Instructions,
+		NumLocals:          meta.NumLocals,
+		NumParameters:      meta.NumParameters,
+		Length:             meta.Length,
+		Name:               meta.Name,
+		IsArrow:            meta.IsArrow,
+		IsGenerator:        meta.IsGenerator,
+		IsAsync:            meta.IsAsync,
+		IsMethod:           meta.IsMethod,
+		IsAsyncGenerator:   meta.IsAsyncGenerator,
+		IsStrict:           meta.IsStrict,
+		SourceText:         meta.SourceText,
+		BaseSlot:           meta.BaseSlot,
+		ArgumentsSlot:      meta.ArgumentsSlot,
+		HasNonSimpleParams: meta.HasNonSimpleParams,
+		SkipArguments:      meta.SkipArguments,
+		SelfSlot:           meta.SelfSlot,
+		ParamPrologueEnd:   meta.ParamPrologueEnd,
+		DeferParams:        meta.DeferParams,
+		Constants:          consts,
+		Positions:          srcPosList(meta.Positions), // T05: 函数体语句位置表
 	}
 	for _, ps := range meta.Parameters {
 		fn.Parameters = append(fn.Parameters, object.ParameterInfo{
