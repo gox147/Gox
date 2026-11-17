@@ -103,6 +103,12 @@ bench-results/perf-stress-*.json
 # 4K 呈现 A/B 基准（scripts/bench-present-4k.sh）的 txt 口径产物：同属观测产物，
 # 结论写进提交信息/文档，文件本身不入库。
 bench-results/present-4k-*.txt
+# 冷启动三条口径的原始结果（T3-5，scripts/check-coldstart.py 消费）：与 perf-probe
+# 同属观测产物 —— 闸门只读「最新一份」，历史值一律落进 coldstart-baseline.json
+# 与 docs/performance.md §12.5 的台账。进程级那份（coldstart-process-*.json）
+# 例外，保持入库：它是 §12.1「对外可引用的首帧数字」的出处，需要可追溯。
+bench-results/coldstart-2*.json
+bench-results/coldstart-font-*.json
 
 # macOS 访达噪音与仓库根目录的临时构建产物（gox CLI 用 scripts/build-npm.sh 出包，
 # 根目录的 gox 只是随手 go build 的二进制，不该入库）。

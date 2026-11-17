@@ -303,6 +303,33 @@ jobs:
           if [ -n "$gstats" ]; then echo "::error::linux/xvfb 画廊实测=[${gstats}]"; fi
           exit "$rc"
 
+      # ── 冷启动闸门（T3-5）──────────────────────────────────────────────────
+      # 为什么单独一步而不是塞进 go test：第一步是两个**不用跑基准**的守卫 ——
+      #   ① 字体文件"一次启动只读一次盘"的断言（纯逻辑, 毫秒级）；
+      #   ② check-coldstart.py 的自测（判据本身坏了要先知道, 与 check-bench
+      #   同一纪律）。这两条一红就是实现/判据坏了, 与机器负载无关。
+      # 第二步才跑分阶段探针并过闸门：它依赖字体目录规模（runner 上装了
+      #   fonts-noto-cjk，与我们刷基线时的组织方式一致），所以阈值按比值判；
+      #   换了 runner 镜像导致绝对值漂移时, 用 --update-baseline 重新固化。
+      - name: 冷启动闸门（字体只读一次 + 闸门自测 + 分阶段扫描成本）
+        if: runner.os == 'Linux'
+        run: |
+          set -euo pipefail
+          sudo apt-get install -yq fonts-noto-cjk
+          if ! go test ./gfx/ -run 'TestFontFileReadOnceAcrossScanAndChoose|TestFontFileReadHookIsLive|TestFontFileCacheHonoursFileIdentity' -count=1; then
+            echo "::error::字体文件被重复读盘 —— 扫描/选默认字体/按族名取面 必须共用 fontFileCache 里的同一份解析结果（见 gfx/font.go 的 fontFileEntry 注释）"
+            exit 1
+          fi
+          if ! python3 scripts/check-coldstart.py --self-test; then
+            echo "::error::check-coldstart.py 自测未通过 —— 闸门判据已失效, 它可能不再拦任何东西"
+            exit 1
+          fi
+          go test ./gfx/ -run TestColdstartFontStage -count=1 -v
+          if ! python3 scripts/check-coldstart.py; then
+            echo "::error::冷启动出现回归 —— 上面逐项列出了超阈值的指标；确认是有意的变化后跑 python3 scripts/check-coldstart.py --update-baseline 固化"
+            exit 1
+          fi
+
       # 证据纪律（看板 rXrGfu，2026-10-07 补）：本步曾在 macos-latest 上持续红，
       # 而 check-run 注解只有 `Process completed with exit code 1.`（未登录读不到
       # job 日志）⇒ 与 Linux 那条同款处理：自己把「失败包 + 失败用例名 + 断言明细」

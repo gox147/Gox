@@ -9,6 +9,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"time"
 
 	"golang.org/x/image/font"
 	"golang.org/x/image/font/opentype"
@@ -81,6 +82,43 @@ var injectedFonts []string
 
 // scannedFonts 是目录扫描的结果 (initFontCandidates 填, 只填一次)。
 var scannedFonts []string
+
+// fontFileCache 是"字体文件的第一个可用面"的进程级缓存:
+//
+//	路径 → (文件身份(mtime, size), 正体面, 解析出来的全部面)
+//
+// 冷启动线 (T3-5 第五批) 加它的原因: 目录扫描一次要 `parseFontFile` 300+
+// 个文件 (本机 330 个 / 148MB, 其中 4 个 CJK 集合字体合计 ~93MB), 耗时
+// ~60ms; 紧接着 chooseBaseFont 又从**磁盘重读**一遍首个候选 (19MB, ~15ms),
+// 而 finalizeFontCandidates 在扫描落空时还会再重读一次。同一份字节在同一次
+// 启动里被读了 2~3 遍 —— 这是"扫描", 不是"解析"贵 (实测同机 148MB 读盘
+// ≈ 30ms, 解析同批字体头只有几十 µs 量级)。
+//
+// 缓存键带文件身份而**不是只带路径**: 扫描结果是跨进程持久的思路 (落盘索引)
+// 才需要它, 这里只做**进程内**去重, 但身份仍要在 —— 宿主在同一个进程里
+// 换掉字体文件 (gox dev 热重启的父进程长存, 子进程退出不影响它; 测试里同
+// 一个进程换临时字体目录) 时, 旧的面不能继续用。
+//
+// 缓存的值是"面"而不是"文件字节": 面持有 sfnt 解析结果的引用, 字节本身在
+// 解析完成后由 GC 回收 —— 缓存 330 个文件的字节要 148MB, 缓存 330 个面只
+// 是几个指针。
+type fontFileEntry struct {
+	mtime time.Time
+	size  int64
+	// reg 是最适合当默认正文的那个面 (parseFontFile 的口径, 见 baseFaceRank);
+	// nil 表示这个文件解析不出任何面 (exe 改名的 .ttf / 损坏文件)。
+	reg *opentype.Font
+	// all 是文件里的全部面 (延迟填充: 只有被 fontFromSrc 要过才解析), 供
+	// 族索引按需要取 —— 扫描阶段只需要 reg, 解析全部面是 fontFamily 的账。
+	all []*opentype.Font
+	// parsing 表示"某个调用者正在解析 all", 其余调用者应等待而不是重复读盘。
+	parsing bool
+}
+
+var (
+	fontFileMu    sync.Mutex
+	fontFileCache = map[string]*fontFileEntry{}
+)
 
 // rebuildCandidatesLocked 重算生效候选表。调用方必须持有 fontMu。
 func rebuildCandidatesLocked() {
@@ -357,7 +395,38 @@ func scanSystemFonts(dirs []string, limit int) []string {
 // 不再是 col.Font(0): 集合字体里的 face 0 未必是正体 (fonts-noto-cjk 的
 // NotoSansCJK-Bold.ttc 每个面都是粗体), 而拿粗体面当默认字体 = 整屏正文加粗
 // —— 见 chooseBaseFont 的说明。
+//
+// T3-5 第五批: 结果按 (路径, mtime, size) 进进程级缓存。它在冷启动里要被
+// 调 300+ 次 (目录扫描逐个试解析), 随后 chooseBaseFont 又从磁盘重读同一个
+// 19MB 文件 —— 同一个文件在同一次启动里只该读一次 (见 fontFileEntry)。
 func parseFontFile(path string) (*opentype.Font, error) {
+	ent, err := loadFontFileEntry(path)
+	if err != nil {
+		return nil, err
+	}
+	if ent.reg == nil {
+		// 解析成功但一个面都读不出来: 仍按旧实现口径显式报错 (scanSystemFonts
+		// 只拿"有没有 err"当"这文件是不是真字体")。
+		return nil, fmt.Errorf("%s: no readable face", filepath.Base(path))
+	}
+	return ent.reg, nil
+}
+
+// loadFontFileEntry 取一个字体文件的解析结果 (带 (mtime, size) 身份校验的
+// 进程级缓存)。键是绝对/给定的路径, 身份在每次命中时重新 stat。
+func loadFontFileEntry(path string) (*fontFileEntry, error) {
+	st, err := os.Stat(path)
+	if err != nil {
+		return nil, err
+	}
+	fontFileMu.Lock()
+	if ent, ok := fontFileCache[path]; ok && ent.size == st.Size() && ent.mtime.Equal(st.ModTime()) {
+		fontFileMu.Unlock()
+		return ent, nil
+	}
+	fontFileMu.Unlock()
+
+	fireFontReadHook(path)
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, err
@@ -366,7 +435,100 @@ func parseFontFile(path string) (*opentype.Font, error) {
 	if err != nil {
 		return nil, err
 	}
-	return regularFaceOf(col)
+	ent := &fontFileEntry{mtime: st.ModTime(), size: st.Size()}
+	if reg, rerr := regularFaceOf(col); rerr == nil {
+		ent.reg = reg
+	}
+	fontFileMu.Lock()
+	fontFileCache[path] = ent
+	fontFileMu.Unlock()
+	return ent, nil
+}
+
+// fireFontReadHook 触发读盘钩子 (生产路径上是空操作)。
+func fireFontReadHook(path string) {
+	if h := fontReadHook; h != nil {
+		h(path)
+	}
+}
+
+// fontReadHook 是"字体文件真的被读盘了"的测试钩子 (仅测试期非 nil)。
+//
+// 为什么留钩子而不是用耗时断言: 冷启动的浪费形态是"同一个文件读了两次",
+// 这在 CI 上不会有稳定可观测的时间差 (页缓存会把第二次读变得几乎免费),
+// 但读盘次数是确定的。钩子只在未命中缓存、真要 os.ReadFile 时触发, 生产
+// 路径上恒为 nil, 代价是一次 nil 判断。
+var fontReadHook func(path string)
+
+// fontFileFaces 返回文件里的全部面 (按需解析, 一次)。
+//
+// 只在"按族名选面" (fontFromSrc) 时用 —— 目录扫描阶段只需要正体面, 把
+// 每个文件的全部面都解析出来会把 fontFamily 的首用成本抬回去。
+func fontFileFaces(path string) ([]*opentype.Font, error) {
+	ent, err := loadFontFileEntry(path)
+	if err != nil {
+		return nil, err
+	}
+	fontFileMu.Lock()
+	if ent.all != nil {
+		faces := ent.all
+		fontFileMu.Unlock()
+		return faces, nil // 命中: 扫描阶段已读过这个文件
+	}
+	fontFileMu.Unlock()
+
+	fireFontReadHook(path)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	// 归属必须在**读盘之前**定下来: 并发的第二个调用者看到"有人正在解析"
+	// 就该等结果, 而不是自己也读一遍 (那正是要消灭的重复读盘)。
+	owner := false
+	fontFileMu.Lock()
+	if !ent.parsing {
+		ent.parsing = true
+		owner = true
+	}
+	fontFileMu.Unlock()
+
+	if owner {
+		col, cerr := opentype.ParseCollection(data)
+		fontFileMu.Lock()
+		if cerr == nil {
+			n := col.NumFonts()
+			faces := make([]*opentype.Font, n)
+			for i := 0; i < n; i++ {
+				if f, err := col.Font(i); err == nil {
+					faces[i] = f
+				}
+			}
+			ent.all = faces
+		} else {
+			// 解析失败也是一个结论: 缓存空切片, 并发者不再等待 (下次调用
+			// 会重试, 与 loadFontFileEntry 的"失败不入缓存"同一口径)。
+			ent.all = []*opentype.Font{}
+		}
+		ent.parsing = false
+		fontFileMu.Unlock()
+		if cerr != nil {
+			return nil, cerr
+		}
+	}
+
+	// 非归属者 (或刚解析完的归属者) 在这里取结果。等待用 time.Sleep 轮询
+	// 而不是 sync.Once/Cond: 真实的 fontFamily 使用是 GUI 线程串行的, 这条
+	// 分支实践里几乎不执行, 为它引入一把条件变量不值得。
+	for {
+		fontFileMu.Lock()
+		ready := !ent.parsing
+		out := ent.all
+		fontFileMu.Unlock()
+		if ready {
+			return out, nil
+		}
+		time.Sleep(time.Millisecond)
+	}
 }
 
 // regularFaceOf 在一个字体集合里挑"最像正体"的面 (评分见 baseFaceRank)。
@@ -454,6 +616,14 @@ func loadBaseFontLocked() (*opentype.Font, error) {
 	// 会让"从不用 GUI"的脚本平白付一次开销。initFontCandidates 自带 sync.Once,
 	// 且**不取 fontMu** —— 调用方已经持有, 再取会自锁。
 	initFontCandidates()
+	// 扫描结果排在最前 (rebuildCandidatesLocked): 它们就是本轮扫描刚解析过
+	// 的那批, 第一个可用者通常就在这里。**先只看扫描结果** —— 扫描落空时
+	// 才去试静态候选, 免得把扫描结果整体再 stat 一遍 (那是几百次系统调用,
+	// 在冷启动预算里属于纯浪费)。
+	if f, err := chooseBaseFont(scannedFonts); err == nil {
+		baseFont = f
+		return baseFont, nil
+	}
 	f, err := chooseBaseFont(fontCandidates)
 	if err != nil {
 		return nil, err
@@ -474,6 +644,9 @@ func loadBaseFontLocked() (*opentype.Font, error) {
 //
 // 判面用的是 baseFaceRank (与族索引登记面同一口径), 不是文件名 —— Linux 上
 // 文件名与真实字重对不上的情况很常见。
+//
+// 解析结果按 (路径, mtime, size) 缓存 (见 fontFileEntry): 调用方通常已经把
+// 扫描结果试过一轮, 这里再试同一批文件只花一次 stat。
 func chooseBaseFont(paths []string) (*opentype.Font, error) {
 	var first *opentype.Font
 	var lastErr error
@@ -488,6 +661,9 @@ func chooseBaseFont(paths []string) (*opentype.Font, error) {
 			lastErr = fmt.Errorf("%s: %w", filepath.Base(p), err)
 			continue
 		}
+		// baseFaceRank == 0 就是正体面 —— 直接返回, **不再走第二次
+		// parseFontFile**: 那条路虽然命中进程缓存, 仍要 stat 一次, 而
+		// 首选候选 (Linux 上恒为扫描结果里的第一个 CJK 正体) 是最热的一条。
 		if baseFaceRank(f) == 0 {
 			return f, nil
 		}

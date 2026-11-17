@@ -1,0 +1,14 @@
+{
+  "说明": "冷启动基线 —— 由 python3 scripts/check-coldstart.py --update-baseline 生成。刻意优化过启动（或确认是有意的变化）之后才重建；平时只比对不自动刷新。",
+  "生成方式": "python3 scripts/check-coldstart.py --update-baseline",
+  "指标": {
+    "font_stage_total_ms": 37.670674999999996,
+    "process_first_frame_ms": 121.0,
+    "inproc_first_frame_ms": 0.745
+  },
+  "host": {
+    "font_stage_total_ms": "linux/amd64||32",
+    "process_first_frame_ms": "Linux-6.6.117-45.11.6.tl4.x86_64-x86_64-with-glibc2.39|AMD EPYC 9K65 192-Core Processor|32",
+    "inproc_first_frame_ms": "Linux/x86_64|AMD EPYC 9K65 192-Core Processor|"
+  }
+}

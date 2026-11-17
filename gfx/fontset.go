@@ -729,21 +729,15 @@ func fontFromSrc(src faceSrc) (*opentype.Font, error) {
 	faces, ok := facesByPath[src.path]
 	fontSrcMu.Unlock()
 	if !ok {
-		data, err := os.ReadFile(src.path)
+		// T3-5 第五批: 面解析走 fontFileFaces —— 与目录扫描 (parseFontFile)
+		// 共用同一份 (路径, mtime, size) 缓存。若默认字体正是从扫描候选里选
+		// 出来的 (Linux 常态), 这里就不再读第二次盘。facesByPath 仍然保留:
+		// 它承担的是"文件解析结果最多缓存 maxCachedFont 个"的容量上限。
+		parsed, err := fontFileFaces(src.path)
 		if err != nil {
 			return nil, err
 		}
-		col, err := opentype.ParseCollection(data)
-		if err != nil {
-			return nil, err
-		}
-		n := col.NumFonts()
-		faces = make([]*opentype.Font, n)
-		for i := 0; i < n; i++ {
-			if f, err := col.Font(i); err == nil {
-				faces[i] = f
-			}
-		}
+		faces = parsed
 		fontSrcMu.Lock()
 		if len(fontPathOrder) >= maxCachedFont {
 			old := fontPathOrder[0]
@@ -778,6 +772,13 @@ func resetFontCaches() {
 	facesByPath = map[string][]*opentype.Font{}
 	fontPathOrder = nil
 	fontSrcMu.Unlock()
+
+	// 文件级解析缓存也必须清: 它按 (路径, mtime, size) 做键, 覆盖同名文件的
+	// 替换; 但 resetFontCaches 的语义是"宿主换字体后全部重来", 清干净比
+	// 依赖身份校验更不会留坑 (它只是冷启动期的去重缓存, 重建代价可接受)。
+	fontFileMu.Lock()
+	fontFileCache = map[string]*fontFileEntry{}
+	fontFileMu.Unlock()
 
 	familyIdx.mu.Lock()
 	familyIdx.built = false
