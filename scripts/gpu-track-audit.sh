@@ -76,7 +76,12 @@ echo ""
 echo "接入面核销:"
 echo "  - SetPresentWrapper 接入点: ${wrapper_files:-无}"
 echo "  - 移动端 (android/ios/harmony) gpu 接入: $(grep -rln 'gfx/gpu' gfx/android gfx/ios gfx/harmony --include='*.go' 2>/dev/null | head -1 || true)未接入"
-echo "  - 窗口化上屏最后一跳: $(grep -c '在此代替 readback' gfx/gpu/backend_wgpu.go) 处 TODO (swapchain 未接, 仅离屏/回读验证)"
+swapchain=$(grep -c 'PresentsToWindow' gfx/gpu/backend_wgpu.go)
+if [ "$swapchain" -gt 0 ]; then
+  echo "  - 窗口化上屏最后一跳: swapchain 已接线 (Present 路径在位, 真机验证待做, 见 docs/gpu-track-audit.md 2026-11-17 节)"
+else
+  echo "  - 窗口化上屏最后一跳: $(grep -c '在此代替 readback' gfx/gpu/backend_wgpu.go) 处 TODO (swapchain 未接, 仅离屏/回读验证)"
+fi
 
 # ---- CI 核销 ----
 gpu_ci=$(grep -rln -- '-tags gpu' .github/workflows/ 2>/dev/null | tr '\n' ' ')

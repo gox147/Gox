@@ -41,10 +41,23 @@ func init() {
 				"设 GOX_GPU=software 可强制启用\n", gpu.Backend())
 		return
 	}
-	// 硬件适配器: 包装。失败 (驱动兼容问题等) 时 wrapPresent 静默降级,
-	// 用户无感, 窗口继续用平台后端。
+	// 包装判据 (2026-11-17 A 路径硬前提 #2 落地后的新口径):
+	//   - swapchain 就绪 (PresentsToWindow) → 包装, 真上屏;
+	//   - 没就绪 → **不包装**。GPU 轨在窗口化模式下只到离屏纹理为止,
+	//     硬包装等于把窗口变黑 (2026-11-17 之前的旧行为, audit 文档
+	//     「A 路径硬前提缺口」记录的正是这个洞)。
+	// 离屏/无头场景 (inner==nil) 不经此判断 —— 那是测试与基准的入口。
 	gfx.SetPresentWrapper(func(inner gfx.Surface) (gfx.Surface, bool) {
 		s, err := gpu.New(inner)
-		return s, err == nil
+		if err != nil || !s.PresentsToWindow() {
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "gox: GPU 呈现不可用, 退回 CPU blit: %v\n", err)
+			} else {
+				fmt.Fprintf(os.Stderr,
+					"gox: GPU 呈现未启用 —— 原生句柄不可用 (平台 %T 暂无 swapchain 接线), 退回 CPU blit\n", inner)
+			}
+			return nil, false
+		}
+		return s, true
 	})
 }

@@ -92,7 +92,7 @@ var (
 	// 从 gfx.WakeChan() 收到 gfx.Post 的唤醒后 SetEvent, 被 WaitEventsWake
 	// 并进 MsgWaitForMultipleObjectsEx 的等待集合。
 	procCreateEventW = kernel32.NewProc("CreateEventW")
-	procSetEvent    = kernel32.NewProc("SetEvent")
+	procSetEvent     = kernel32.NewProc("SetEvent")
 
 	// P3-4 原生对话框
 	procMessageBoxW = user32.NewProc("MessageBoxW")
@@ -368,7 +368,10 @@ var (
 )
 
 type surface struct {
-	hwnd   syscall.Handle
+	hwnd syscall.Handle
+	// hInst 是建窗口时的 HINSTANCE, 缓存下来给 NativeWindowTarget 用
+	// (GPU 呈现建 swapchain 时 wgpu 要 HINSTANCE+HWND 成对句柄)。
+	hInst  uintptr
 	events chan gfx.Event
 	mu     sync.Mutex
 	closed bool
@@ -455,6 +458,7 @@ func newSurface(cfg gfx.WindowConfig) (gfx.Surface, error) {
 
 	s := &surface{
 		hwnd:   syscall.Handle(hwnd),
+		hInst:  hInst,
 		events: make(chan gfx.Event, 256),
 	}
 	// P2-7: 建窗即关输入法, 让 imeOn=false 与真实状态一致 (gfx 在焦点落到
@@ -1352,6 +1356,26 @@ func (s *surface) waitEvents(maxWait time.Duration, withWake bool) bool {
 var _ interface {
 	WaitEventsWake(time.Duration, <-chan struct{}) bool
 } = (*surface)(nil)
+
+// 编译期断言: surface 满足 gfx 的原生窗口句柄可选能力 —— GPU 呈现
+// (gfx/gpu swapchain) 依赖它在包装时拿到 HINSTANCE+HWND。
+var _ gfx.NativeWindowProvider = (*surface)(nil)
+
+// NativeWindowTarget 交出 HINSTANCE + HWND (gfx.NativeWindowProvider)。
+// 窗口已销毁 (hwnd==0) 时返回 false —— GPU 侧据此安静退回 CPU blit。
+func (s *surface) NativeWindowTarget() (gfx.NativeWindowTarget, bool) {
+	s.mu.Lock()
+	hwnd, hInst := s.hwnd, s.hInst
+	s.mu.Unlock()
+	if hwnd == 0 || hInst == 0 {
+		return gfx.NativeWindowTarget{}, false
+	}
+	return gfx.NativeWindowTarget{
+		Kind:    "win32",
+		Display: hInst,
+		Window:  uintptr(hwnd),
+	}, true
+}
 
 func min2(a, b int) int {
 	if a < b {

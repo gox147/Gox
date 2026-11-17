@@ -33,9 +33,11 @@ TRACK=cgo kind=none backend=cgo available=false                 ← 骨架纪律
 |---|---|
 | SetPresentWrapper 接入点 | 仅 `cmd/gox/gpu_present_init.go`（桌面）；softmedia 链式叠加 |
 | 移动端 android/ios/harmony | **未接入** SetPresentWrapper（grep 零命中） |
-| **窗口化上屏最后一跳** | **未接 swapchain**：`backend_wgpu.go` ShowRegions 收尾留有
-「surface.Present(surfaceTex) 在此代替 readback」的 TODO —— 当前 GPU 轨只
-能离屏合成 + Readback 验证；「窗口化时由 swapchain 提供」的注释与代码不符 |
+| **窗口化上屏最后一跳** | ✅ **已接 swapchain（2026-11-17）**：`backend_wgpu.go`
+ShowRegions 收尾走 `wgpu.Surface.Present`（acquire 交换链纹理 → 渲染 →
+Present），离屏 target 纹理仅作测试 Readback/降级兜底。运行期任何
+acquire/present 错误 → 永久退回内层 CPU blit（`swapBroken` 降级语义，
+测试钉住：`gfx/gpu/swapchain_gate_test.go`） |
 | CI gpu 跑批 | 此前无；已接入 `.github/workflows/gpu-present.yml` |
 
 ## 关键结论：A 路径（上屏合成默认化）的硬前提缺口
@@ -52,6 +54,23 @@ gogpu/wgpu 已提供原生窗口接入 API（`SurfaceTargetFromXlibWindow` /
    `target` 纹理，ShowRegions 收尾改为 surface.Present。
 
 在此之前，A 路径的「默认化」只能做到离屏验证级别，数字均为兜底口径。
+
+### 2026-11-17 更新：两件硬前提已落地（代码层），真机验证待做
+
+1. ✅ 原生句柄暴露：新增可选接口 `gfx.NativeWindowProvider`
+   （`gfx/native_window.go`，不扩 Surface 契约）。win32 已实现
+   （HINSTANCE+HWND）；x11 已实现但 Display 恒 0（xgb 无 Xlib Display*，
+   dlopen libX11 方案待评估，GPU 侧对 Display==0 拒绝建链）；cocoa 未实现
+   （需 CAMetalLayer，setWantsLayer 方案未验证）。
+2. ✅ swapchain 上屏：`backend_wgpu.go` 接入
+   `Instance.CreateSurfaceUnsafe` + `Surface.Configure/GetCurrentTexture/
+   Present`，支持 resize 重配、非 RGBA8 格式备用管线、运行期失效永久
+   降级 CPU blit。包装点（`cmd/gox/gpu_present_init.go`）新判据：
+   `PresentsToWindow()` 为 false 时**不包装真窗口**（旧行为会黑窗）。
+
+**诚实口径**：swapchain 路径在本沙箱（无 GPU 硬件、无真平台窗口）只能
+验证 gate 降级语义与像素 A/B 零退化（软件适配器兜底口径），真机窗口化
+上屏与性能数字属于上面「硬件覆盖待办」，未做不得声称 A 路径完成。
 
 ## wgpu 交叉编译矩阵抽查（`--xcompile`，linux/amd64 host）
 
@@ -95,7 +114,7 @@ darwin 目标需要本机 cgo 工具链（`CGO_ENABLED=1` + Apple 工具链）�
 
 `gpu-track-audit.sh` 全量复跑：三轨输出与 2026-11-08 基线逐项一致
 （nogpu=none / wgpu=software 兜底口径 / cgo=none），接入面结论不变
-（移动端未接入、swapchain TODO 1 处、CI 跑批文件在位）。
+（移动端未接入、swapchain 接入代码已落地待真机验证、CI 跑批文件在位）。
 `go test ./gfx/gpu` 与 `go test -tags gpu ./gfx/gpu` 均绿。
 `--xcompile` 矩阵复跑：windows/amd64、linux/arm64 ok；darwin/arm64
 fakecgo 符号冲突、js/wasm 构建约束排除，均与上表一致。

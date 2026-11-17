@@ -17,11 +17,16 @@ import (
 
 // 包级单例: 全部窗口共享一个 GPU device (多窗口 / 多屏场景下驱动对象只建一份,
 // 每窗口一个 surface/swapchain —— 与 gogpu 应用框架同一模型)。
+// Instance 与 Adapter 一并持有: swapchain 建链 (CreateSurfaceUnsafe) 要用
+// Instance, 能力查询 (GetSurfaceCapabilities) 要用 Adapter —— 回收它们
+// 会导致窗口化路径整个瘸掉, 且 Go 侧无警告, 只能真机上查。
 var (
-	devOnce sync.Once
-	devInst *wgpu.Device
-	devErr  error
-	devInfo gputypes.AdapterInfo // 建 device 时那张适配器的信息 (Backend() 用)
+	devOnce     sync.Once
+	devInstance *wgpu.Instance
+	devAdapter  *wgpu.Adapter
+	devInst     *wgpu.Device
+	devErr      error
+	devInfo     gputypes.AdapterInfo // 建 device 时那张适配器的信息 (Backend() 用)
 )
 
 // Device 返回进程级共享 GPU device; 不可用时 (无适配器/驱动) 返回 error,
@@ -47,6 +52,7 @@ func Device() (*wgpu.Device, error) {
 			devErr = fmt.Errorf("wgpu device: %w", err)
 			return
 		}
+		devInstance, devAdapter = inst, ad
 		devInst = d
 		devInfo = ad.Info()
 	})
@@ -105,17 +111,34 @@ type Surface struct {
 	vbuf     *wgpu.Buffer
 	sampler  *wgpu.Sampler
 
+	// swapchain 备用管线要复用的共享资源 (buildPipeline 建好后留存):
+	shaderModule  *wgpu.ShaderModule
+	layoutForSwap *wgpu.PipelineLayout
+	swapPipeline  *wgpu.RenderPipeline // 非 RGBA8 swapchain 格式的管线 (按需)
+
 	// fbTex 是 CPU 帧缓冲的 GPU 镜像 (持久, 尺寸随窗口变化重建)。
 	fbTex    *wgpu.Texture
 	fbView   *wgpu.TextureView
 	bindGrp  *wgpu.BindGroup
 	fbW, fbH int
 
-	// target 是合成目标: 窗口化时为 swapchain 纹理, 离屏时为这张纹理。
+	// target 是合成目标: 离屏模式 (测试/无头) 的渲染终点; 窗口化模式的
+	// Readback/兜底纹理 (真渲染终点是 swapchain 纹理, 见 wgpuSurf)。
 	target *wgpu.Texture
 	// targetView 是 target 的视图 (随 target 重建; 每帧建视图再 Release
 	// 是白付一笔驱动调用, 4K 下尤其冤 —— 缓存之)。
 	targetView *wgpu.TextureView
+
+	// ── 窗口化 swapchain (A 路径硬前提 #2, 2026-11-17 接线) ──
+	// wgpuSurf 非 nil = 窗口化真上屏已就绪: 渲染终点是 swapchain 纹理,
+	// ShowRegions 收尾 Present 到原生窗口 (不再只有离屏合成 + readback)。
+	// swapBroken = 运行期失效开关: 任何 acquire/render/present 错误都会
+	// 置位并永久退回「内层 CPU blit」—— swapchain 疯掉不该拖死窗口,
+	// 这与 New 失败时不包装是同一条降级语义, 只是时机晚一拍。
+	wgpuSurf     *wgpu.Surface
+	swapFormat   gputypes.TextureFormat // swapchain 实际格式 (可能非 RGBA8, 如 BGRA8)
+	swapW, swapH int
+	swapBroken   bool
 
 	// uploadScratch 是子纹理上传的复用缓冲 (按最大脏区增长)。wgpu 的
 	// WriteTexture 语义保证调用返回时数据已被拷走, 所以下一帧可以直接
@@ -161,7 +184,126 @@ func New(inner gfx.Surface) (*Surface, error) {
 	if err := s.ensureTargets(s.width, s.height); err != nil {
 		return nil, err
 	}
+	// 窗口化: 尝试建 swapchain 真上屏 (A 路径硬前提 #2)。失败**不是错误**:
+	// Surface 照常返回 (离屏模式, 测试/无头照用), 只是窗口拿不到像素 ——
+	// 上层 (cmd/gox 包装点) 用 PresentsToWindow() 判断要不要真包装,
+	// 真窗口没 swapchain 就退回 CPU blit, 行为降级而非失败。
+	_ = s.initSwapchain()
 	return s, nil
+}
+
+// PresentsToWindow 报告本 Surface 是否真的能把像素呈到原生窗口
+// (swapchain 就绪)。呈现包装点必须以它为准决定要不要包装真平台窗口:
+// false 时包装等于把窗口变黑 (GPU 轨只到离屏纹理为止)。
+// 离屏模式 (inner==nil, 测试/无头) 恒 false, 但那不是包装场景。
+func (s *Surface) PresentsToWindow() bool { return s.wgpuSurf != nil }
+
+// initSwapchain 从内层平台 Surface 拿原生句柄建 wgpu surface 并配置
+// swapchain。三道 gate, 任何一道不过都返回 error (调用方退回 CPU blit):
+//
+//  1. inner 实现 gfx.NativeWindowProvider (可选接口, 不扩 Surface 契约);
+//  2. 目标 kind 是 wgpu 支持的窗口系统;
+//  3. 平台后端交得出 wgpu 需要的句柄形态 (x11 目前交不出 Xlib Display*)。
+//
+// 口径纪律: 本函数只决定「能不能上屏」, 不做任何性能声明 —— 是否比
+// CPU blit 快要靠硬件口径基准 (bench-present-4k.sh, 不接受兜底口径)。
+func (s *Surface) initSwapchain() error {
+	if devInstance == nil || devAdapter == nil {
+		return fmt.Errorf("gpu: instance/adapter 未就绪")
+	}
+	p, ok := s.inner.(gfx.NativeWindowProvider)
+	if !ok {
+		return fmt.Errorf("inner %T 未实现 NativeWindowProvider", s.inner)
+	}
+	tgt, ok := p.NativeWindowTarget()
+	if !ok {
+		return fmt.Errorf("inner 交不出原生窗口句柄")
+	}
+	var st wgpu.SurfaceTargetUnsafe
+	switch tgt.Kind {
+	case "win32":
+		st = wgpu.SurfaceTargetFromWindowsHWND(tgt.Display, tgt.Window)
+	case "x11":
+		// xgb 拿不到 Xlib Display* (恒 0), vkCreateXlibSurfaceKHR 需要
+		// 它 —— 在 dlopen 方案落地前 Linux 窗口化保持 CPU blit (见
+		// gfx/native_window.go 平台覆盖表)。
+		if tgt.Display == 0 {
+			return fmt.Errorf("x11: 无 Xlib Display*, wgpu 建不了 surface")
+		}
+		st = wgpu.SurfaceTargetFromXlibWindow(tgt.Display, tgt.Window)
+	default:
+		// cocoa / wayland / android: 未实现或未接入, 见 gfx/native_window.go
+		return fmt.Errorf("平台 %q 暂无 swapchain 接线", tgt.Kind)
+	}
+	surf, err := devInstance.CreateSurfaceUnsafe(st)
+	if err != nil {
+		return fmt.Errorf("create surface: %w", err)
+	}
+	caps := devAdapter.GetSurfaceCapabilities(surf)
+	if len(caps.Formats) == 0 {
+		return fmt.Errorf("surface 无可用格式")
+	}
+	// 优先 RGBA8Unorm (与离屏管线同格式, 免建第二条管线); 拿不到就
+	// 用适配器首选格式, 渲染时走 pipelineFor 建对应格式的管线。
+	format := caps.Formats[0]
+	for _, f := range caps.Formats {
+		if f == gputypes.TextureFormatRGBA8Unorm {
+			format = f
+			break
+		}
+	}
+	w, h := s.inner.Size()
+	if err := surf.Configure(s.dev, &wgpu.SurfaceConfiguration{
+		Width: uint32(w), Height: uint32(h),
+		Format:      format,
+		Usage:       gputypes.TextureUsageRenderAttachment,
+		PresentMode: gputypes.PresentModeFifo, // Fifo 全平台保证支持, VSync 防撕裂
+	}); err != nil {
+		return fmt.Errorf("configure: %w", err)
+	}
+	s.wgpuSurf = surf
+	s.swapFormat = format
+	s.swapW, s.swapH = w, h
+	return nil
+}
+
+// pipelineFor 返回适配给定颜色格式的呈现管线 (按需建, 缓存于 swapPipeline)。
+// swapchain 格式与离屏 RGBA8 不一致时 (常见: 窗口系统只给 BGRA8) 必须用
+// 匹配的管线, 否则验证层报格式不兼容。
+func (s *Surface) pipelineFor(format gputypes.TextureFormat) (*wgpu.RenderPipeline, error) {
+	if format == gputypes.TextureFormatRGBA8Unorm {
+		return s.pipeline, nil
+	}
+	if s.swapPipeline != nil {
+		return s.swapPipeline, nil
+	}
+	// 复用顶点缓冲与布局, 只换 Fragment 目标格式重建。
+	pl, err := s.dev.CreateRenderPipeline(&wgpu.RenderPipelineDescriptor{
+		Label:  "gpu-present-pipeline-swap",
+		Layout: s.layoutForSwap,
+		Vertex: wgpu.VertexState{
+			Module: s.shaderModule, EntryPoint: "vs_main",
+			Buffers: []gputypes.VertexBufferLayout{{
+				ArrayStride: 16, StepMode: gputypes.VertexStepModeVertex,
+				Attributes: []gputypes.VertexAttribute{
+					{Format: gputypes.VertexFormatFloat32x2, Offset: 0, ShaderLocation: 0},
+					{Format: gputypes.VertexFormatFloat32x2, Offset: 8, ShaderLocation: 1},
+				},
+			}},
+		},
+		Fragment: &wgpu.FragmentState{
+			Module: s.shaderModule, EntryPoint: "fs_main",
+			Targets: []gputypes.ColorTargetState{{
+				Format: format, WriteMask: gputypes.ColorWriteMaskAll,
+			}},
+		},
+		Primitive: gputypes.PrimitiveState{Topology: gputypes.PrimitiveTopologyTriangleList},
+	})
+	if err != nil {
+		return nil, err
+	}
+	s.swapPipeline = pl
+	return pl, nil
 }
 
 // buildPipeline 建「全屏 textured quad」管线 (呈现路径唯一需要的绘制)。
@@ -193,6 +335,7 @@ func (s *Surface) buildPipeline() error {
 	if err != nil {
 		return err
 	}
+	s.shaderModule = shader
 
 	bgl, err := s.dev.CreateBindGroupLayout(&wgpu.BindGroupLayoutDescriptor{
 		Entries: []gputypes.BindGroupLayoutEntry{
@@ -213,6 +356,7 @@ func (s *Surface) buildPipeline() error {
 	if err != nil {
 		return err
 	}
+	s.layoutForSwap = layout
 	pl, err := s.dev.CreateRenderPipeline(&wgpu.RenderPipelineDescriptor{
 		Label:  "gpu-present-pipeline",
 		Layout: layout,
@@ -356,20 +500,52 @@ func (s *Surface) ShowRegions(img *image.RGBA, rects []image.Rectangle) {
 			return
 		}
 	}
-	// 2. 合成: Load (保留目标旧内容) + 逐脏区 scissor 重绘 —— 只碰变化区域
+	// 2. 选渲染终点与呈现方式:
+	//    - 窗口化且 swapchain 就绪 → acquire 交换链纹理, 收尾 Present 到
+	//      原生窗口 (真上屏, A 路径硬前提 #2 的落地路径);
+	//    - 否则 → 离屏 target 纹理 (测试 / 无头 / swapchain 失效降级)。
+	renderView := s.targetView
+	renderPl := s.pipeline
+	present := func() {}
+	if s.wgpuSurf != nil && !s.swapBroken {
+		st, view, ok := s.acquireSwap(w, h)
+		if !ok {
+			// swapchain 运行期失效 (窗口销毁 / 驱动重置 / resize 竞态):
+			// 永久置 broken 并把**这一帧**交回内层 CPU blit —— 降级而非
+			// 失败, 窗口不许因为 GPU 疯掉而停更。
+			s.swapBroken = true
+			if s.inner != nil {
+				s.inner.ShowRegions(img, rects)
+			}
+			return
+		}
+		defer view.Release()
+		renderView = view
+		pl, perr := s.pipelineFor(s.swapFormat)
+		if perr != nil {
+			s.swapBroken = true
+			if s.inner != nil {
+				s.inner.ShowRegions(img, rects)
+			}
+			return
+		}
+		renderPl = pl
+		present = func() { _ = s.wgpuSurf.Present(st) }
+	}
+	// 合成: Load (保留目标旧内容) + 逐脏区 scissor 重绘 —— 只碰变化区域
 	enc, err := s.dev.CreateCommandEncoder(&wgpu.CommandEncoderDescriptor{Label: "gfx-frame"})
 	if err != nil {
 		return
 	}
 	pass, err := enc.BeginRenderPass(&wgpu.RenderPassDescriptor{
 		ColorAttachments: []wgpu.RenderPassColorAttachment{{
-			View: s.targetView, LoadOp: gputypes.LoadOpLoad, StoreOp: gputypes.StoreOpStore,
+			View: renderView, LoadOp: gputypes.LoadOpLoad, StoreOp: gputypes.StoreOpStore,
 		}},
 	})
 	if err != nil {
 		return
 	}
-	pass.SetPipeline(s.pipeline)
+	pass.SetPipeline(renderPl)
 	pass.SetBindGroup(0, s.bindGrp, nil)
 	pass.SetVertexBuffer(0, s.vbuf, 0)
 	for _, r := range rects {
@@ -392,7 +568,35 @@ func (s *Surface) ShowRegions(img *image.RGBA, rects []image.Rectangle) {
 		return
 	}
 	_, _ = s.dev.Queue().Submit(cmds)
-	// 窗口化路径: surface.Present(surfaceTex) 在此代替 readback。
+	// 窗口化路径: Present 交换链纹理上屏 (代替离屏 readback); 离屏路径
+	// present 是空操作, 结果经 Readback() 验证。
+	present()
+}
+
+// acquireSwap 取一帧交换链纹理及其视图; 尺寸变了先重配 swapchain。
+// 任何一步失败返回 ok=false —— 调用方置 swapBroken 退回 CPU blit。
+func (s *Surface) acquireSwap(w, h int) (*wgpu.SurfaceTexture, *wgpu.TextureView, bool) {
+	if s.swapW != w || s.swapH != h {
+		s.wgpuSurf.Unconfigure()
+		if err := s.wgpuSurf.Configure(s.dev, &wgpu.SurfaceConfiguration{
+			Width: uint32(w), Height: uint32(h),
+			Format:      s.swapFormat,
+			Usage:       gputypes.TextureUsageRenderAttachment,
+			PresentMode: gputypes.PresentModeFifo,
+		}); err != nil {
+			return nil, nil, false
+		}
+		s.swapW, s.swapH = w, h
+	}
+	st, _, err := s.wgpuSurf.GetCurrentTexture()
+	if err != nil {
+		return nil, nil, false
+	}
+	view, err := st.CreateView(nil)
+	if err != nil {
+		return nil, nil, false
+	}
+	return st, view, true
 }
 
 // Stats 读取帧统计快照 (gx/dev 调试面板 / 测试断言用)。
