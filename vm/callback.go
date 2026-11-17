@@ -212,6 +212,20 @@ func (vm *VM) invokeWithThis(fn, thisVal object.Value, args []object.Value) erro
 				if f := vm.currentFrame(); f != nil {
 					f.This = ta
 				}
+			} else if re, isRe := result.(*object.RegExp); isRe {
+				// class D extends RegExp: super(...) 返回内建 RegExp 实例。
+				// 与 TypedArray 同法: 把派生类 prototype 写进 ProtoOverride
+				// (GetProto / GetProperty 原型回退段都会优先走它), 并让它
+				// 成为帧 this —— 否则派生实例只是普通对象, re.source 报
+				// "incompatible receiver", exec 覆写也接不进 regExpExec。
+				if nt, ok := vm.pendingNewTarget.(*object.Closure); ok {
+					if pv, found := nt.GetProperty("prototype"); found && pv != nil {
+						re.ProtoOverride = pv
+					}
+				}
+				if f := vm.currentFrame(); f != nil {
+					f.This = re
+				}
 			} else if object.IsTemporalExotic(result) {
 				// class D extends Temporal.X: super(...) 返回 Temporal 内建实例。
 				// 规范里派生实例仍是普通带内部槽的对象, 其内部槽寄存在派生类

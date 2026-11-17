@@ -491,14 +491,9 @@ func setupStringProto() *object.Object {
 			return object.NewArray([]object.Value{})
 		}
 
-		// 正则分隔符
+		// 正则分隔符：与内建 @@split 同一条 regExpSplit 实现（捕获组按序拼进结果）
 		if re, isRe := args[0].(*object.RegExp); isRe {
-			parts := re.Split(s.Value, limit)
-			elements := make([]object.Value, len(parts))
-			for i, part := range parts {
-				elements[i] = object.NewString(part)
-			}
-			return object.NewArray(elements)
+			return regExpSplit(re, s.Value, limit)
 		}
 
 		sep, isStr := args[0].(*object.String)
@@ -821,57 +816,11 @@ func setupStringProto() *object.Object {
 		if len(args) < 2 {
 			return s
 		}
-		// 处理 RegExp 搜索
+		// 处理 RegExp 搜索：与内建 @@replace 同一条 regExpReplace 实现
+		// （exec 循环 + GetSubstitution + 函数式实参全量），消除快路径与
+		// 派发路径的口径分叉。
 		if re, isRe := args[0].(*object.RegExp); isRe {
-			if object.IsCallable(args[1]) {
-				fn := args[1]
-				if re.Global {
-					result := re.ReplaceAllStringFunc(s.Value, func(match string) string {
-						r := object.CallFunction(fn, object.UndefinedSingleton, object.NewString(match))
-						return toStr(r)
-					})
-					return object.NewString(result)
-				}
-				loc := re.FindStringIndex(s.Value)
-				if loc == nil {
-					return s
-				}
-				matchStr := s.Value[loc[0]:loc[1]]
-				r := object.CallFunction(fn, object.UndefinedSingleton, object.NewString(matchStr))
-				return object.NewString(s.Value[:loc[0]] + toStr(r) + s.Value[loc[1]:])
-			}
-			// 规范: ToString(replaceValue) 走 ToPrimitive(string), 返回对象
-			// (如 toString 返回函数) 必须抛 TypeError (S15.5.4.11_A1_T16)。
-			rpl, errv := toPrimitiveToString(args[1])
-			if errv != nil {
-				return errv
-			}
-			replacement := rpl.Value
-			// 字符串替换: 展开 $1/$2/$&/$$ 捕获组
-			if re.Global {
-				locs := re.FindAllStringSubmatchIndex(s.Value, -1)
-				if locs == nil {
-					return s
-				}
-				var sb strings.Builder
-				lastEnd := 0
-				for _, loc := range locs {
-					sb.WriteString(s.Value[lastEnd:loc[0]])
-					matchStr := s.Value[loc[0]:loc[1]]
-					sb.WriteString(expandReplacement(replacement, matchStr,
-						submatchGroups(s.Value, loc), namedGroupsOfSubexp(re.SubexpNames(), s.Value, loc)))
-					lastEnd = loc[1]
-				}
-				sb.WriteString(s.Value[lastEnd:])
-				return object.NewString(sb.String())
-			}
-			loc := re.FindStringSubmatchIndex(s.Value)
-			if loc == nil {
-				return s
-			}
-			replacementStr := expandReplacement(replacement,
-				s.Value[loc[0]:loc[1]], submatchGroups(s.Value, loc), namedGroupsOfSubexp(re.SubexpNames(), s.Value, loc))
-			return object.NewString(s.Value[:loc[0]] + replacementStr + s.Value[loc[1]:])
+			return regExpReplace(re, s.Value, args[1])
 		}
 
 		// 规范: ToString(searchValue) 走 ToPrimitive(string) —— toString 返回
@@ -954,25 +903,14 @@ func setupStringProto() *object.Object {
 		if len(args) < 2 {
 			return s
 		}
-		// 规范: 用非全局正则做 replaceAll 应抛 TypeError
+		// 规范: 用非全局正则做 replaceAll 应抛 TypeError（IsRegExp/flags 检查
+		// 已在上方完成）。其余与 replace 同一条 regExpReplace 实现。
 		if re, isRe := args[0].(*object.RegExp); isRe {
 			if !re.Global {
 				return object.NewErrorWithName("TypeError",
 					"String.prototype.replaceAll called with a non-global RegExp argument")
 			}
-			replacement := toStr(args[1])
-			if object.IsCallable(args[1]) {
-				fn := args[1]
-				result := re.ReplaceAllStringFunc(s.Value, func(match string) string {
-					r := object.CallFunction(fn, object.UndefinedSingleton, object.NewString(match))
-					return toStr(r)
-				})
-				return object.NewString(result)
-			}
-			result := re.ReplaceAllStringFunc(s.Value, func(match string) string {
-				return expandReplacement(replacement, match, []string{}, nil)
-			})
-			return object.NewString(result)
+			return regExpReplace(re, s.Value, args[1])
 		}
 
 		search := toStr(args[0])
@@ -1241,45 +1179,15 @@ func setupStringProto() *object.Object {
 			return object.NewArray(result)
 		}
 
-		loc := re.FindStringSubmatchIndex(s.Value)
-		if loc == nil {
-			return object.NullSingleton
-		}
-		result := []object.Value{object.NewString(s.Value[loc[0]:loc[1]])}
-		groups := submatchGroups(s.Value, loc)
-		for _, g := range groups {
-			result = append(result, object.NewString(g))
-		}
-		arr := object.NewArray(result)
-		arr.SetProperty("index", object.NewNumber(float64(loc[0])))
-		arr.SetProperty("input", object.NewString(s.Value))
-		// 命名捕获组 .groups (参与的组为匹配串, 未参与的组为 undefined)
-		names := re.SubexpNames()
-		hasNamed := false
-		for _, n := range names {
-			if n != "" {
-				hasNamed = true
-				break
-			}
-		}
-		if hasNamed {
-			gobj := object.NewObject()
-			for i := 1; i < len(names) && i < len(loc)/2; i++ {
-				if names[i] == "" {
-					continue
-				}
-				if loc[i*2] >= 0 {
-					gobj.SetProperty(names[i], object.NewString(s.Value[loc[i*2]:loc[i*2+1]]))
-				} else {
-					gobj.SetProperty(names[i], object.UndefinedSingleton)
-				}
-			}
-			arr.SetProperty("groups", gobj)
-		}
-		return arr
+		// 非 global：规范步骤 7 直接返回 RegExpExec(rx, S) 的结果数组
+		// （未参与捕获组是 undefined 而非 ""；groups 属性由 exec 统一构建）。
+		// 此前这里用 FindStringSubmatchIndex 手工拼装，空捕获串、缺
+		// groups 通道与 exec 内建不一致。
+		return regExpExec(re, s.Value)
 	}))
 
-	// matchAll(regexp): 返回所有匹配（规范为迭代器，这里简化为数组）
+	// matchAll(regexp): 返回所有匹配（规范为 %RegExp String Iterator%，
+	// 数组快路径已改为真迭代器，见下方 NextFn）
 	p.SetBuiltinProperty("matchAll", object.NewBuiltinMethod("matchAll", func(this object.Value, args ...object.Value) object.Value {
 		if !requireObjectCoercible(this) {
 			return thisTypeError("String", "matchAll", this)
@@ -1307,46 +1215,32 @@ func setupStringProto() *object.Object {
 			return object.NewErrorWithName("TypeError",
 				"String.prototype.matchAll called with a non-global RegExp argument")
 		}
-		allMatches := re.FindAllStringSubmatchIndex(s.Value, -1)
-		if allMatches == nil {
-			return object.NewArray([]object.Value{})
+		// 规范: matchAll 返回 %RegExp String Iterator%（不是数组）。
+		// 逐轮 exec（与 @@replace 同一条 regExpExec 管线），空匹配按
+		// AdvanceStringIndex 推进 lastIndex 防死循环。
+		if !re.SetLastIndexStrict(0) {
+			return lastIndexTypeError()
 		}
-		result := make([]object.Value, len(allMatches))
-		for i, loc := range allMatches {
-			matchArr := []object.Value{object.NewString(s.Value[loc[0]:loc[1]])}
-			groups := submatchGroups(s.Value, loc)
-			for _, g := range groups {
-				matchArr = append(matchArr, object.NewString(g))
+		var it *object.JSIterator
+		it = &object.JSIterator{Name: "RegExp String Iterator", NextFn: func() (object.Value, bool) {
+			res := regExpExec(re, s.Value)
+			if isErrorResult(res) {
+				it.PendingErr = res
+				return object.UndefinedSingleton, true
 			}
-			arr := object.NewArray(matchArr)
-			arr.SetProperty("index", object.NewNumber(float64(loc[0])))
-			arr.SetProperty("input", object.NewString(s.Value))
-			// 命名捕获组 .groups
-			subNames := re.SubexpNames()
-			hasNamed2 := false
-			for _, n := range subNames {
-				if n != "" {
-					hasNamed2 = true
-					break
+			if isNullishExecResult(res) {
+				it.MarkExhausted()
+				return object.UndefinedSingleton, true
+			}
+			if matchStringOfResult(res) == "" {
+				if !re.SetLastIndexStrict(re.LastIndex + 1) {
+					it.PendingErr = lastIndexTypeError()
+					return object.UndefinedSingleton, true
 				}
 			}
-			if hasNamed2 {
-				gobj := object.NewObject()
-				for i := 1; i < len(subNames) && i < len(loc)/2; i++ {
-					if subNames[i] == "" {
-						continue
-					}
-					if loc[i*2] >= 0 {
-						gobj.SetProperty(subNames[i], object.NewString(s.Value[loc[i*2]:loc[i*2+1]]))
-					} else {
-						gobj.SetProperty(subNames[i], object.UndefinedSingleton)
-					}
-				}
-				arr.SetProperty("groups", gobj)
-			}
-			result[i] = arr
-		}
-		return object.NewArray(result)
+			return res, false
+		}}
+		return it
 	}))
 
 	// search(regexp): 返回第一个匹配的码元索引，未找到返回 -1

@@ -104,29 +104,39 @@ func (s *funcSymStore) SymbolKeys() []*Symbol { return s.order }
 func LookupSymbolPropertyDescriptorChain(v Value, sym *Symbol) (PropertyDescriptor, bool) {
 	// minProtoDepth 是"沿原型链向上但尚未找到"的层数上限, 防环。
 	const maxProtoDepth = 64
+	// 第一遍: 只查符号键槽, **沿整条链**。此前字符串键兜底混在每层里做,
+	// 实例层 (*RegExp → 内建 @@matchAll 以字符串形态注册) 会在到达
+	// RegExp.prototype 的符号 getter 之前命中, 把用户 defineProperty 的
+	// 访问器整个遮蔽掉 (matchAll/regexp-prototype-get-matchAll-throws.js)。
 	for cur, depth := v, 0; cur != nil && depth < maxProtoDepth; depth++ {
-		var desc PropertyDescriptor
-		var found bool
 		switch o := cur.(type) {
 		case *Object:
-			desc, found = o.GetSymbolPropertyDescriptor(sym)
+			if desc, found := o.GetSymbolPropertyDescriptor(sym); found {
+				return desc, true
+			}
 		case SymbolPropertyStore:
-			desc, found = o.GetSymbolPropertyDescriptor(sym)
+			if desc, found := o.GetSymbolPropertyDescriptor(sym); found {
+				return desc, true
+			}
 		}
-		if found {
-			return desc, true
+		pp, ok := cur.(interface{ GetProto() Value })
+		if !ok {
+			break
 		}
-		// 字符串键兜底 (与旧路径逐字等价)。
-		//
-		// vm.getIndex 此前对"没有符号键槽的类型"一律走 default 分支的
-		// GetProperty(toJSString(sym)), 符号键读取全靠这条兜底 —— 部分内建
-		// 原型 (如 %AsyncGeneratorPrototype%) 的 @@toStringTag 正是按这个
-		// 字符串形态硬编码的, 其 SymbolProperties 其实是空的
-		// (Object.getOwnPropertySymbols 返回 [])。收口成统一符号键通道时
-		// 若丢掉它, 这类成员会静默读回 undefined。
-		//
-		// 键的写法必须与旧路径一致: vm.toJSString 用的是 object.ToString(sym)
-		// 而非 sym.Inspect() ("Symbol(...)"), 后者查不到。
+		cur = pp.GetProto()
+	}
+	// 第二遍: 字符串键兜底 (与旧路径逐字等价)。
+	//
+	// vm.getIndex 此前对"没有符号键槽的类型"一律走 default 分支的
+	// GetProperty(toJSString(sym)), 符号键读取全靠这条兜底 —— 部分内建
+	// 原型 (如 %AsyncGeneratorPrototype%) 的 @@toStringTag 正是按这个
+	// 字符串形态硬编码的, 其 SymbolProperties 其实是空的
+	// (Object.getOwnPropertySymbols 返回 [])。收口成统一符号键通道时
+	// 若丢掉它, 这类成员会静默读回 undefined。
+	//
+	// 键的写法必须与旧路径一致: vm.toJSString 用的是 object.ToString(sym)
+	// 而非 sym.Inspect() ("Symbol(...)"), 后者查不到。
+	for cur, depth := v, 0; cur != nil && depth < maxProtoDepth; depth++ {
 		if g, hasStr := cur.(interface{ GetProperty(string) (Value, bool) }); hasStr {
 			if val, ok := g.GetProperty(ToString(sym)); ok {
 				return PropertyDescriptor{Value: val}, true

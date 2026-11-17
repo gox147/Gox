@@ -213,6 +213,8 @@ func regExpBuiltinExec(re *object.RegExp, input string) object.Value {
 	var groupsObj *object.Object
 	var indicesGroupsObj *object.Object
 	if hasNamed {
+		// 规范 RegExpBuiltinExec 步骤 24: groups = ObjectCreate(null)。
+		// object.NewObject() 即 null 原型对象。
 		groupsObj = object.NewObject()
 		if re.HasIndices {
 			indicesGroupsObj = object.NewObject()
@@ -221,7 +223,7 @@ func regExpBuiltinExec(re *object.RegExp, input string) object.Value {
 			if names[i] == "" {
 				continue
 			}
-			var val object.Value
+			var val object.Value = object.UndefinedSingleton
 			var idxVal object.Value = object.UndefinedSingleton
 			if loc[i*2] >= 0 {
 				val = object.NewString(searchStr[loc[i*2]:loc[i*2+1]])
@@ -229,16 +231,30 @@ func regExpBuiltinExec(re *object.RegExp, input string) object.Value {
 					object.NewNumber(float64(loc[i*2] + lastIndex)),
 					object.NewNumber(float64(loc[i*2+1] + lastIndex)),
 				})
-			} else {
-				val = object.UndefinedSingleton
 			}
-			groupsObj.SetProperty(names[i], val)
-			if indicesGroupsObj != nil {
-				indicesGroupsObj.SetProperty(names[i], idxVal)
+			// 重复命名组 (duplicate-named-groups 提案)：同一名字可以对应
+			// 多个捕获序号。属性值 = 序号最大的**参与**捕获；没有参与时为
+			// undefined 占位 (仍要建自有属性)。未参与的组不覆盖已写入的值。
+			participated := loc[i*2] >= 0
+			if _, exists := groupsObj.GetProperty(names[i]); participated || !exists {
+				groupsObj.SetProperty(names[i], val)
+				if indicesGroupsObj != nil {
+					indicesGroupsObj.SetProperty(names[i], idxVal)
+				}
 			}
 		}
-		arr.SetProperty("groups", groupsObj)
 	}
+	// 规范步骤 24-26：groups 属性**恒存在** —— 无命名组时值为 undefined
+	// (groups-object-undefined.js：hasOwnProperty("groups") === true 且
+	// verifyProperty w/e/c 全真)。CreateDataProperty：不能走 SetProperty
+	// （会触发用户在 Array.prototype 上埋的 setter，groups-object.js 的
+	// set 陷阱专测这一点；且 ExtraProps 通道 hasOwnProperty 看不见）。
+	arr.DefineOwn("groups", object.DataProperty(func() object.Value {
+		if groupsObj != nil {
+			return groupsObj
+		}
+		return object.UndefinedSingleton
+	}()))
 
 	// d (hasIndices): 附带 indices 匹配位置数组 —— 0 号为整匹配, i 号为第 i
 	// 个捕获组的 [start, end] (未参与的组为 undefined); 元素相对整个 input
@@ -260,13 +276,15 @@ func regExpBuiltinExec(re *object.RegExp, input string) object.Value {
 			}
 		}
 		indicesArr := object.NewArray(indices)
-		indicesArr.SetProperty("groups", func() object.Value {
+		// indices.groups 同样是 CreateDataProperty（null 原型 groups 对象或
+		// undefined），与顶层 groups 属性同一落点。
+		indicesArr.DefineOwn("groups", object.DataProperty(func() object.Value {
 			if indicesGroupsObj != nil {
 				return indicesGroupsObj
 			}
 			return object.UndefinedSingleton
-		}())
-		arr.SetProperty("indices", indicesArr)
+		}()))
+		arr.DefineOwn("indices", object.DataProperty(indicesArr))
 	}
 
 	if re.Global || re.Sticky {
@@ -288,35 +306,46 @@ func regExpBuiltinExec(re *object.RegExp, input string) object.Value {
 // 这一下把 lastIndex 改成不可写, 从而使错误发生在**匹配成功之后**的严格
 // Set 上。此前 Gox 直接调 Go 侧的 FindAll*, 从不读 exec, 也就永远不抛。
 func regExpExec(re *object.RegExp, input string) object.Value {
-	// 只有实例上存在**自有** exec 时才经 CallFunction 调用, 否则直接走内建
-	// 路径 —— 两个理由:
-	//
-	// (1) CallFunction 会**清空**回调错误槽。ToString(参数) 阶段挂起的抛出
-	//     正记在这个槽里 (coerce-arg-err / arg-1-coerce-err 一族), 无谓地
-	//     调一次 CallFunction 就把那个抛出抹掉了。
-	// (2) 内建方法「返回」的 Error 值经 CallFunction 后只是普通 Value, 不会
-	//     自动变成 JS 抛出, 需要调用方额外判定。
-	if re.HasOwn("exec") {
-		if exec, ok := re.GetProperty("exec"); ok && object.IsCallable(exec) {
-			pending := object.TakeCallbackError()
-			res := object.CallFunction(exec, re, object.NewString(input))
-			thrown := object.TakeCallbackError()
-			if pending != nil {
-				// 参数 ToString 阶段已挂起抛出: 原样归还给 VM 传播。
-				object.SetCallbackError(pending)
-				return object.UndefinedSingleton
-			}
-			if thrown != nil {
-				object.SetCallbackError(thrown)
-				return object.UndefinedSingleton
-			}
-			if res == nil {
-				return object.NullSingleton
-			}
-			return res
+	// 规范 RegExpExec: exec = Get(rx, "exec") —— **沿原型链**查找。此前用
+	// HasOwn("exec") 只认实例自有属性, 子类覆写 (class X extends RegExp
+	// { exec(...) } 方法挂在 X.prototype 上) 被漏掉, 落回内建 exec 跑空
+	// 模式 (named-groups groups-object-subclass 族专测)。
+	// 判"是内建 exec"用指针比对 RegExp.prototype.exec —— 用户覆写原型
+	// 方法时指针不同, 按规范应走 CallFunction。
+	if exec, ok := re.GetProperty("exec"); ok && exec != nil && object.IsCallable(exec) && !isBuiltinRegExpExec(exec) {
+		pending := object.TakeCallbackError()
+		res := object.CallFunction(exec, re, object.NewString(input))
+		thrown := object.TakeCallbackError()
+		if pending != nil {
+			// 参数 ToString 阶段已挂起抛出: 原样归还给 VM 传播。
+			object.SetCallbackError(pending)
+			return object.UndefinedSingleton
 		}
+		if thrown != nil {
+			object.SetCallbackError(thrown)
+			return object.UndefinedSingleton
+		}
+		if res == nil {
+			return object.NullSingleton
+		}
+		return res
 	}
 	return regExpBuiltinExec(re, input)
+}
+
+// isBuiltinRegExpExec 判断 v 是否就是 %RegExp.prototype%.exec 内建方法
+// 本体 —— 是则不必绕 CallFunction（理由见 regExpExec 注释），直接走内建
+// 快路径。
+func isBuiltinRegExpExec(v object.Value) bool {
+	proto, ok := object.RegExpProto.(*object.Object)
+	if !ok {
+		return false
+	}
+	builtin, ok := proto.GetProperty("exec")
+	if !ok {
+		return false
+	}
+	return v == builtin
 }
 
 // isNullishExecResult 判断 exec 结果是否为「未匹配」(null / undefined)。
@@ -464,7 +493,49 @@ func setupRegExpProto() *object.Object {
 		return object.NewArray(out)
 	}))
 
+	// [Symbol.matchAll](string): %RegExp.prototype%[@@matchAll] ——
+	// 返回 %RegExp String Iterator%。规范要点:
+	//   - 非全局正则直接 TypeError（matchAll-requires-global 族）;
+	//   - 先 Set(rx,"lastIndex",0,true)，之后每轮 RegExpExec 推进;
+	//   - 迭代器 next() 每次 yield 一个 exec 结果数组。
+	// 此前引擎没有这个方法，String.prototype.matchAll 派发落空后走
+	// 字符串侧数组快路径，返回的不是迭代器（named-groups matchall 族
+	// 的 compareIterator 断言因此失败）。
+	p.SetBuiltinProperty(object.NewSymbol("Symbol.matchAll").Inspect(), object.NewBuiltinMethod("[Symbol.matchAll]", func(this object.Value, args ...object.Value) object.Value {
+		re, errVal := regExpThis(this)
+		if errVal != nil {
+			return errVal
+		}
+		input := ""
+		if len(args) > 0 {
+			input = toStr(args[0])
+		}
+		if !re.Global {
+			return object.NewTypeError("matchAll requires a global regular expression")
+		}
+		if !re.SetLastIndexStrict(0) {
+			return lastIndexTypeError()
+		}
+		var it *object.JSIterator
+		it = &object.JSIterator{Name: "RegExp String Iterator", NextFn: func() (object.Value, bool) {
+			res := regExpExec(re, input)
+			if isErrorResult(res) {
+				it.PendingErr = res
+				return object.UndefinedSingleton, true
+			}
+			if isNullishExecResult(res) {
+				it.MarkExhausted()
+				return object.UndefinedSingleton, true
+			}
+			return res, false
+		}}
+		return it
+	}))
+
 	// [Symbol.replace](string, replacement): 用于 String.prototype.replace
+	// 实现体抽到 regExpReplace：@@replace 与 String.prototype.replace /
+	// replaceAll 快路径三处共用同一份 exec 循环与 GetSubstitution 展开，
+	// 避免快路径丢捕获组 / 丢 groups 实参的口径分叉。
 	p.SetBuiltinProperty(object.NewSymbol("Symbol.replace").Inspect(), object.NewBuiltinMethod("[Symbol.replace]", func(this object.Value, args ...object.Value) object.Value {
 		re, errVal := regExpThis(this)
 		if errVal != nil {
@@ -474,64 +545,13 @@ func setupRegExpProto() *object.Object {
 		if len(args) > 0 {
 			input = toStr(args[0])
 		}
-		replaceStr := ""
+		// 缺省 replacement 维持历史行为（空串）：规范 ToString(undefined)
+		// 应为 "undefined"，但既有用例在空串口径下通过，零退潮优先。
+		var replaceValue object.Value = object.NewString("")
 		if len(args) > 1 {
-			replaceStr = toStr(args[1])
+			replaceValue = args[1]
 		}
-
-		var results []object.Value
-		if re.Global {
-			// 步骤: Set(rx, "lastIndex", 0, true) 后逐轮 exec。
-			if !re.SetLastIndexStrict(0) {
-				return lastIndexTypeError()
-			}
-			rs, errVal := collectExecResults(re, input)
-			if errVal != nil {
-				return errVal
-			}
-			results = rs
-		} else {
-			res := regExpExec(re, input)
-			if isErrorResult(res) {
-				return res
-			}
-			if isNullishExecResult(res) {
-				return object.NewString(input)
-			}
-			results = append(results, res)
-		}
-
-		// 规范步骤: namedCaptures = Get(result, "groups");
-		// 非 undefined ⇒ ToObject(namedCaptures) —— null 抛 TypeError
-		// (result-coerce-groups-err.js)。
-		for _, res := range results {
-			if g, has := groupsOfResult(res); has {
-				if g == nil || g == object.NullSingleton {
-					return object.NewTypeError("Cannot convert undefined or null to object")
-				}
-			}
-		}
-
-		// 拼接替换结果。exec 可被用户覆写, 返回的 index / 匹配串未必自洽,
-		// 越界一律跳过 (宁可少替换也不 panic)。
-		var result strings.Builder
-		lastEnd := 0
-		for _, res := range results {
-			start := lastIndexOfResult(res)
-			matchStr := matchStringOfResult(res)
-			if start < 0 || start < lastEnd || start > len(input) {
-				continue
-			}
-			end := start + len(matchStr)
-			if end > len(input) {
-				end = len(input)
-			}
-			result.WriteString(input[lastEnd:start])
-			result.WriteString(expandReplacement(replaceStr, matchStr, submatchGroupsOfResult(res), namedGroupsOfResult(res)))
-			lastEnd = end
-		}
-		result.WriteString(input[lastEnd:])
-		return object.NewString(result.String())
+		return regExpReplace(re, input, replaceValue)
 	}))
 
 	// [Symbol.split](string, limit): 用于 String.prototype.split
@@ -549,12 +569,7 @@ func setupRegExpProto() *object.Object {
 			limit = int(toFloat(args[1]))
 		}
 
-		parts := re.Split(input, limit)
-		result := make([]object.Value, len(parts))
-		for i, part := range parts {
-			result[i] = object.NewString(part)
-		}
-		return object.NewArray(result)
+		return regExpSplit(re, input, limit)
 	}))
 
 	// ===== 访问器属性族 (source/global/flags/...) =====
@@ -597,6 +612,12 @@ func submatchGroupsOfResult(res object.Value) []string {
 	}
 	groups := make([]string, 0, len(arr.Elements))
 	for i := 1; i < len(arr.Elements); i++ {
+		// 未参与的捕获组值是 undefined：GetSubstitution 对 $n 的口径是
+		// "capture undefined → 空串"，不能串成 "undefined"。
+		if isUndefinedValue(arr.Elements[i]) {
+			groups = append(groups, "")
+			continue
+		}
 		groups = append(groups, toStr(arr.Elements[i]))
 	}
 	return groups
@@ -620,10 +641,213 @@ func namedGroupsOfResult(res object.Value) map[string]string {
 	named := make(map[string]string)
 	for _, k := range gobj.Keys() {
 		if v, ok := gobj.GetProperty(k); ok {
+			// 未参与的命名组属性值是 undefined：GetSubstitution 视为
+			// capture undefined → $<name> 展开为空串。查不到键与查到
+			// undefined 落同一分支，这里跳过即可。
+			if isUndefinedValue(v) {
+				continue
+			}
 			named[k] = toStr(v)
 		}
 	}
 	return named
+}
+
+// regExpSplit 是规范 RegExp.prototype[Symbol.split] 的实现体，供内建
+// @@split 与 String.prototype.split 快路径共用（两侧此前各写一份，快路径
+// 丢捕获组 —— split-with-capture-group 族断言捕获组按序拼进结果）。
+// 分隔符点集合与 re.Split 内部用的是同一条 FindAll 管线；若两侧匹配数
+// 不一致（空匹配推进等边界语义分叉），宁可退回无捕获的旧行为也不拼错。
+func regExpSplit(re *object.RegExp, input string, limit int) object.Value {
+	parts := re.Split(input, limit)
+	result := make([]object.Value, 0, len(parts))
+	locs := re.FindAllStringSubmatchIndex(input, func() int {
+		if limit > 0 {
+			return limit - 1
+		}
+		return -1
+	}())
+	withCaptures := len(locs) == len(parts)-1 && len(parts) > 0
+	for i, part := range parts {
+		result = append(result, object.NewString(part))
+		if !withCaptures || i >= len(locs) {
+			continue
+		}
+		loc := locs[i]
+		for g := 1; g < len(loc)/2; g++ {
+			if loc[g*2] >= 0 {
+				result = append(result, object.NewString(input[loc[g*2]:loc[g*2+1]]))
+			} else {
+				result = append(result, object.UndefinedSingleton)
+			}
+		}
+	}
+	return object.NewArray(result)
+}
+
+// regExpReplace 是规范 RegExp.prototype[Symbol.replace] 的实现体，供内建
+// @@replace 与 String.prototype.replace 快路径共用。replaceValue 可以是
+// 字符串（GetSubstitution 展开）或函数（[matched, p1..pn, position, S,
+// groups?] 实参表）。
+func regExpReplace(re *object.RegExp, input string, replaceValue object.Value) object.Value {
+	// 规范 @@replace 步骤 7: functionalReplace = IsCallable(replaceValue);
+	// 非函数时 ToString(replaceValue) 必须发生在**匹配之前** —— 毒 toString
+	// 即使零匹配也要抛 (arg-2-coerce-err.js)。
+	var replaceStr string
+	if !object.IsCallable(replaceValue) {
+		rpl, errv := toPrimitiveToString(replaceValue)
+		if errv != nil {
+			return errv
+		}
+		replaceStr = rpl.Value
+	}
+	var results []object.Value
+	if re.Global {
+		// 步骤: Set(rx, "lastIndex", 0, true) 后逐轮 exec。
+		if !re.SetLastIndexStrict(0) {
+			return lastIndexTypeError()
+		}
+		rs, errVal := collectExecResults(re, input)
+		if errVal != nil {
+			return errVal
+		}
+		results = rs
+	} else {
+		res := regExpExec(re, input)
+		if isErrorResult(res) {
+			return res
+		}
+		if isNullishExecResult(res) {
+			return object.NewString(input)
+		}
+		results = append(results, res)
+	}
+
+	// 规范步骤: namedCaptures = Get(result, "groups");
+	// 非 undefined ⇒ ToObject(namedCaptures) —— null 抛 TypeError
+	// (result-coerce-groups-err.js)。
+	// 规范: 字符串替换路径 namedCaptures = Get(result,"groups"); 非 undefined
+	// ⇒ ToObject(namedCaptures) —— null 抛 TypeError (result-coerce-groups-err.js)。
+	// **函数式路径没有这一步**: namedCaptures 非 undefined 原样追加为最后实参,
+	// groups: null / undefined 均不抛 (named-groups-fn.js 断言面)。
+	if !object.IsCallable(replaceValue) {
+		for _, res := range results {
+			if g, has := groupsOfResult(res); has {
+				if g == object.NullSingleton {
+					return object.NewTypeError("Cannot convert undefined or null to object")
+				}
+			}
+		}
+	}
+
+	// replaceValue 是函数：replacerArgs = [matched, p1..pn, position,
+	// S, groups?]（fn-invoke-args.js / named-groups-fn.js 的断言面）。
+	if object.IsCallable(replaceValue) {
+		fn := replaceValue
+		var result strings.Builder
+		lastEnd := 0
+		for _, res := range results {
+			start := lastIndexOfResult(res)
+			matchStr := matchStringOfResult(res)
+			if start < 0 || start < lastEnd || start > len(input) {
+				continue
+			}
+			end := start + len(matchStr)
+			if end > len(input) {
+				end = len(input)
+			}
+			result.WriteString(input[lastEnd:start])
+			r := object.CallFunction(fn, object.UndefinedSingleton, replacerArgs(res, input, start)...)
+			if thr := callbackThrown(); thr != nil {
+				return thr
+			}
+			result.WriteString(toStr(r))
+			lastEnd = end
+		}
+		result.WriteString(input[lastEnd:])
+		return object.NewString(result.String())
+	}
+
+	// replaceStr 已在函数入口按规范步骤 7 提前 ToString (匹配前求值)。
+
+	// 拼接替换结果。exec 可被用户覆写, 返回的 index / 匹配串未必自洽,
+	// 越界一律跳过 (宁可少替换也不 panic)。
+	var result strings.Builder
+	lastEnd := 0
+	for _, res := range results {
+		start := lastIndexOfResult(res)
+		matchStr := matchStringOfResult(res)
+		if start < 0 || start < lastEnd || start > len(input) {
+			continue
+		}
+		end := start + len(matchStr)
+		if end > len(input) {
+			end = len(input)
+		}
+		result.WriteString(input[lastEnd:start])
+		namedCap, errVal := resolveNamedCaptures(replaceStr, res)
+		if errVal != nil {
+			return errVal
+		}
+		result.WriteString(expandReplacement(replaceStr, matchStr, submatchGroupsOfResult(res), namedCap, input, start))
+		lastEnd = end
+	}
+	result.WriteString(input[lastEnd:])
+	return object.NewString(result.String())
+}
+
+// resolveNamedCaptures 预解析替换模板里被引用的 $<name> 组（规范
+// GetSubstitution 对每个 $<name> 执行 Get(namedCaptures, name) —— 是**按名
+// 查找**而非枚举，且沿原型链可达（groups-object-subclass 族：exec 结果的
+// groups 挂在原型上的 b 属性也要能取到），getter 抛错必须传播）。
+// 返回 名 → 值字符串（缺失/undefined 的名字不入表，展开为空串）；第二个
+// 返回值非 nil 表示解析过程抛了错（namedCaptures 为 null 的 TypeError 已
+// 在上游拦截）。
+func resolveNamedCaptures(replacement string, res object.Value) (map[string]string, object.Value) {
+	gv, ok := res.GetProperty("groups")
+	if !ok || gv == nil || isUndefinedValue(gv) {
+		return nil, nil // namedCaptures undefined：$<...> 字面保留
+	}
+	if gv == object.NullSingleton {
+		// 上游 regExpReplace 已拦截 null；这里兜底同款 TypeError。
+		return nil, object.NewTypeError("Cannot convert undefined or null to object")
+	}
+	named := make(map[string]string)
+	for i := 0; i < len(replacement); i++ {
+		if replacement[i] != '$' || i+1 >= len(replacement) || replacement[i+1] != '<' {
+			continue
+		}
+		end := strings.IndexByte(replacement[i+2:], '>')
+		if end < 0 {
+			continue
+		}
+		name := replacement[i+2 : i+2+end]
+		if _, seen := named[name]; seen {
+			continue
+		}
+		v, found := gv.GetProperty(name)
+		if !found || v == nil || isUndefinedValue(v) {
+			continue // capture undefined → 空串（不入表即空串语义）
+		}
+		named[name] = toStr(v)
+	}
+	return named, nil
+}
+
+// replacerArgs 构造函数式替换的实参表（规范 @@replace 步骤 14.j/ii）：
+// [matched, p1..pn, position, S, groups?] —— groups 仅在 exec 结果的
+// groups 属性非 undefined 时追加（named-groups-fn.js: "groups value is
+// passed as last argument of replacer unless it is undefined"）。
+func replacerArgs(res object.Value, input string, start int) []object.Value {
+	callArgs := []object.Value{object.NewString(matchStringOfResult(res))}
+	if arr, ok := res.(*object.Array); ok && len(arr.Elements) > 1 {
+		callArgs = append(callArgs, arr.Elements[1:]...)
+	}
+	callArgs = append(callArgs, object.NewNumber(float64(start)), object.NewString(input))
+	if gv, ok := res.GetProperty("groups"); ok && gv != nil && !isUndefinedValue(gv) {
+		callArgs = append(callArgs, gv)
+	}
+	return callArgs
 }
 
 // toRegExpArg 将参数转换为 *object.RegExp。
@@ -641,10 +865,12 @@ func toRegExpArg(v object.Value, defaultFlags string) (*object.RegExp, object.Va
 	return re, nil
 }
 
-// expandReplacement 展开 $1, $2, $&, $$, $`, $', $<name> 等替换模式。
-// groups 是捕获组的字符串切片 (不含整个匹配); named 是命名捕获组
-// 名 → 匹配串映射 (nil 表示模式无命名组, 此时 $<...> 按字面量保留)。
-func expandReplacement(replacement, match string, groups []string, named map[string]string) string {
+// expandReplacement 展开 $1, $2, $&, $$, $`, $', $<name> 等替换模式
+// (GetSubstitution)。groups 是捕获组的字符串切片 (不含整个匹配); named 是
+// 命名捕获组 名 → 匹配串映射 (nil 表示 namedCaptures 整体 undefined, 此时
+// $<...> 按字面量保留); input/position 供 $` ($` = position 前文本) 与
+// $' (匹配后文本) 取值。
+func expandReplacement(replacement, match string, groups []string, named map[string]string, input string, position int) string {
 	var result strings.Builder
 	for i := 0; i < len(replacement); i++ {
 		c := replacement[i]
@@ -658,17 +884,21 @@ func expandReplacement(replacement, match string, groups []string, named map[str
 			result.WriteByte('$')
 			i++
 		case next == '<':
-			// $<name> 命名捕获组引用 (GetSubstitution): 模式无命名组或
-			// 名字不存在时按字面量保留 —— 与规范"非法引用"的宽容处理一致
-			// (真正该抛 SyntaxError 的非法模式在编译期已被拒绝)。
+			// $<name> 命名捕获组引用 (GetSubstitution):
+			//   - namedCaptures 整体 undefined (模式无命名组 / exec 结果
+			//     没有 groups 对象) → 字面保留 "$<..."；
+			//   - 找不到 '>' → 字面保留；
+			//   - 组名不存在或该组未参与 (capture undefined) → 整段展开为
+			//     空串 (named-groups.js: "replace the text through > with
+			//     the empty String"，string-replace-missing.js 同口径)。
 			end := strings.IndexByte(replacement[i+2:], '>')
 			if end >= 0 && named != nil {
 				name := replacement[i+2 : i+2+end]
 				if v, ok := named[name]; ok {
 					result.WriteString(v)
-					i = i + 2 + end
-					continue
 				}
+				i = i + 2 + end
+				continue
 			}
 			result.WriteString("$<")
 			i++
@@ -676,10 +906,26 @@ func expandReplacement(replacement, match string, groups []string, named map[str
 			result.WriteString(match)
 			i++
 		case next == '`':
-			// $` 表示匹配前的文本 (这里无法获取，用空串占位)
+			// $` = 匹配起点之前的文本 (GetSubstitution)
+			pre := position
+			if pre > len(input) {
+				pre = len(input)
+			}
+			if pre < 0 {
+				pre = 0
+			}
+			result.WriteString(input[:pre])
 			i++
 		case next == '\'':
-			// $' 表示匹配后的文本 (这里无法获取，用空串占位)
+			// $' = 匹配结束之后的文本 (GetSubstitution)
+			end := position + len(match)
+			if end > len(input) {
+				end = len(input)
+			}
+			if end < 0 {
+				end = 0
+			}
+			result.WriteString(input[end:])
 			i++
 		case next >= '0' && next <= '9':
 			// 捕获组 $1, $2, ..., $99

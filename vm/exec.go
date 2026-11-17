@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"math"
 	"os"
-	"strconv"
 	"strings"
 
 	"github.com/14752222/Gox/bytecode"
@@ -2159,12 +2158,13 @@ func (vm *VM) runFrom(startFrameIdx int) error {
 			case *object.Object:
 				vm.stack.Push(runtime.NewObjectKeysIterator(v))
 			case *object.Array:
-				// for...in 遍历数组的索引键 ("0", "1", ...)
-				keys := make([]string, len(v.Elements))
-				for i := range v.Elements {
-					keys[i] = strconv.Itoa(i)
-				}
-				iter := runtime.NewObjectKeysIteratorWithKeys(v, keys)
+				// for...in: 索引键 + defineProperty 定义的**可枚举**字符串
+				// 键 (EnumerableOwnKeys 的规范顺序: 整数索引升序在前)。
+				// exec 结果数组上的 "groups"/"indices" 走 DefineOwn 落
+				// PropDescs, propertyHelper 的 isEnumerable 用 for-in 探测,
+				// 漏枚举会让所有 verifyProperty(result, "groups", …) 假阴。
+				// ExtraProps (arr.foo = 1) 维持历史行为不枚举。
+				iter := runtime.NewObjectKeysIteratorWithKeys(v, v.EnumerableOwnKeys())
 				vm.stack.Push(iter)
 			default:
 				// 函数类 (Closure/BuiltinFunction/BuiltinMethod) 等实现

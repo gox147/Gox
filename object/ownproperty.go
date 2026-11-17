@@ -184,15 +184,20 @@ func (a *Array) EnumerableOwnKeys() []string {
 	return keys
 }
 
-// HasOwn 检查数组自有属性: length / 越界内索引 / defineProperty 定义的键。
-// 注意 ExtraProps (arr.foo = 1 的落点) 不计入 —— 与历史行为一致
-// (既有 hasOwnProperty 对数组额外属性返 false)。
+// HasOwn 检查数组自有属性: length / 越界内索引 / defineProperty 定义的键 /
+// ExtraProps (exec 结果上的 index / input / groups 等运行期附加属性)。
+// 此前 ExtraProps 不计入, 导致 "ab".exec 类自定义 exec 返回的带 groups 的
+// 数组在 hasOwnProperty / Object.getOwnPropertyDescriptor 下漏掉 groups
+// (named-groups groups-object-subclass 族)。
 func (a *Array) HasOwn(name string) bool {
 	if name == "length" {
 		return true
 	}
 	if d, ok := a.PropDescs[name]; ok {
 		_ = d
+		return true
+	}
+	if _, ok := a.ExtraProps[name]; ok {
 		return true
 	}
 	if idx, err := Atoi(name); err == nil && idx >= 0 {
@@ -212,6 +217,11 @@ func (a *Array) HasOwn(name string) bool {
 func (a *Array) OwnDescriptor(name string) (PropertyDescriptor, bool) {
 	if d, ok := a.PropDescs[name]; ok {
 		return d, true
+	}
+	if v, ok := a.ExtraProps[name]; ok {
+		// ExtraProps 属性按普通可枚举可配置数据属性处理
+		// (exec 结果的 index/input/groups 均为此口径)。
+		return DataProperty(v), true
 	}
 	if name == "length" {
 		return arrayLengthDescriptorFor(a), true
@@ -300,7 +310,7 @@ func (a *Array) truncateTo(n int) {
 
 // TruncateTo / DropDescsFrom: stdlib 的 ArraySetLength (defineProperty
 // "length") 需要的导出包装。
-func (a *Array) TruncateTo(n int) { a.truncateTo(n) }
+func (a *Array) TruncateTo(n int)    { a.truncateTo(n) }
 func (a *Array) DropDescsFrom(n int) { a.dropDescsFrom(n) }
 
 // dropDescsFrom 删除索引 >= from 的显式描述符 (length 截断时调用),

@@ -243,10 +243,17 @@ func (r *RegExp) FindAllString(s string, n int) []string {
 
 // SubexpNames 组名数组：下标 0 恒为 ""（整匹配，对齐 Go 口径）；未命名组
 // 也是 ""。regexp2 的 GetGroupNames 会把未命名组报成序号字符串（"1"），
-// 在此归一。
+// 在此归一。降级重写过组名时（FallbackGroupNames 非 nil），直接返回真实
+// JS 组名 —— 重写后的 k1..kN 对外不可见。
 func (r *RegExp) SubexpNames() []string {
 	if !r.hasFallbackEngine() {
 		return r.Regexp.SubexpNames()
+	}
+	if r.FallbackGroupNames != nil {
+		out := make([]string, len(r.FallbackGroupNames)+1)
+		out[0] = ""
+		copy(out[1:], r.FallbackGroupNames)
+		return out
 	}
 	names := r.Regexp2.GetGroupNames()
 	out := make([]string, len(names))
@@ -469,10 +476,20 @@ func decodeGroupName(name string) (string, bool) {
 				if !ok {
 					return "", false
 				}
+				i += 6
+				// 代理对合并：组名里 \uD8xx \uDexx 两个转义合起来才是一个
+				// astral 码点（unicode-property-names 族专测这一点）。单独
+				// 一个代理码元不是合法标识符字符。
+				if v >= 0xD800 && v <= 0xDBFF && i+6 <= len(name) &&
+					name[i] == '\\' && name[i+1] == 'u' {
+					if lo, ok2 := parseHexRun(name[i+2 : i+6]); ok2 && lo >= 0xDC00 && lo <= 0xDFFF {
+						v = 0x10000 + (v-0xD800)<<10 + (lo - 0xDC00)
+						i += 6
+					}
+				}
 				r := rune(v)
 				b.WriteRune(r)
 				runes = append(runes, r)
-				i += 6
 				continue
 			}
 			return "", false
@@ -504,6 +521,194 @@ func decodeGroupName(name string) (string, bool) {
 		}
 	}
 	return b.String(), true
+}
+
+// renameGroupsForFallback 把降级模式里的命名组重写成 .NET 一定接受的形态
+// （T2 第二层，2026-11-18）。
+//
+// 为什么重写而不是原样交给 .NET：
+//   - .NET 组名只认 word 字符开头，JS 合法名 `(?<$>a)` .NET 直接拒绝编译；
+//   - .NET 把重复命名组合并成一个组（captures 叠栈），而 JS
+//     （duplicate-named-groups 提案）要求每组独立占一个捕获序号 —— exec
+//     结果数组长度、groups 属性都以序号为准。
+//
+// 重写规则（两遍扫描：先收集组名与序号，再重写 —— 否则前向引用
+// `\k<a>(?<a>b)` 里引用先于声明出现，会漏掉重写）：
+//   - `(?<name>` → `(?<kN>`，N 为捕获组出现序号（含未命名组一起计数，
+//     保证 \1..\9 序号不变）；
+//   - `\k<name>` → `\k<kN>`，N 取该名**最后一次**声明的组（非重复名
+//     等价于唯一组；重复名下这是最接近提案"最近捕获"的近似）；
+//   - 未命名捕获组 `(` 原样保留但同样计数。
+//
+// 返回重写后的模式与 names（下标 i-1 = 第 i 个捕获组的真实 JS 名，
+// 未命名为 ""）；SubexpNames 据此对外还原真实组名。组名合法性已由
+// preprocessGroupNames 校验过，这里不再重复。
+func renameGroupsForFallback(pattern string) (string, []string) {
+	// 第一遍：收集捕获组（命名在前，未命名也计数）
+	names := []string{}
+	occurrences := map[string][]int{} // 组名 → 各次声明的捕获序号（升序）
+	for i := 0; i < len(pattern); {
+		if pattern[i] == '\\' {
+			i += 2
+			continue
+		}
+		if pattern[i] == '[' {
+			k := i + 1
+			if k < len(pattern) && pattern[k] == '^' {
+				k++
+			}
+			if k < len(pattern) && pattern[k] == ']' {
+				k++
+			}
+			for k < len(pattern) && pattern[k] != ']' {
+				if pattern[k] == '\\' {
+					k++
+				}
+				k++
+			}
+			if k < len(pattern) {
+				k++
+			}
+			i = k
+			continue
+		}
+		if strings.HasPrefix(pattern[i:], "(?<") && i+3 < len(pattern) &&
+			pattern[i+3] != '=' && pattern[i+3] != '!' {
+			end := indexGtUnescaped(pattern, i+3)
+			if end >= 0 {
+				name := pattern[i+3 : end]
+				names = append(names, name)
+				occurrences[name] = append(occurrences[name], len(names))
+				i = end + 1
+				continue
+			}
+		}
+		if pattern[i] == '(' {
+			// 未命名捕获组也计数（序号对齐 \1..\9）。注意 (? 开头的
+			// 非捕获结构 ((?: (?= (?! 以及上面已处理的 (?<name>) 不计数。
+			if !(i+1 < len(pattern) && pattern[i+1] == '?') {
+				names = append(names, "")
+			}
+		}
+		i++
+	}
+
+	// 第二遍：重写输出。ni 按同样的顺序数捕获组 —— 组**定义**用出现
+	// 序号（nameToN 是给 \k 引用用的，指向同名最后一次声明）。
+	var b strings.Builder
+	b.Grow(len(pattern))
+	ni := 0
+	for i := 0; i < len(pattern); {
+		if pattern[i] == '\\' {
+			if i+1 < len(pattern) && pattern[i+1] == 'k' && i+3 < len(pattern) && pattern[i+2] == '<' {
+				end := indexGtUnescaped(pattern, i+3)
+				if end >= 0 {
+					name := pattern[i+3 : end]
+					if nums, ok := occurrences[name]; ok {
+						writeBackrefAsDotNetConditional(&b, nums)
+						i = end + 1
+						continue
+					}
+					// 未知组名引用：原样保留，交给 .NET 报 SyntaxError
+					// （JS 规范同样要求引用必须存在）
+					b.WriteString(pattern[i : end+1])
+					i = end + 1
+					continue
+				}
+			}
+			b.WriteString(pattern[i : i+2])
+			i += 2
+			continue
+		}
+		if pattern[i] == '[' {
+			k := i + 1
+			if k < len(pattern) && pattern[k] == '^' {
+				k++
+			}
+			if k < len(pattern) && pattern[k] == ']' {
+				k++
+			}
+			for k < len(pattern) && pattern[k] != ']' {
+				if pattern[k] == '\\' {
+					k++
+				}
+				k++
+			}
+			if k < len(pattern) {
+				k++
+			}
+			b.WriteString(pattern[i:k])
+			i = k
+			continue
+		}
+		if strings.HasPrefix(pattern[i:], "(?<") && i+3 < len(pattern) &&
+			pattern[i+3] != '=' && pattern[i+3] != '!' {
+			end := indexGtUnescaped(pattern, i+3)
+			if end >= 0 {
+				ni++
+				// 命名组降级为**普通未命名组**：.NET 把命名组排在全部未命名
+				// 组之后编号（隐式组优先），命名/未命名混用时 \1..\9 的序号
+				// 会整体错位。统一 unnamed 后 .NET 编号 = 源顺序 = JS 序号。
+				b.WriteByte('(')
+				i = end + 1
+				continue
+			}
+		}
+		if pattern[i] == '(' {
+			if !(i+1 < len(pattern) && pattern[i+1] == '?') {
+				ni++
+			}
+		}
+		b.WriteByte(pattern[i])
+		i++
+	}
+	return b.String(), names
+}
+
+// writeBackrefAsDotNetConditional 把 JS 的 \k<name>（对应重命名前的捕获
+// 序号集合 nums，升序）改写成 .NET 条件引用：
+//
+//	(?(n)\n|(?(m)\m|…(?(1)\1)))
+//
+// 语义 = JS（duplicate-named-groups 提案）：取同名**最后参与的**捕获；
+// 全部未参与时匹配空串。.NET 的裸 \n 在组未参与时会整个匹配失败，
+// 而 JS 里未捕获的回溯引用匹配空串 —— 条件式是二者的等价桥。
+// nums 为空不应发生（引用必须指向已声明的组，否则走未知名分支）。
+func writeBackrefAsDotNetConditional(b *strings.Builder, nums []int) {
+	if len(nums) == 0 {
+		return
+	}
+	// 降序：外层优先**最后声明**的组 —— 同名多组时 JS 取最后参与的捕获，
+	// 而且实测 .NET 在量词重复下首组优先会因旧捕获残留而整体失配。
+	for j := len(nums) - 1; j >= 0; j-- {
+		n := nums[j]
+		b.WriteString("(?(")
+		b.WriteString(strconv.Itoa(n))
+		b.WriteString(`)\`)
+		b.WriteString(strconv.Itoa(n))
+		if j > 0 {
+			b.WriteString("|")
+		}
+	}
+	// 闭合所有层：每层条件式一个 ')'。
+	for range nums {
+		b.WriteByte(')')
+	}
+}
+
+// indexGtUnescaped 从 off 起找未转义的 '>'。组名里不会出现裸 >（规范
+// GroupName 字符集不含它），这里只为防畸形模式扫到别的结构去。
+func indexGtUnescaped(pattern string, off int) int {
+	for j := off; j < len(pattern); j++ {
+		if pattern[j] == '\\' {
+			j++
+			continue
+		}
+		if pattern[j] == '>' {
+			return j
+		}
+	}
+	return -1
 }
 
 // hasFallbackTrigger 降级引擎准入闸门（零退潮的结构保证之二）。

@@ -21,26 +21,34 @@ import (
 // TypeError。此前 lastIndex 只是裸结构体字段, 无从表达「不可写」, 于是
 // 这 8 个用例全是假阳性通过 (详见 stdlib/regexp.go 的注释与 rEXjyz)。
 type RegExp struct {
-	Pattern     string          // 原始正则表达式模式
-	Flags       string          // 标志位 (g, i, m, s, u, y)
-	Regexp      *regexp.Regexp  // Go 编译后的正则
-	Regexp2     *regexp2.Regexp // 降级引擎（RE2 编译失败才启用，见 regexp_fallback.go）
-	Global      bool            // g 标志
-	IgnoreCase  bool            // i 标志
-	Multiline   bool            // m 标志
-	DotAll      bool            // s 标志
-	Sticky      bool            // y 标志 (粘性匹配)
-	Unicode     bool            // u 标志
-	UnicodeSets bool            // v 标志 (unicodeSets, ES2024; 与 u 互斥)
-	HasIndices  bool            // d 标志 (匹配位置索引)
-	mu          sync.Mutex
-	LastIndex   int // 上次匹配位置 (g/y 标志使用)
+	Pattern string          // 原始正则表达式模式
+	Flags   string          // 标志位 (g, i, m, s, u, y)
+	Regexp  *regexp.Regexp  // Go 编译后的正则
+	Regexp2 *regexp2.Regexp // 降级引擎（RE2 编译失败才启用，见 regexp_fallback.go）
+	// FallbackGroupNames 非 nil 时，降级引擎里的命名组已重写为 k1..kN
+	// （.NET 组名字符集比 JS 窄，见 renameGroupsForFallback）；此切片
+	// 按捕获组序号存真实 JS 组名（未命名组为 ""），SubexpNames 用它还原。
+	FallbackGroupNames []string
+	Global             bool // g 标志
+	IgnoreCase         bool // i 标志
+	Multiline          bool // m 标志
+	DotAll             bool // s 标志
+	Sticky             bool // y 标志 (粘性匹配)
+	Unicode            bool // u 标志
+	UnicodeSets        bool // v 标志 (unicodeSets, ES2024; 与 u 互斥)
+	HasIndices         bool // d 标志 (匹配位置索引)
+	mu                 sync.Mutex
+	LastIndex          int // 上次匹配位置 (g/y 标志使用)
 
 	// PropDescs 承载 defineProperty / 赋值落在实例上的自有属性描述符。
 	// lastIndex 的规范描述符是懒建 (见 ownLastIndexDescriptor)。
 	PropDescs map[string]PropertyDescriptor
 	// propKeyOrder 记录 defineProperty 定义键的创建顺序 (OwnKeys 口径)。
 	propKeyOrder []string
+	// ProtoOverride 是派生类实例 (class MyRe extends RegExp) 的 [[Prototype]]
+	// 覆盖 —— super() 回填的派生类原型 (MyRe.prototype)。普通实例为 nil,
+	// GetProto 回落 RegExpProto。与 TypedArray.ProtoOverride 同法。
+	ProtoOverride Value
 }
 
 func (r *RegExp) Type() ObjectType { return REGEXP_OBJ }
@@ -49,12 +57,36 @@ func (r *RegExp) Inspect() string {
 }
 func (r *RegExp) IsTruthy() bool { return true }
 
-// GetProto 返回实例的 [[Prototype]] = %RegExp.prototype%。
+// GetProto 返回实例的 [[Prototype]]: 派生类实例为 ProtoOverride
+// (class MyRe extends RegExp 的 MyRe.prototype), 普通实例为 %RegExp.prototype%。
 //
 // 原型链遍历的事实来源是鸭子类型入口 `interface{ GetProto() Value }`。此前
 // *RegExp 缺这个方法, 链在实例处断掉 —— 即便 RegExpProto 已装配, 经链式
 // 查找 (symbol 成员 / getPrototypeOf) 的读法仍取不到 exec / @@match 等成员。
-func (r *RegExp) GetProto() Value { return RegExpProto }
+func (r *RegExp) GetProto() Value {
+	if r.ProtoOverride != nil {
+		return r.ProtoOverride
+	}
+	return RegExpProto
+}
+
+// protoChainGet 沿 ProtoOverride (若派生类原型存在) 或 RegExpProto 链查 name,
+// 供 GetProperty 的原型回退段使用。override 原型优先于内建原型。
+func (r *RegExp) protoChainGet(name string) (Value, bool) {
+	if r.ProtoOverride != nil {
+		if o, ok := r.ProtoOverride.(interface {
+			GetProperty(string) (Value, bool)
+		}); ok {
+			if v, found := o.GetProperty(name); found {
+				return v, true
+			}
+		}
+	}
+	if RegExpProto != nil {
+		return RegExpProto.GetProperty(name)
+	}
+	return nil, false
+}
 
 // ownLastIndexDescriptor 返回 lastIndex 的规范自有描述符:
 // {writable:true, enumerable:false, configurable:false}。
@@ -108,10 +140,7 @@ func (r *RegExp) GetProperty(name string) (Value, bool) {
 		// 二者在 DefineOwn / SetProperty 处保持同步。
 		return NewNumber(float64(r.LastIndex)), true
 	}
-	if RegExpProto != nil {
-		return RegExpProto.GetProperty(name)
-	}
-	return nil, false
+	return r.protoChainGet(name)
 }
 
 func (r *RegExp) SetProperty(name string, val Value) {
@@ -331,10 +360,17 @@ func NewRegExp(pattern, flags string) (*RegExp, error) {
 		// T2 根因单 rvDg77: RE2 无回溯, lookbehind / \k<name> / \1 / (?i-:…)
 		// 一律编译失败。用 regexp2 降级重试 —— 只有原本必败的模式才走到这,
 		// RE2 主路径行为不变 (零退潮是结构保证)。
-		if !hasFallbackTrigger(pattern, r) {
+		// T2 第二层 (2026-11-18): 含命名组的模式也降级 —— RE2 组名只认
+		// ASCII word 字符, `(?<$>a)` / `(?<π>a)` 这类 JS 合法组名 RE2 必败
+		// 而从未落到降级引擎。降级前统一重写组名 (见 renameGroupsForFallback)。
+		if !hasFallbackTrigger(pattern, r) && !strings.Contains(pattern, "(?<") {
 			return nil, fmt.Errorf("SyntaxError: Invalid regular expression: %s", pattern)
 		}
-		re2, ferr := compileFallback(pattern, r)
+		fbPattern := pattern
+		if strings.Contains(pattern, "(?<") {
+			fbPattern, r.FallbackGroupNames = renameGroupsForFallback(pattern)
+		}
+		re2, ferr := compileFallback(fbPattern, r)
 		if ferr != nil {
 			return nil, fmt.Errorf("SyntaxError: Invalid regular expression: %s", pattern)
 		}
