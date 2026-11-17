@@ -59,8 +59,8 @@ gogpu/wgpu 已提供原生窗口接入 API（`SurfaceTargetFromXlibWindow` /
 
 1. ✅ 原生句柄暴露：新增可选接口 `gfx.NativeWindowProvider`
    （`gfx/native_window.go`，不扩 Surface 契约）。win32 已实现
-   （HINSTANCE+HWND）；x11 已实现但 Display 恒 0（xgb 无 Xlib Display*，
-   dlopen libX11 方案待评估，GPU 侧对 Display==0 拒绝建链）；cocoa 未实现
+   （HINSTANCE+HWND）；x11 已实现（2026-11-18 补 Xlib Display* dlopen
+   方案，见下文更新）；cocoa 未实现
    （需 CAMetalLayer，setWantsLayer 方案未验证）。
 2. ✅ swapchain 上屏：`backend_wgpu.go` 接入
    `Instance.CreateSurfaceUnsafe` + `Surface.Configure/GetCurrentTexture/
@@ -71,6 +71,21 @@ gogpu/wgpu 已提供原生窗口接入 API（`SurfaceTargetFromXlibWindow` /
 **诚实口径**：swapchain 路径在本沙箱（无 GPU 硬件、无真平台窗口）只能
 验证 gate 降级语义与像素 A/B 零退化（软件适配器兜底口径），真机窗口化
 上屏与性能数字属于上面「硬件覆盖待办」，未做不得声称 A 路径完成。
+
+### 2026-11-18 更新：x11 Xlib Display* dlopen 方案落地（硬前提补齐）
+
+- ✅ `gfx/x11/xlib.go`：purego `Dlopen("libX11.so.6")` → `XOpenDisplay(NULL)`
+  取 Xlib Display*，**零 cgo**（purego 已在依赖中，gfx/cocoa 同款），
+  不破坏「零 cgo、单机交叉编译」发行根基。要点：与 xgb 同源（都读
+  DISPLAY，连同一 server，Window id 可跨连接引用）；进程内共享一条
+  连接、从不 XCloseDisplay；启动即调 XInitThreads；dlopen/连接任一
+  失败安静返回 0 且不重试（sync.Once），GPU 侧 gate 拒绝建链退
+  CPU blit。降级语义有测试钉住（`gfx/x11/xlib_test.go`，无头沙箱
+  PASS：无 X server 时 Display==0，行为与无 GPU 轨一致）。
+- 至此三平台句柄暴露的**代码前提**全部就位：win32 ✅ / x11 ✅（本轮）/
+  cocoa ❌（CAMetalLayer 未实现，仍待 G-3）。
+- 诚实口径：x11 真机点亮（swapchain 真上屏 + 性能数字）属于「硬件
+  覆盖待办」，本更新只核销代码层缺口，不构成 A 路径完成。
 
 ## wgpu 交叉编译矩阵抽查（`--xcompile`，linux/amd64 host）
 

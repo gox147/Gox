@@ -532,14 +532,12 @@ func (s *surface) trySend(ev gfx.Event) {
 // 编译期断言: surface 满足 gfx 的原生窗口句柄可选能力。
 var _ gfx.NativeWindowProvider = (*surface)(nil)
 
-// NativeWindowTarget 交出 X Window id (gfx.NativeWindowProvider)。
+// NativeWindowTarget 交出 X Window id + Xlib Display* (gfx.NativeWindowProvider)。
 //
-// ⚠️ 已知缺口 (诚实口径, 见 docs/gpu-track-audit.md「A 路径硬前提」):
-// xgb 是纯 Go 的 X11 协议实现, 只有 socket 连接没有 Xlib Display*,
-// 而 wgpu 的 X11 surface 走 vkCreateXlibSurfaceKHR, 必须要 Display*。
-// 这里 Display 恒 0, GPU 后端看到 0 会拒绝建 swapchain —— 窗口照常
-// 走 CPU blit, 行为与没有这个接口时完全一致。补 Xlib Display* 的
-// dlopen 方案评估后再把 Display 填上, GPU 路径即可在 Linux 点亮。
+// Display* 来自 dlopen libX11 的 XOpenDisplay (见 xlib.go, purego 零 cgo,
+// 2026-11-18 落地)。打不开 Xlib (无库 / 无 X server) 时 Display 恒 0,
+// GPU 后端看到 0 会拒绝建 swapchain —— 窗口照常走 CPU blit, 行为与
+// 没有这个接口时完全一致。真机点亮属于 G-3 三平台验证的硬件覆盖项。
 func (s *surface) NativeWindowTarget() (gfx.NativeWindowTarget, bool) {
 	s.mu.Lock()
 	win := s.win
@@ -549,7 +547,7 @@ func (s *surface) NativeWindowTarget() (gfx.NativeWindowTarget, bool) {
 	}
 	return gfx.NativeWindowTarget{
 		Kind:    "x11",
-		Display: 0, // xgb 无 Xlib Display*, 见上
+		Display: xlibDisplay(), // dlopen Xlib (xlib.go); 0 = 不可用, GPU 侧 gate 拒绝建链
 		Window:  uintptr(win),
 	}, true
 }

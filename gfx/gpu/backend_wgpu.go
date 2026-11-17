@@ -224,9 +224,9 @@ func (s *Surface) initSwapchain() error {
 	case "win32":
 		st = wgpu.SurfaceTargetFromWindowsHWND(tgt.Display, tgt.Window)
 	case "x11":
-		// xgb 拿不到 Xlib Display* (恒 0), vkCreateXlibSurfaceKHR 需要
-		// 它 —— 在 dlopen 方案落地前 Linux 窗口化保持 CPU blit (见
-		// gfx/native_window.go 平台覆盖表)。
+		// Display* 由 gfx/x11 的 dlopen 方案供给 (xlib.go, 2026-11-18
+		// 落地); dlopen/XOpenDisplay 失败时仍是 0 —— 这道 gate 保留:
+		// 0 = 安静退 CPU blit, 行为与无 GPU 轨完全一致。
 		if tgt.Display == 0 {
 			return fmt.Errorf("x11: 无 Xlib Display*, wgpu 建不了 surface")
 		}

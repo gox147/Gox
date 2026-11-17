@@ -20,11 +20,10 @@ package gfx
 //
 //   - win32: ✅ HWND + HINSTANCE, wgpu 侧 SurfaceTargetFromWindowsHWND
 //     直接可用 (gfx/win32)。
-//   - x11: ⚠️ 只报 Window id, Display 恒 0 —— xgb 是纯 Go 协议实现,
-//     拿不到 Xlib Display*, 而 wgpu 的 X11 surface 要求 Xlib 句柄
-//     (SurfaceTargetFromXlibWindow)。在引入 Xlib Display* (dlopen 方案
-//     待评估) 之前, GPU 侧对 x11 目标必须拒绝 —— 见 gpu 包 swapchain
-//     接线处的 gate。
+//   - x11: ✅ (2026-11-18) purego dlopen libX11 → XOpenDisplay(NULL)
+//     取 Xlib Display* (gfx/x11/xlib.go, 零 cgo, 不破坏发行链)。
+//     打不开 Xlib 时安静退 0, GPU 侧 gate 拒绝建链、窗口照常 CPU
+//     blit。真机点亮待 G-3 三平台验证 (无头沙箱验不到真上屏)。
 //   - cocoa: ❌ 未实现。wgpu 要 CAMetalLayer*, 需要先给 NSView
 //     setWantsLayer+layer 并取层指针, 纯 Go objc 调用可行但未验证,
 //     留给三平台验证阶段一并做 (G-3 窗口化分阶段)。
