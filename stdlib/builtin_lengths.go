@@ -573,23 +573,29 @@ var builtinLengths = map[string]int{
 // 不可枚举、可配置)。解析失败的键静默跳过 (如引擎未实现的命名空间)。
 //
 // 应在 SetupGlobals 末尾 (所有内建注册完毕后) 调用一次。
+//
+// 冷启动热路径 (T3-5 第二批): 全部 ~575 个限定名都不切 slice —— 见
+// splitRoot / setLengthFromNamePath 的注释。
 func applyBuiltinLengths(env *runtime.Environment) {
 	for path, n := range builtinLengths {
-		segs := splitDots(path)
-		if len(segs) == 0 {
+		root, rest := splitRoot(path)
+		if root == "" {
 			continue
 		}
 		// T3-5 惰性全局: 根尚未物化时不在此处 env.Get —— 那会把惰性化
 		// 变相打回全量物化。对应子树的 length 由惰性工厂在物化时经
 		// applyBuiltinLengthsPrefixes 自行补做。
-		if env.IsLazyName(segs[0]) {
+		//
+		// 判据放在切段之前 (第二批): 根名只需一次 IndexByte, 惰性根
+		// (Temporal / TypedArray 家族) 连切片都不建就跳过。
+		if env.IsLazyName(root) {
 			continue
 		}
-		v, ok := env.Get(segs[0])
+		v, ok := env.Get(root)
 		if !ok || v == nil {
 			continue
 		}
-		setLengthFromPath(v, segs[1:], n)
+		setLengthFromNamePath(v, rest, n)
 	}
 }
 
@@ -602,26 +608,48 @@ func applyBuiltinLengthsPrefixes(env *runtime.Environment, roots []string) {
 		rootSet[r] = struct{}{}
 	}
 	for path, n := range builtinLengths {
-		segs := splitDots(path)
-		if len(segs) == 0 {
+		root, rest := splitRoot(path)
+		if root == "" {
 			continue
 		}
-		if _, match := rootSet[segs[0]]; !match {
+		if _, match := rootSet[root]; !match {
 			continue
 		}
-		v, ok := env.Get(segs[0])
+		v, ok := env.Get(root)
 		if !ok || v == nil {
 			continue
 		}
-		setLengthFromPath(v, segs[1:], n)
+		setLengthFromNamePath(v, rest, n)
 	}
 }
 
-// setLengthFromPath 从根值出发按 segs 逐段解析限定名并设置 length。
-// 解析失败的键静默跳过 (如引擎未实现的命名空间)。
-func setLengthFromPath(root object.Value, segs []string, n int) {
+// splitRoot 把限定名切成根名与剩余路径, 不分配内存 (子串共享底层数组)。
+//
+// 冷启动热路径 (T3-5 第二批): 上一版先 splitDots 出一个 []string 再取 [0],
+// 每个限定名一次 heap 分配 (~575 次/进程) —— CPU 剖面里 splitDots 仍占
+// SetupGlobals 的 ~11%, 且这 575 次分配在 GC 标记阶段是要被扫描的活对象。
+// 根名之后的路径根本不需要变成切片, 直接按字符串下钻即可。
+func splitRoot(s string) (root, rest string) {
+	if i := strings.IndexByte(s, '.'); i >= 0 {
+		return s[:i], s[i+1:]
+	}
+	return s, ""
+}
+
+// setLengthFromNamePath 从根值出发, 按 "a.b.c" 形式的剩余路径逐段解析并设置
+// length。解析失败的键静默跳过 (如引擎未实现的命名空间)。
+//
+// 逐段切分用 IndexByte 定位而不是先切成切片: 零分配, 且每段就是原字符串的
+// 子串 (GetProperty 只读匹配, 不需要独立副本)。
+func setLengthFromNamePath(root object.Value, path string, n int) {
 	v := root
-	for _, seg := range segs {
+	for path != "" {
+		seg := path
+		if i := strings.IndexByte(path, '.'); i >= 0 {
+			seg, path = path[:i], path[i+1:]
+		} else {
+			path = ""
+		}
 		obj, isObj := v.(*object.Object)
 		if !isObj {
 			// BuiltinFunction.prototype 等也可继续走 GetProperty
@@ -648,25 +676,5 @@ func setLengthFromPath(root object.Value, segs []string, n int) {
 		fn.SetFunctionLength(n)
 	case *object.BuiltinMethod:
 		fn.SetFunctionLength(n)
-	}
-}
-
-// splitDots 按 '.' 切分限定名 (键已保证不含 Symbol/$262 等)。
-//
-// 冷启动热路径 (T3-5)：SetupGlobals 末尾会对 builtinLengths 的全部限定名
-// (~550 个) 各调一次本函数。之前的实现逐 rune 做 `cur += string(r)` 拼接，
-// 每个字符一次堆分配，CPU 剖面里占 EvalFileVM 首次调用的 ~40%。
-// 改为 strings.IndexByte 定位分隔符后直接切子串 —— Go 的子串共享底层内存，
-// 除结果 slice 外零分配。
-func splitDots(s string) []string {
-	out := make([]string, 0, strings.Count(s, ".")+1)
-	for {
-		i := strings.IndexByte(s, '.')
-		if i < 0 {
-			out = append(out, s)
-			return out
-		}
-		out = append(out, s[:i])
-		s = s[i+1:]
 	}
 }
