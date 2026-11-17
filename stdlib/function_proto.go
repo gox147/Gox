@@ -72,6 +72,58 @@ func setupFunctionIntrinsics(env *runtime.Environment) {
 	object.SetGeneratorFunctionPrototype(genFuncProto)
 	object.SetGeneratorPrototype(genProto)
 
+	// %GeneratorPrototype%.next/return/throw —— 生成器实例的这三个方法是
+	// 虚拟属性 (object.Generator.GetProperty), 此前 %GeneratorPrototype% 上
+	// 没有可见的函数对象: genProto.next === undefined,
+	// isConstructor(genProto.next) 类用例 (T4 r8DmKW) 与原型可见性用例挂。
+	// 这里用 BuiltinMethod 注册 (天然无 [[Construct]]), 实例虚拟属性优先,
+	// 两者共用同一驱动回调, 语义一致。
+	if gp, ok := object.GetGeneratorPrototype().(*object.Object); ok {
+		genResult := func(val object.Value, done bool) object.Value {
+			res := object.NewObject()
+			res.SetProperty("value", val)
+			res.SetProperty("done", object.NewBoolean(done))
+			return res
+		}
+		genReceiver := func(this object.Value, method string) (*object.Generator, object.Value) {
+			gen, ok := this.(*object.Generator)
+			if !ok {
+				return nil, object.NewTypeError("Method Generator.prototype.%s called on incompatible receiver", method)
+			}
+			return gen, nil
+		}
+		genArg := func(args []object.Value) object.Value {
+			if len(args) > 0 {
+				return args[0]
+			}
+			return object.UndefinedSingleton
+		}
+		gp.SetBuiltinProperty("next", object.NewBuiltinMethod("next", func(this object.Value, args ...object.Value) object.Value {
+			gen, errVal := genReceiver(this, "next")
+			if errVal != nil {
+				return errVal
+			}
+			val, done := object.GeneratorNext(gen, genArg(args))
+			return genResult(val, done)
+		}))
+		gp.SetBuiltinProperty("return", object.NewBuiltinMethod("return", func(this object.Value, args ...object.Value) object.Value {
+			gen, errVal := genReceiver(this, "return")
+			if errVal != nil {
+				return errVal
+			}
+			val, done := object.GeneratorReturn(gen, genArg(args))
+			return genResult(val, done)
+		}))
+		gp.SetBuiltinProperty("throw", object.NewBuiltinMethod("throw", func(this object.Value, args ...object.Value) object.Value {
+			gen, errVal := genReceiver(this, "throw")
+			if errVal != nil {
+				return errVal
+			}
+			val, done := object.GeneratorThrow(gen, genArg(args))
+			return genResult(val, done)
+		}))
+	}
+
 	// %AsyncFunction% + %AsyncFunction.prototype% (后者无 .prototype 属性)
 	// 本身是可构造的 (CreateDynamicFunction kind="async")。
 	asyncFunc := object.NewBuiltin("AsyncFunction", func(args ...object.Value) object.Value {

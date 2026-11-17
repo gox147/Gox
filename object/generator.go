@@ -83,7 +83,8 @@ func (g *Generator) IsTruthy() bool   { return true }
 func (g *Generator) GetProperty(name string) (Value, bool) {
 	if name == "next" {
 		return &BuiltinFunction{
-			Name: "next",
+			Name:             "next",
+			NotConstructable: true, // 生成器原型方法无 [[Construct]] (T4 r8DmKW)
 			Fn: func(args ...Value) Value {
 				arg := Value(UndefinedSingleton)
 				if len(args) > 0 {
@@ -104,7 +105,8 @@ func (g *Generator) GetProperty(name string) (Value, bool) {
 	// checkCallbackErr 会自动重抛 —— 这里与 next 一样无需自行处理。
 	if name == "return" {
 		return &BuiltinFunction{
-			Name: "return",
+			Name:             "return",
+			NotConstructable: true, // 生成器原型方法无 [[Construct]] (T4 r8DmKW)
 			Fn: func(args ...Value) Value {
 				arg := Value(UndefinedSingleton)
 				if len(args) > 0 {
@@ -122,7 +124,8 @@ func (g *Generator) GetProperty(name string) (Value, bool) {
 	// 体内未捕获时同样经 SetCallbackError 上报, 由 VM 调用点重抛。
 	if name == "throw" {
 		return &BuiltinFunction{
-			Name: "throw",
+			Name:             "throw",
+			NotConstructable: true, // 生成器原型方法无 [[Construct]] (T4 r8DmKW)
 			Fn: func(args ...Value) Value {
 				arg := Value(UndefinedSingleton)
 				if len(args) > 0 {

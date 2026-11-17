@@ -225,7 +225,22 @@ func setupWeakRefGlobals(env *runtime.Environment) {
 		}
 		return object.NewWeakRef(target)
 	})
-	weakRefFn.SetProperty("prototype", object.NewObject())
+	// WeakRef.prototype: 实例的 deref 是虚拟属性 (object.WeakRef.GetProperty),
+	// 但 %WeakRef.prototype% 上此前没有可见的函数对象 —— WeakRef.prototype.deref
+	// === undefined (T4 r8DmKW: not-a-constructor 族)。这里补注册。
+	weakProto := object.NewObjectWithProto(object.GetObjectPrototype())
+	weakProto.SetBuiltinProperty("constructor", weakRefFn)
+	weakProto.SetBuiltinProperty("deref", object.NewBuiltinMethod("deref", func(this object.Value, args ...object.Value) object.Value {
+		wr, ok := this.(*object.WeakRef)
+		if !ok {
+			return object.NewTypeError("Method WeakRef.prototype.deref called on incompatible receiver")
+		}
+		if wr.Target == nil {
+			return object.UndefinedSingleton
+		}
+		return wr.Target
+	}))
+	weakRefFn.SetProperty("prototype", weakProto)
 	env.Declare("WeakRef", weakRefFn, false)
 
 	regFn := object.NewBuiltin("FinalizationRegistry", func(args ...object.Value) object.Value {
@@ -238,7 +253,43 @@ func setupWeakRefGlobals(env *runtime.Environment) {
 		}
 		return object.NewFinalizationRegistry(cleanup)
 	})
-	regFn.SetProperty("prototype", object.NewObject())
+	// FinalizationRegistry.prototype: register/unregister 同为虚拟属性,
+	// 补注册到 %FinalizationRegistry.prototype% (T4 r8DmKW)。
+	regProto := object.NewObjectWithProto(object.GetObjectPrototype())
+	regProto.SetBuiltinProperty("constructor", regFn)
+	regProto.SetBuiltinProperty("register", object.NewBuiltinMethod("register", func(this object.Value, args ...object.Value) object.Value {
+		reg, ok := this.(*object.FinalizationRegistry)
+		if !ok {
+			return object.NewTypeError("Method FinalizationRegistry.prototype.register called on incompatible receiver")
+		}
+		if len(args) == 0 || !object.IsObjectValue(args[0]) {
+			return object.NewTypeError("FinalizationRegistry.register: target must be an object")
+		}
+		var held object.Value = object.UndefinedSingleton
+		if len(args) > 1 {
+			held = args[1]
+		}
+		token := args[0]
+		if len(args) > 2 && args[2] != object.UndefinedSingleton {
+			if !object.IsObjectValue(args[2]) {
+				return object.NewTypeError("FinalizationRegistry.register: unregister token must be an object")
+			}
+			token = args[2]
+		}
+		reg.Register(args[0], held, token)
+		return object.UndefinedSingleton
+	}))
+	regProto.SetBuiltinProperty("unregister", object.NewBuiltinMethod("unregister", func(this object.Value, args ...object.Value) object.Value {
+		reg, ok := this.(*object.FinalizationRegistry)
+		if !ok {
+			return object.NewTypeError("Method FinalizationRegistry.prototype.unregister called on incompatible receiver")
+		}
+		if len(args) == 0 || !object.IsObjectValue(args[0]) {
+			return object.NewTypeError("FinalizationRegistry.unregister: token must be an object")
+		}
+		return object.NewBoolean(reg.Unregister(args[0]))
+	}))
+	regFn.SetProperty("prototype", regProto)
 	env.Declare("FinalizationRegistry", regFn, false)
 }
 

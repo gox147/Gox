@@ -115,6 +115,58 @@ func setupMath() *object.Object {
 		return object.NewNumber(result)
 	}))
 
+	m.SetBuiltinProperty("sumPrecise", object.NewBuiltin("sumPrecise", func(args ...object.Value) object.Value {
+		// Math.sumPrecise(iterable) (ES2025): 可迭代对象求和。
+		// 元素必须全为 Number, 否则 TypeError; 空迭代 → -0;
+		// +Inf 与 -Inf 同时出现 → NaN (规范: 无限和不一致)。
+		// 此前未注册 (T4 r8DmKW: Math/sumPrecise/not-a-constructor 族)。
+		if len(args) == 0 {
+			return object.NewTypeError("Math.sumPrecise: iterable argument is required")
+		}
+		next, ok := object.Iterate(args[0])
+		if !ok {
+			return object.NewTypeError("Math.sumPrecise: iterable argument is required")
+		}
+		var sum float64
+		count := 0
+		hasPosInf, hasNegInf, hasNaN := false, false, false
+		for {
+			v, done := next()
+			if done {
+				break
+			}
+			n, isNum := v.(*object.Number)
+			if !isNum {
+				return object.NewTypeError("Math.sumPrecise: values must be numbers")
+			}
+			f := toFloat(n)
+			if math.IsNaN(f) {
+				hasNaN = true
+			}
+			if math.IsInf(f, 1) {
+				hasPosInf = true
+			}
+			if math.IsInf(f, -1) {
+				hasNegInf = true
+			}
+			sum += f
+			count++
+		}
+		if hasNaN || (hasPosInf && hasNegInf) {
+			return object.NewNumber(math.NaN())
+		}
+		if hasPosInf {
+			return object.NewNumber(math.Inf(1))
+		}
+		if hasNegInf {
+			return object.NewNumber(math.Inf(-1))
+		}
+		if count == 0 {
+			return object.NewNumber(math.Copysign(0, -1))
+		}
+		return object.NewNumber(sum)
+	}))
+
 	m.SetBuiltinProperty("hypot", object.NewBuiltin("hypot", func(args ...object.Value) object.Value {
 		// Math.hypot(...values): 欧几里得范数 sqrt(x² + y² + ...)
 		// 按 ECMAScript 语义: 任一参数为 ±Infinity → +Infinity;
@@ -254,7 +306,7 @@ func f16Round(x float64) float64 {
 		return math.NaN()
 	}
 	b := math.Float64bits(x)
-	sign := uint16(b >> 63) << 15
+	sign := uint16(b>>63) << 15
 	e := int((b >> 52) & 0x7FF)
 	m := b & ((1 << 52) - 1)
 	if e == 0x7FF {

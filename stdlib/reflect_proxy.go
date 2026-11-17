@@ -46,11 +46,15 @@ func setupReflectProxy(env *runtime.Environment) {
 			if err != nil {
 				return err
 			}
-			// 简化: revoke 标记代理已撤销，撤销后操作抛 TypeError
+			// 简化: revoke 标记代理已撤销，撤销后操作抛 TypeError。
+			// revocation function 是匿名内建: name="" 且无 [[Construct]]
+			// (revocation-function-name / -not-a-constructor 族, T4/T5)。
+			// 名单按 "revoke" 登记, 注册名先用它匹配名单再清空 Name。
 			revoke := object.NewBuiltin("revoke", func(args ...object.Value) object.Value {
 				p.IsRevoked = true
 				return object.UndefinedSingleton
 			})
+			revoke.Name = ""
 			res := object.NewObject()
 			res.SetProperty("proxy", p)
 			res.SetProperty("revoke", revoke)
@@ -66,6 +70,45 @@ func setupReflectProxy(env *runtime.Environment) {
 	// %Reflect%[@@toStringTag] = "Reflect" —— 命名空间对象的品牌标签。
 	setToStringTag(reflectObj, "Reflect")
 
+	// ===== proxy trap 分发公共段 (T5 r8dXes) =====
+	// reflectProxyTrap 对 proxy 目标做 GetMethod(handler, trapName) 语义分发:
+	//   非 proxy            → (nil, false, nil): 调用方走原有 target 路径;
+	//   revoked             → TypeError (所有内部方法共享);
+	//   trap 存在不可调用   → TypeError "'%s' trap must be callable"
+	//                         (trap-is-not-callable 族此前被静默吞掉);
+	//   trap 不存在         → (nil, false, nil): 调用方转发 target;
+	//   trap 可调用         → 调用 trap (this 绑 handler), trap 内异常经
+	//                         回调桥由 VM 的 checkCallbackErr 重抛。
+	// 注意: 这里不做不变式校验 (invariant 族单列), 只做 GetMethod + 转发。
+	// trap 的首参一律是 [[ProxyTarget]] (规范 Proxy 内部方法语义) ——
+	// 由 helper 注入, 调用点只传其余参数。此前调用点误传 proxy 本身,
+	// trap 里再操作 proxy 会无限递归 (not-extensible-target-same-target-
+	// prototype 退潮的直接根因)。
+	reflectProxyTrap := func(v object.Value, trapName string, args ...object.Value) (object.Value, bool, object.Value) {
+		p, ok := v.(*object.Proxy)
+		if !ok {
+			return nil, false, nil
+		}
+		if p.IsRevoked {
+			return nil, true, object.NewTypeError("Cannot perform '%s' on a proxy that has been revoked", trapName)
+		}
+		trap, present := object.GetProxyTrapMethod(p.Handler, trapName)
+		if !present {
+			return nil, false, nil
+		}
+		if !object.IsCallable(trap) {
+			return nil, true, object.NewTypeError("'%s' trap must be callable", trapName)
+		}
+		trapArgs := make([]object.Value, 0, len(args)+1)
+		trapArgs = append(trapArgs, p.Target)
+		trapArgs = append(trapArgs, args...)
+		res := object.CallFunction(trap, p.Handler, trapArgs...)
+		if ev := object.TakeCallbackErrorValue(); ev != object.UndefinedSingleton {
+			return nil, true, ev
+		}
+		return res, true, nil
+	}
+
 	// Reflect.get(target, key, receiver?) — 读取目标属性
 	reflectObj.SetBuiltinProperty("get", object.NewBuiltin("Reflect.get", func(args ...object.Value) object.Value {
 		target, errVal := reflectTargetArg(args, "Reflect.get")
@@ -76,6 +119,25 @@ func setupReflectProxy(env *runtime.Environment) {
 			return object.NewTypeError("Reflect.get: property key is required")
 		}
 		key := toPropKey(args[1])
+		// trap 收到规范化的 Property Key: 字符串键用 toPropKey 结果,
+		// Symbol 键原样传 (ToPropertyKey 不转换 Symbol)。
+		trapKey := object.Value(object.NewString(key))
+		if _, isSym := args[1].(*object.Symbol); isSym {
+			trapKey = args[1]
+		}
+		var receiver object.Value = args[0]
+		if len(args) > 2 {
+			receiver = args[2]
+		}
+		// proxy: get trap 分发 (GetMethod 语义); 无 trap 时沿 target 转发
+		if res, handled, errVal := reflectProxyTrap(target, "get", trapKey, receiver); errVal != nil {
+			return errVal
+		} else if handled {
+			if res == nil {
+				return object.UndefinedSingleton
+			}
+			return res
+		}
 		// 代理通过 VM 转发 get trap；这里 Reflect 直接读取目标
 		if p, ok := target.(*object.Proxy); ok {
 			target = p.Target
@@ -98,6 +160,12 @@ func setupReflectProxy(env *runtime.Environment) {
 		}
 		key := toPropKey(args[1])
 		val := args[2]
+		// proxy: set trap 分发; trap 返回 falsy → Reflect.set 返回 false
+		if res, handled, errVal := reflectProxyTrap(target, "set", args[1], val, args[0]); errVal != nil {
+			return errVal
+		} else if handled {
+			return object.NewBoolean(object.IsTruthyValue(res))
+		}
 		if p, ok := target.(*object.Proxy); ok {
 			target = p.Target
 		}
@@ -125,6 +193,12 @@ func setupReflectProxy(env *runtime.Environment) {
 			return object.NewTypeError("Reflect.has: property key is required")
 		}
 		key := toPropKey(args[1])
+		// proxy: has trap 分发
+		if res, handled, errVal := reflectProxyTrap(target, "has", args[1]); errVal != nil {
+			return errVal
+		} else if handled {
+			return object.NewBoolean(object.IsTruthyValue(res))
+		}
 		if p, ok := target.(*object.Proxy); ok {
 			target = p.Target
 		}
@@ -151,6 +225,12 @@ func setupReflectProxy(env *runtime.Environment) {
 			return object.NewTypeError("Reflect.deleteProperty: property key is required")
 		}
 		key := toPropKey(args[1])
+		// proxy: deleteProperty trap 分发
+		if res, handled, errVal := reflectProxyTrap(target, "deleteProperty", args[1]); errVal != nil {
+			return errVal
+		} else if handled {
+			return object.NewBoolean(object.IsTruthyValue(res))
+		}
 		if p, ok := target.(*object.Proxy); ok {
 			target = p.Target
 		}
@@ -175,6 +255,18 @@ func setupReflectProxy(env *runtime.Environment) {
 			return object.NullSingleton
 		}
 		target := args[0]
+		// proxy: getPrototypeOf trap 分发; 结果必须是对象或 null
+		if res, handled, errVal := reflectProxyTrap(target, "getPrototypeOf"); errVal != nil {
+			return errVal
+		} else if handled {
+			if res == nil || res == object.UndefinedSingleton || res == object.NullSingleton {
+				return object.NullSingleton
+			}
+			if !object.IsObjectLike(res) {
+				return object.NewTypeError("'getPrototypeOf' trap must return an object or null")
+			}
+			return res
+		}
 		if p, ok := target.(*object.Proxy); ok {
 			target = p.Target
 		}
@@ -208,6 +300,12 @@ func setupReflectProxy(env *runtime.Environment) {
 		}
 		target := args[0]
 		proto := args[1]
+		// proxy: setPrototypeOf trap 分发; 结果按 ToBoolean 返回
+		if res, handled, errVal := reflectProxyTrap(target, "setPrototypeOf", proto); errVal != nil {
+			return errVal
+		} else if handled {
+			return object.NewBoolean(object.IsTruthyValue(res))
+		}
 		if p, ok := target.(*object.Proxy); ok {
 			target = p.Target
 		}
@@ -228,6 +326,15 @@ func setupReflectProxy(env *runtime.Environment) {
 			return object.NewArray(nil)
 		}
 		target := args[0]
+		// proxy: ownKeys trap 分发; 结果 CreateListFromArrayLike
+		if res, handled, errVal := reflectProxyTrap(target, "ownKeys"); errVal != nil {
+			return errVal
+		} else if handled {
+			if arr, ok := res.(*object.Array); ok {
+				return object.NewArray(arr.Elements)
+			}
+			return object.NewTypeError("'ownKeys' trap must return an array")
+		}
 		if p, ok := target.(*object.Proxy); ok {
 			target = p.Target
 		}
@@ -270,6 +377,12 @@ func setupReflectProxy(env *runtime.Environment) {
 			return object.NewBoolean(false)
 		}
 		target := args[0]
+		// proxy: isExtensible trap 分发
+		if res, handled, errVal := reflectProxyTrap(target, "isExtensible"); errVal != nil {
+			return errVal
+		} else if handled {
+			return object.NewBoolean(object.IsTruthyValue(res))
+		}
 		if p, ok := target.(*object.Proxy); ok {
 			target = p.Target
 		}
@@ -372,6 +485,85 @@ func setupReflectProxy(env *runtime.Environment) {
 			return result
 		}
 		return obj
+	}))
+
+	// Reflect.defineProperty(target, key, desc) — 定义属性, 返回布尔。
+	// 此前未注册 (T4 r8DmKW: Reflect/defineProperty/not-a-constructor 族
+	// 直接 ReferenceError)。
+	reflectObj.SetBuiltinProperty("defineProperty", object.NewBuiltin("Reflect.defineProperty", func(args ...object.Value) object.Value {
+		target, errVal := reflectTargetArg(args, "Reflect.defineProperty")
+		if errVal != nil {
+			return errVal
+		}
+		if len(args) < 3 {
+			return object.NewTypeError("Reflect.defineProperty: property key and descriptor are required")
+		}
+		desc := args[2]
+		// proxy: defineProperty trap 分发; trap 返回 falsy → false
+		if res, handled, errVal := reflectProxyTrap(target, "defineProperty", args[1], desc); errVal != nil {
+			return errVal
+		} else if handled {
+			return object.NewBoolean(object.IsTruthyValue(res))
+		}
+		if p, ok := target.(*object.Proxy); ok {
+			// 无 trap: 解包 target 继续走普通定义路径
+			target = p.Target
+		}
+		if store, ok := target.(object.OwnPropertyStore); ok {
+			key := toPropKey(args[1])
+			if d, errVal2 := descriptorFromJS(args[2]); errVal2 != nil {
+				return errVal2
+			} else {
+				store.DefineOwn(key, d)
+				return object.TrueSingleton
+			}
+		}
+		return object.FalseSingleton
+	}))
+
+	// Reflect.getOwnPropertyDescriptor(target, key) — 自有属性描述符。
+	// proxy 走 getOwnPropertyDescriptor trap (含不变式校验, 见
+	// proxyGetOwnPropertyDescriptor, 与 Object.getOwnPropertyDescriptor 同路)。
+	reflectObj.SetBuiltinProperty("getOwnPropertyDescriptor", object.NewBuiltin("Reflect.getOwnPropertyDescriptor", func(args ...object.Value) object.Value {
+		target, errVal := reflectTargetArg(args, "Reflect.getOwnPropertyDescriptor")
+		if errVal != nil {
+			return errVal
+		}
+		if len(args) < 2 {
+			return object.NewTypeError("Reflect.getOwnPropertyDescriptor: property key is required")
+		}
+		if pxy, ok := target.(*object.Proxy); ok {
+			return proxyGetOwnPropertyDescriptor(pxy, args[1])
+		}
+		if store, ok := target.(object.OwnPropertyStore); ok {
+			key := toPropKey(args[1])
+			if d, exists := store.OwnDescriptor(key); exists {
+				return describeProperty(d)
+			}
+		}
+		return object.UndefinedSingleton
+	}))
+
+	// Reflect.preventExtensions(target) — 阻止扩展, 返回布尔
+	reflectObj.SetBuiltinProperty("preventExtensions", object.NewBuiltin("Reflect.preventExtensions", func(args ...object.Value) object.Value {
+		target, errVal := reflectTargetArg(args, "Reflect.preventExtensions")
+		if errVal != nil {
+			return errVal
+		}
+		// proxy: preventExtensions trap 分发
+		if res, handled, errVal := reflectProxyTrap(target, "preventExtensions"); errVal != nil {
+			return errVal
+		} else if handled {
+			return object.NewBoolean(object.IsTruthyValue(res))
+		}
+		if p, ok := target.(*object.Proxy); ok {
+			target = p.Target
+		}
+		if o, ok := target.(*object.Object); ok {
+			o.Extensible = false
+			return object.TrueSingleton
+		}
+		return object.FalseSingleton
 	}))
 
 	env.Declare("Reflect", reflectObj, false)

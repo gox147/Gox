@@ -15,6 +15,14 @@ func (vm *VM) inOperator(obj, key object.Value) object.Value {
 	if p, ok := obj.(*object.Proxy); ok {
 		found, err := vm.proxyHas(p, k)
 		if err != nil {
+			// trap 内异常 / trap 不可调用的 TypeError 原样上抛
+			// (此前吞成 false, trap-is-not-callable 族漏抛)。
+			if te, ok2 := err.(*ThrowError); ok2 {
+				return te.Value
+			}
+			if v := vm.throwJSErrorValue(err); v != nil {
+				return v
+			}
 			return object.NewBoolean(false)
 		}
 		return object.NewBoolean(found)

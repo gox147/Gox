@@ -213,6 +213,18 @@ func setupObjectGlobal() *object.BuiltinFunction {
 		if len(args) == 0 {
 			return object.NullSingleton
 		}
+		// proxy: getPrototypeOf trap 分发 (T5); 结果必须是对象或 null
+		if res, handled, errVal := proxyTrapDispatch(args[0], "getPrototypeOf"); errVal != nil {
+			return errVal
+		} else if handled {
+			if res == nil || res == object.UndefinedSingleton || res == object.NullSingleton {
+				return object.NullSingleton
+			}
+			if !object.IsObjectLike(res) {
+				return object.NewTypeError("'getPrototypeOf' trap must return an object or null")
+			}
+			return res
+		}
 		if g, ok := args[0].(*object.GlobalObject); ok {
 			if g.Proto != nil {
 				return g.Proto
@@ -368,6 +380,20 @@ func setupObjectGlobal() *object.BuiltinFunction {
 			g.DefineGlobal(toStr(args[1]), desc)
 			return args[0]
 		}
+		// proxy: defineProperty trap 分发 (T5); falsy → TypeError (始终严格语义)
+		if res, handled, errVal := proxyTrapDispatch(args[0], "defineProperty", args[1], args[2]); errVal != nil {
+			return errVal
+		} else if handled {
+			if !object.IsTruthyValue(res) {
+				return object.NewTypeError("'defineProperty' trap returned false")
+			}
+			return args[0]
+		}
+		// 无 trap: 解包 target 走下方 OwnPropertyStore 通道 (此前 *Proxy 非
+		// OwnPropertyStore, 静默 no-op —— trap-is-undefined 转发族)。
+		if p, ok := args[0].(*object.Proxy); ok && p.Target != nil {
+			args[0] = p.Target
+		}
 		// 统一自有属性接口: 普通对象 / 数组 / 函数类都经 OwnPropertyStore
 		// 落地描述符 —— 数组索引访问器、函数 name/length 重定义等此前进
 		// 非 *Object 分支一律静默 no-op, 现在走各类型自己的描述符通道。
@@ -480,6 +506,15 @@ func setupObjectGlobal() *object.BuiltinFunction {
 		if len(args) < 2 {
 			return object.UndefinedSingleton
 		}
+		// proxy: setPrototypeOf trap 分发 (T5); falsy → TypeError, 成功返回 obj
+		if res, handled, errVal := proxyTrapDispatch(args[0], "setPrototypeOf", args[1]); errVal != nil {
+			return errVal
+		} else if handled {
+			if !object.IsTruthyValue(res) {
+				return object.NewTypeError("'setPrototypeOf' trap returned false")
+			}
+			return args[0]
+		}
 		obj, ok := args[0].(*object.Object)
 		if !ok {
 			return args[0]
@@ -585,12 +620,37 @@ func setupObjectGlobal() *object.BuiltinFunction {
 		if len(args) == 0 {
 			return object.NewBoolean(false)
 		}
+		// proxy: isExtensible trap 分发 (T5)
+		if res, handled, errVal := proxyTrapDispatch(args[0], "isExtensible"); errVal != nil {
+			return errVal
+		} else if handled {
+			return object.NewBoolean(object.IsTruthyValue(res))
+		}
+		// 无 trap: 解包 target 取真实 Extensible 状态 (此前 *Proxy 不被
+		// IsExtensible 识别, 无 trap 也误报 false)。
+		if p, ok := args[0].(*object.Proxy); ok && p.Target != nil {
+			return object.NewBoolean(object.IsExtensible(p.Target))
+		}
 		return object.NewBoolean(object.IsExtensible(args[0]))
 	}))
 
 	// Object.preventExtensions(obj)
 	o.SetProperty("preventExtensions", object.NewBuiltin("preventExtensions", func(args ...object.Value) object.Value {
 		if len(args) > 0 {
+			// proxy: preventExtensions trap 分发 (T5); falsy → TypeError
+			if res, handled, errVal := proxyTrapDispatch(args[0], "preventExtensions"); errVal != nil {
+				return errVal
+			} else if handled {
+				if !object.IsTruthyValue(res) {
+					return object.NewTypeError("'preventExtensions' trap returned false")
+				}
+				return args[0]
+			}
+			// 无 trap: 解包 target 落地 PreventExtensions
+			if p, ok := args[0].(*object.Proxy); ok && p.Target != nil {
+				object.PreventExtensions(p.Target)
+				return args[0]
+			}
 			object.PreventExtensions(args[0])
 			return args[0]
 		}
@@ -830,6 +890,15 @@ func setupErrorTypes(env *runtime.Environment) {
 		})
 		f.ReturnIsValue = true
 		object.RegisterErrorConstructor("Error", f)
+		// Error.isError(arg) (ES2025): 品牌校验 —— 实际是 *Error 才为 true,
+		// instanceof 式判定无法跨构造器伪装 (T4 r8DmKW: Error/isError 族)。
+		f.SetProperty("isError", object.NewBuiltin("isError", func(args ...object.Value) object.Value {
+			if len(args) == 0 {
+				return object.FalseSingleton
+			}
+			_, ok := args[0].(*object.Error)
+			return object.NewBoolean(ok)
+		}))
 		return f
 	}(), false)
 
@@ -1318,6 +1387,40 @@ func newDynamicFunction(env *runtime.Environment, args []object.Value, kind dyna
 		Env:           env,
 		FuncPrototype: object.FuncPrototypeForCompiled(fn),
 	}
+}
+
+// proxyTrapDispatch 实现 proxy trap 的 GetMethod 分发 (T5 r8dXes):
+//
+//	非 proxy          → (nil, false, nil): 调用方走原有路径;
+//	revoked           → TypeError;
+//	trap 存在不可调用 → TypeError "'%s' trap must be callable";
+//	trap 不存在       → (nil, false, nil): 调用方转发 target;
+//	trap 可调用       → 调用 trap (this 绑 handler), 异常经回调桥重抛。
+//
+// 只做 GetMethod + 分发, 不做不变式校验 (invariant 族单列)。
+func proxyTrapDispatch(v object.Value, trapName string, args ...object.Value) (object.Value, bool, object.Value) {
+	p, ok := v.(*object.Proxy)
+	if !ok {
+		return nil, false, nil
+	}
+	if p.IsRevoked {
+		return nil, true, object.NewTypeError("Cannot perform '%s' on a proxy that has been revoked", trapName)
+	}
+	trap, present := object.GetProxyTrapMethod(p.Handler, trapName)
+	if !present {
+		return nil, false, nil
+	}
+	if !object.IsCallable(trap) {
+		return nil, true, object.NewTypeError("'%s' trap must be callable", trapName)
+	}
+	trapArgs := make([]object.Value, 0, len(args)+1)
+	trapArgs = append(trapArgs, p.Target)
+	trapArgs = append(trapArgs, args...)
+	res := object.CallFunction(trap, p.Handler, trapArgs...)
+	if ev := object.TakeCallbackErrorValue(); ev != object.UndefinedSingleton {
+		return nil, true, ev
+	}
+	return res, true, nil
 }
 
 // proxyGetOwnPropertyDescriptor 实现 Proxy [[GetOwnProperty]] (9.5.5):

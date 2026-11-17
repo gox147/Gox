@@ -118,19 +118,35 @@ func IsObjectLike(v Value) bool {
 // 如果 handler 不是对象或没有对应 trap，返回 nil。
 // trap 名称如 "get", "set", "apply", "construct", "has" 等。
 func GetProxyTrap(handler Value, trapName string) Value {
+	trap, present := GetProxyTrapMethod(handler, trapName)
+	if !present {
+		return nil
+	}
+	return trap
+}
+
+// GetProxyTrapMethod 实现规范的 GetMethod(handler, trapName) 语义:
+//   - 属性不存在 / 值为 undefined / null → (nil, false): 调用方转发 target;
+//   - 属性存在但不可调用 → (值, true): 调用方必须抛 TypeError
+//     ("'%s' trap must be callable", trap-is-not-callable 族, T5 r8dXes);
+//   - 属性存在且可调用 → (trap, true)。
+//
+// 注意与 GetProxyTrap 的区别: 后者把「存在但不可调用」也静默降级为 nil,
+// 会吃掉本该抛出的 TypeError。
+func GetProxyTrapMethod(handler Value, trapName string) (Value, bool) {
 	obj, ok := handler.(*Object)
 	if !ok {
-		return nil
+		return nil, false
 	}
 	val, found := obj.GetProperty(trapName)
 	if !found || val == nil {
-		return nil
+		return nil, false
 	}
-	// trap 必须可调用
-	if IsCallable(val) {
-		return val
+	switch val.(type) {
+	case *Undefined, *Null:
+		return nil, false
 	}
-	return nil
+	return val, true
 }
 
 // IsProxy 判断值是否为代理。

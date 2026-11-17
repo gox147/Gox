@@ -149,6 +149,15 @@ func TypeOf(v Value) string {
 	if _, ok := v.(*PrimitiveObject); ok {
 		return "object"
 	}
+	// callable proxy (target 可调用) typeof 为 "function" (ProxyCreate 给
+	// target 可调用的 proxy 装 [[Call]]); revoked proxy 两个内部方法都
+	// 没有, 回落 "object" (revocable/target-is-revoked-function-proxy 族)。
+	if p, ok := v.(*Proxy); ok {
+		if !p.IsRevoked && p.Target != nil && IsCallable(p.Target) {
+			return "function"
+		}
+		return "object"
+	}
 	switch v.Type() {
 	case NUMBER_OBJ:
 		return "number"

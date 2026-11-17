@@ -554,6 +554,29 @@ func setupRegExpProto() *object.Object {
 		return regExpReplace(re, input, replaceValue)
 	}))
 
+	// [Symbol.search](string): %RegExp.prototype%[@@search] —— 此前未注册,
+	// typeof RegExp.prototype[Symbol.search] === "undefined"
+	// (T4 r8DmKW: not-a-constructor 族)。规范语义: RegExpExec 一次,
+	// 命中返回 result.index, 未命中返回 -1。
+	p.SetBuiltinProperty(object.NewSymbol("Symbol.search").Inspect(), object.NewBuiltinMethod("[Symbol.search]", func(this object.Value, args ...object.Value) object.Value {
+		re, errVal := regExpThis(this)
+		if errVal != nil {
+			return errVal
+		}
+		input := ""
+		if len(args) > 0 {
+			input = toStr(args[0])
+		}
+		res := regExpExec(re, input)
+		if isErrorResult(res) || isNullishExecResult(res) {
+			return object.NewInt(-1)
+		}
+		if idx, found := res.GetProperty("index"); found {
+			return idx
+		}
+		return object.NewInt(-1)
+	}))
+
 	// [Symbol.split](string, limit): 用于 String.prototype.split
 	p.SetBuiltinProperty(object.NewSymbol("Symbol.split").Inspect(), object.NewBuiltinMethod("[Symbol.split]", func(this object.Value, args ...object.Value) object.Value {
 		re, errVal := regExpThis(this)

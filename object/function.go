@@ -3,6 +3,7 @@ package object
 import (
 	"fmt"
 	"sort"
+	"strings"
 )
 
 // ParameterInfo 存储函数参数的元数据。
@@ -534,7 +535,8 @@ var nonConstructableBuiltins = map[string]bool{
 	"getOwnPropertyDescriptors": true, "getOwnPropertyNames": true,
 	"getOwnPropertySymbols": true, "getPrototypeOf": true, "has": true,
 	"hasOwn": true, "hypot": true, "imul": true, "instant": true,
-	"is": true, "isArray": true, "isExtensible": true, "isFinite": true,
+	"isError": true,
+	"is":      true, "isArray": true, "isExtensible": true, "isFinite": true,
 	"isFrozen": true, "isInteger": true, "isLockFree": true, "isNaN": true,
 	"isRawJSON": true, "isSafeInteger": true, "isSealed": true,
 	"isView": true, "keyFor": true, "keys": true, "load": true,
@@ -545,6 +547,7 @@ var nonConstructableBuiltins = map[string]bool{
 	"plainDateTimeISO": true, "pow": true, "preventExtensions": true,
 	"race": true, "random": true, "raw": true, "rawJSON": true,
 	"register": true, "reject": true, "resolve": true, "return": true,
+	"revoke":    true,
 	"revocable": true, "round": true, "seal": true, "set": true,
 	"setDate": true, "setFullYear": true, "setHours": true,
 	"setMilliseconds": true, "setMinutes": true, "setMonth": true,
@@ -564,8 +567,17 @@ var nonConstructableBuiltins = map[string]bool{
 // NewBuiltin 创建内建函数的便捷函数。
 // NotConstructable 按 nonConstructableBuiltins 名单判定
 // (rFXXbq: not-a-constructor 族, 200 例)。
+// 匹配同时接受全名与"最后一个 '.' 之后的裸名" —— 部分注册点用
+// 限定名 (如 "Reflect.getPrototypeOf"), 名单按裸名登记
+// (T4 r8DmKW: 此前限定名漏匹配, Reflect 全系 not-a-constructor 用例
+// 的 isConstructor 误判 true)。
 func NewBuiltin(name string, fn func(args ...Value) Value) *BuiltinFunction {
 	_, nonCtor := nonConstructableBuiltins[name]
+	if !nonCtor {
+		if i := strings.LastIndexByte(name, '.'); i >= 0 {
+			_, nonCtor = nonConstructableBuiltins[name[i+1:]]
+		}
+	}
 	return &BuiltinFunction{Name: name, Fn: fn, NotConstructable: nonCtor}
 }
 

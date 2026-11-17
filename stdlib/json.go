@@ -80,6 +80,40 @@ func setupJSON() *object.Object {
 		return object.NewString(result)
 	}))
 
+	// JSON.rawJSON(text) (ES2024): 把 JSON 文本标记为"原始 JSON"。
+	// 此前未注册 (T4 r8DmKW: JSON/rawJSON/isRawJSON not-a-constructor 族)。
+	// 数据本体规范上是内部槽, 这里用不可枚举的标记属性承载, 供 isRawJSON
+	// 品牌校验; JSON.stringify 的 rawJSON 输出通道尚未实现 (T9 领域)。
+	rawJSONMarkerKey := object.NewSymbol("Symbol.rawJSONMarker").Inspect()
+	j.SetBuiltinProperty("rawJSON", object.NewBuiltin("rawJSON", func(args ...object.Value) object.Value {
+		if len(args) == 0 {
+			return object.NewTypeError("JSON.rawJSON: text argument is required")
+		}
+		text := toStr(args[0])
+		if _, err := parseOrderedJSON(text); err != nil {
+			return object.NewErrorWithName("SyntaxError", "JSON.rawJSON: argument is not valid JSON")
+		}
+		obj := object.NewObject()
+		obj.DefineOwn(rawJSONMarkerKey, object.PropertyDescriptor{
+			Value:        object.TrueSingleton,
+			Writable:     false,
+			Enumerable:   false,
+			Configurable: false,
+		})
+		return obj
+	}))
+	j.SetBuiltinProperty("isRawJSON", object.NewBuiltin("isRawJSON", func(args ...object.Value) object.Value {
+		if len(args) == 0 {
+			return object.FalseSingleton
+		}
+		obj, ok := args[0].(*object.Object)
+		if !ok {
+			return object.FalseSingleton
+		}
+		v, found := obj.GetProperty(rawJSONMarkerKey)
+		return object.NewBoolean(found && v == object.TrueSingleton)
+	}))
+
 	j.SetBuiltinProperty("parse", object.NewBuiltin("parse", func(args ...object.Value) object.Value {
 		if len(args) == 0 {
 			return object.NewErrorWithName("SyntaxError", "Unexpected end of JSON input")

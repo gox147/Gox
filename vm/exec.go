@@ -728,6 +728,15 @@ func (vm *VM) runFrom(startFrameIdx int) error {
 				}
 
 			case *object.Proxy:
+				// proxy 的 [[Call]] 由 target 决定 (T5 r8dXes): target 不可
+				// 调用 (含 revoked) 时 typeof 虽可为 "function" 但调用必须抛
+				// TypeError, 不能进 trap 分发。
+				if !object.IsCallable(callee) {
+					if err := vm.throwNamedError("TypeError", "%s is not a function", describeCallee(fn)); err != nil {
+						return err
+					}
+					continue
+				}
 				// 代理: 转发到 apply trap (this 为 undefined)
 				// trap 回调可长期持有 args, 拷出复用缓冲。
 				proxyArgs := make([]object.Value, numArgs)
@@ -889,6 +898,13 @@ func (vm *VM) runFrom(startFrameIdx int) error {
 					continue
 				}
 			case *object.Proxy:
+				// spread 裸调用同 OP_CALL: proxy 不可调用先抛 TypeError (T5)。
+				if !object.IsCallable(callee) {
+					if err := vm.throwNamedError("TypeError", "%s is not a function", describeCallee(fn)); err != nil {
+						return err
+					}
+					continue
+				}
 				result, err := vm.proxyApply(callee, object.UndefinedSingleton, args)
 				if err != nil {
 					if terr := vm.rethrowBridgeError(err); terr != nil {
@@ -1173,6 +1189,16 @@ func (vm *VM) runFrom(startFrameIdx int) error {
 					continue
 				}
 			} else if proxy, ok := fn.(*object.Proxy); ok {
+				// 规范 EvaluateNew 步骤 7: IsConstructor(constructor) 为假抛
+				// TypeError。proxy 的 [[Construct]] 由 target 决定 ——
+				// target 不可构造时 (含 revoked) 不能进 trap 分发
+				// (T4 r8DmKW: create-target-is-not-a-constructor 族)。
+				if !object.IsConstructor(proxy) {
+					if err := vm.throwNamedError("TypeError", "%s is not a constructor", describeCallee(fn)); err != nil {
+						return err
+					}
+					continue
+				}
 				// 代理构造: 转发到 construct trap
 				result, err := vm.proxyConstruct(proxy, args)
 				if err != nil {
@@ -2596,7 +2622,16 @@ func (vm *VM) runFrom(startFrameIdx int) error {
 			// in 运算符: key in obj。左操作数(key)先压, 右操作数(obj)后压, 栈顶是 obj。
 			obj := vm.stack.Pop()
 			key := vm.stack.Pop()
-			vm.stack.Push(vm.inOperator(obj, key))
+			res := vm.inOperator(obj, key)
+			// proxy has trap 抛出的错误 (异常 / trap 不可调用) 以 *Error 回传,
+			// 这里转正常抛出流程 (可被 try/catch 捕获)。
+			if errObj, isErr := res.(*object.Error); isErr {
+				if !vm.handleThrow(errObj) {
+					return &ThrowError{Value: errObj}
+				}
+				continue
+			}
+			vm.stack.Push(res)
 		case bytecode.OP_THIS:
 			frame := vm.currentFrame()
 			if frame.Closure == nil {
@@ -2685,6 +2720,33 @@ func (vm *VM) runFrom(startFrameIdx int) error {
 				// 按描述符可配置性裁决并同步 Elements / propKeyOrder。
 				if s, ok := key.(*object.String); ok {
 					vm.stack.Push(object.NewBoolean(arr.DeleteOwn(s.Value)))
+				} else {
+					vm.stack.Push(object.NewBoolean(false))
+				}
+			} else if p, ok := obj.(*object.Proxy); ok {
+				// proxy: deleteProperty trap 分发 (T5 r8dXes)。此前 proxy 掉进
+				// 末尾 else 恒返回 true —— trap 存在时不执行、不可调用时不抛。
+				if s, ok := key.(*object.String); ok {
+					deleted, err := vm.proxyDelete(p, s.Value)
+					if err != nil {
+						if terr := vm.rethrowBridgeError(err); terr != nil {
+							return terr
+						}
+						continue
+					}
+					vm.stack.Push(object.NewBoolean(deleted))
+				} else if sym, ok := key.(*object.Symbol); ok {
+					// deleteProperty trap 收到的 key 一律 String 化? 规范传
+					// 原始 Property Key (Symbol 也原样传)。Symbol 键的 trap
+					// 分发与字符串一致。
+					deleted, err := vm.proxyDelete(p, sym.Inspect())
+					if err != nil {
+						if terr := vm.rethrowBridgeError(err); terr != nil {
+							return terr
+						}
+						continue
+					}
+					vm.stack.Push(object.NewBoolean(deleted))
 				} else {
 					vm.stack.Push(object.NewBoolean(false))
 				}

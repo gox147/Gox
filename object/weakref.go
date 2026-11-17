@@ -109,6 +109,35 @@ func NewFinalizationRegistry(cleanup Value) *FinalizationRegistry {
 	return &FinalizationRegistry{Cleanup: cleanup}
 }
 
+// Register / Unregister 是 FinalizationRegistry 内部注册表的导出入口,
+// 供 stdlib 的 %FinalizationRegistry.prototype%.register/unregister 使用
+// (实例虚拟属性与原型方法共用同一存储, T4 r8DmKW)。
+func (r *FinalizationRegistry) Register(target, held, token Value) {
+	r.mu.Lock()
+	r.entries = append(r.entries, finRegistryEntry{
+		target:          target,
+		held:            held,
+		unregisterToken: token,
+	})
+	r.mu.Unlock()
+}
+
+func (r *FinalizationRegistry) Unregister(token Value) bool {
+	r.mu.Lock()
+	kept := r.entries[:0]
+	removed := false
+	for _, e := range r.entries {
+		if looseEqualsRef(e.unregisterToken, token) {
+			removed = true
+			continue
+		}
+		kept = append(kept, e)
+	}
+	r.entries = kept
+	r.mu.Unlock()
+	return removed
+}
+
 // looseEqualsRef 宽松比较两个 token 是否同一对象/同值。
 func looseEqualsRef(a, b Value) bool {
 	if a == nil || b == nil {

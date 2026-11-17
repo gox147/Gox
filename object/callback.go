@@ -99,7 +99,8 @@ func ConstructFunction(fn Value, args ...Value) Value {
 // 判断值是否实现 [[Construct]] —— 与"可调用"不等价: 箭头函数可调用但不可构造，
 // generator/async 函数同理；内建函数里原型方法/getter/命名空间函数也没有
 // [[Construct]] (靠 NotConstructable 标记)。
-// Proxy 一律视为可构造 (规范由 target 决定，这里放宽)。
+// Proxy 按 target 决定 (ProxyCreate: 只有 target 可构造才装 [[Construct]])；
+// revoked proxy 两个内部方法都没有。
 func IsConstructor(v Value) bool {
 	switch f := v.(type) {
 	case *Closure:
@@ -116,16 +117,25 @@ func IsConstructor(v Value) bool {
 		// BuiltinMethod 无 NotConstructable 标记: 原型方法无 [[Construct]]。
 		return false
 	case *Proxy:
-		return true
+		if f.IsRevoked || f.Target == nil {
+			return false
+		}
+		return IsConstructor(f.Target)
 	}
 	return false
 }
 
-// IsCallable 检查值是否可调用 (是 Closure 或 BuiltinFunction)。
+// IsCallable 检查值是否可调用。
+// Proxy 与构造性同理: target 可调用才装 [[Call]]；revoked proxy 不可调用。
 func IsCallable(v Value) bool {
-	switch v.(type) {
+	switch f := v.(type) {
 	case *Closure, *BuiltinFunction, *BuiltinMethod:
 		return true
+	case *Proxy:
+		if f.IsRevoked || f.Target == nil {
+			return false
+		}
+		return IsCallable(f.Target)
 	}
 	return false
 }
