@@ -1,0 +1,61 @@
+{
+  "generated_at": "2026-11-17T08:12:42Z",
+  "benchmark": "perf-batch/T3-5-coldstart-len + T3-4-bool-singleton",
+  "note": "夜批 A/B 原始数据。两组改动各自独立提交（b5692ef 冷启动、5acba1b 热点），下面 two_tree_ab / three_stack 段分别对应。所有时间为外部 wall time，除 setupglobals 为进程内 go benchmark。",
+  "platform": {
+    "cpu": "AMD EPYC 9754 128-Core Processor",
+    "cpus": 32,
+    "os": "linux/amd64",
+    "kernel": "6.6.117-45.11.3.tl4.x86_64",
+    "go": "go1.26.2"
+  },
+  "binaries": {
+    "base": {"commit": "16ade4f2de87a9957f2b09cb328332137647e89b", "note": "A/B 基线（本轮两提交之前）"},
+    "coldstart_only": {"commit": "b5692ef", "note": "只含冷启动改动"},
+    "final": {"commit": "5acba1bcc895db4f17cbf3e8d4fe207aa26ce47d", "note": "冷启动 + 布尔单例"},
+    "node": {"version": "v22.13.1", "kind": "V8/JIT"},
+    "goja": {"module": "bench/goja", "kind": "纯解释器（同类基线）"}
+  },
+  "setupglobals": {
+    "metric": "BenchmarkSetupGlobals (tools/perf), -benchtime 2000x -count=5, 取中位",
+    "base": {"ns_per_op": 379100, "bytes_per_op": 344715, "allocs_per_op": 2555, "samples_ns": [373615, 370416, 400874, 383899, 379058]},
+    "coldstart_only": {"ns_per_op": 352100, "bytes_per_op": 320406, "allocs_per_op": 2006, "samples_ns": [376249, 379945, 352072, 348793, 346721]},
+    "delta": {"ns_per_op": -7.1, "bytes_per_op": -7.0, "allocs_per_op": -21.5, "allocs_abs": -549}
+  },
+  "startup_idle_process": {
+    "metric": "scripts/bench/startup_idle.js 进程级外部计时，随机交错 300 轮/组",
+    "base_ms": {"min": 4.36, "p10": 4.912, "median": 5.627},
+    "coldstart_only_ms": {"min": 4.356, "p10": 4.775, "median": 5.358},
+    "paired_median_diff_ms": 0.175,
+    "coldstart_faster_rounds": "185/300",
+    "reading": "中位 -4.8%，但 min 持平 —— 收益来自分配/GC 抖动而非指令级路径；进程级只作趋势参考，对外以 setupglobals 微基准为准"
+  },
+  "first_frame_inprocess": {
+    "metric": "tools/perf TestColdStartToFirstFrame, PERF_COLDSTART_REPS=25 ×2 轮",
+    "base_ms": [0.93, 1.10],
+    "final_ms": [0.92, 0.92],
+    "reading": "首帧被 GUI 装载/模块解析主导，初始化段 7% 的改善落在噪声内（0.92~0.93ms 持平）"
+  },
+  "two_tree_ab_fib28": {
+    "metric": "scripts/bench/fib28.js 进程级外部计时，随机交错 15 轮/组，取中位",
+    "base_b5692ef": {"median_ms": 227.1, "min_ms": 215.2},
+    "final_5acba1b": {"median_ms": 201.5, "min_ms": 192.5},
+    "delta_median": -11.3,
+    "delta_min": -10.6
+  },
+  "three_stack": {
+    "metric": "同一脚本 scripts/bench/fib28.js，同一机器同一日，外部 wall time，7 次取中位",
+    "gox_final_ms": {"min": 192.5, "median": 201.5},
+    "goja_ms": {"min": 181.9, "median": 188.7},
+    "node_ms": {"min": 30.9, "median": 32.5},
+    "ratios": {
+      "gox_over_goja": 1.07,
+      "gox_over_node_wall": 6.2,
+      "gox_over_node_pure_compute_estimate": "~16×"
+    },
+    "disclaimer": "gox 是纯解释器；node 是 V8/JIT。原始 wall 的 6.2× 与纯计算的 ~16× 里，绝大部分是「解释器 vs JIT」的固有差距，不能算作实现缺陷；同类可比基线是 goja（1.07×）。"
+  },
+  "compliance": {
+    "builtins_boolean": {"suite": "built-ins, -filter Boolean", "base": "36/51 (70.59%)", "final": "36/51 (70.59%)", "reading": "逐例一致，布尔语义未变"}
+  }
+}
