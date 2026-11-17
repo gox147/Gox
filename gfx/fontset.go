@@ -40,10 +40,12 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 
 	"golang.org/x/image/font"
 	"golang.org/x/image/font/opentype"
@@ -106,10 +108,28 @@ func (ix *familyIndex) build() {
 	ix.mono = map[string]bool{}
 	ix.styleOf = map[string][]styleAxis{}
 
-	// 宿主注入的字体排最前 (与 baseFont 的候选顺序同一口径): 移动端
-	// 随包字体必须能按族名选到, 否则 SetFontPath 只解决了"默认字体"。
+	paths := familyCandidatePaths()
+	results := make([][]familyFaceEntry, len(paths))
+	parallelFor(len(paths), func(i int) {
+		results[i] = scanFamilyFaceEntries(paths[i])
+	})
+	for i, p := range paths {
+		ix.indexEntriesLocked(p, results[i])
+	}
+}
+
+func familyCandidatePaths() []string {
+	seen := make(map[string]bool, 256)
+	out := make([]string, 0, 256)
+	add := func(p string) {
+		if p == "" || seen[p] {
+			return
+		}
+		seen[p] = true
+		out = append(out, p)
+	}
 	for _, p := range injectedFonts {
-		ix.indexFileLocked(p)
+		add(p)
 	}
 	visited := 0
 	var walk func(dir string)
@@ -132,50 +152,73 @@ func (ix *familyIndex) build() {
 				continue
 			}
 			if fontExtOK(e.Name()) {
-				ix.indexFileLocked(full)
+				add(full)
 			}
 		}
 	}
 	for _, d := range fontScanDirs() {
 		walk(d)
 	}
-	// 静态候选补一遍: 扫描有上限, 而静态候选恰恰是"这个平台上必然存在"的
-	// 那几个 (C:\Windows\Fonts 在 Windows 上根本不进扫描目录)。
 	for _, p := range fontCandidatesForOS() {
-		ix.indexFileLocked(p)
+		add(p)
 	}
+	return out
 }
 
-// indexFileLocked 把一个字体文件的所有面记进索引 (调用方必须持有 ix.mu)。
-//
-// 失败一律静默: 目录里混着不可解析的文件是常态 (老格式位图字体、损坏文件),
-// 不值得为此中断整次索引 —— 那会让"用了 fontFamily"变成"整屏无字"。
-func (ix *familyIndex) indexFileLocked(path string) {
+func parallelFor(n int, fn func(i int)) {
+	if n <= 0 {
+		return
+	}
+	if n == 1 {
+		fn(0)
+		return
+	}
+	workers := min(min(runtime.GOMAXPROCS(0), 16), n)
+	var (
+		wg   sync.WaitGroup
+		next atomic.Int64
+	)
+	wg.Add(workers)
+	for w := 0; w < workers; w++ {
+		go func() {
+			defer wg.Done()
+			for {
+				i := int(next.Add(1) - 1)
+				if i >= n {
+					return
+				}
+				fn(i)
+			}
+		}()
+	}
+	wg.Wait()
+}
+
+type familyFaceEntry struct {
+	index int
+	names []string
+	axis  styleAxis
+	mono  bool
+}
+
+func scanFamilyFaceEntries(path string) []familyFaceEntry {
 	f, err := os.Open(path)
 	if err != nil {
-		return
+		return nil
 	}
 	defer f.Close()
 	col, err := opentype.ParseCollectionReaderAt(f)
 	if err != nil {
-		return
+		return nil
 	}
 	var buf sfnt.Buffer
 	n := col.NumFonts()
-	stemKey := normalizeFamilyKey(stripStyleSuffix(strings.TrimSuffix(
-		filepath.Base(path), filepath.Ext(path))))
+	out := make([]familyFaceEntry, 0, 4)
 	for i := 0; i < n; i++ {
 		ft, err := col.Font(i)
 		if err != nil {
 			continue
 		}
-		// 一个面可能有两个族名, **两个都要登记**:
-		//   - ID 1 (Family)      —— "Arial" / "Hiragino Sans GB";
-		//   - ID 16 (TypographicFamily) —— 有时是上面那个的本地化名。
-		// 只取其中一个都会漏: 苹果 CJK 字体的 ID 16 是"冬青黑體簡體中文"这种
-		// 繁体/中文名 (脚本里没人会那么写), 而它的 ID 1 才是通用名; 反过来,
-		// 带光学尺寸的字体族只在 ID 16 里写真正的族名 (ID 1 是 "Arial Bold")。
-		// 两个都收, 代价只是一个 map 键, 收益是"两种写法都能命中"。
 		names := make([]string, 0, 3)
 		for _, id := range []sfnt.NameID{sfnt.NameIDFamily, sfnt.NameIDTypographicFamily} {
 			if key := normalizeFamilyKey(fontNameOf(ft, &buf, id)); key != "" {
@@ -185,23 +228,40 @@ func (ix *familyIndex) indexFileLocked(path string) {
 		if len(names) == 0 {
 			continue
 		}
-		axis := axisFromFont(ft, i, fontNameOf(ft, &buf, sfnt.NameIDSubfamily))
 		mono := false
 		if pt := ft.PostTable(); pt != nil {
 			mono = pt.IsFixedPitch
 		}
-		for _, key := range names {
+		out = append(out, familyFaceEntry{
+			index: i,
+			names: names,
+			axis:  axisFromFont(ft, i, fontNameOf(ft, &buf, sfnt.NameIDSubfamily)),
+			mono:  mono,
+		})
+	}
+	return out
+}
+
+func (ix *familyIndex) indexFileLocked(path string) {
+	ix.indexEntriesLocked(path, scanFamilyFaceEntries(path))
+}
+
+func (ix *familyIndex) indexEntriesLocked(path string, entries []familyFaceEntry) {
+	if len(entries) == 0 {
+		return
+	}
+	stemKey := normalizeFamilyKey(stripStyleSuffix(strings.TrimSuffix(
+		filepath.Base(path), filepath.Ext(path))))
+	for _, e := range entries {
+		for _, key := range e.names {
 			if _, ok := ix.files[key]; !ok {
 				ix.files[key] = map[styleAxis]faceSrc{}
 			}
-			// 先到先得: 同一 (族, 轴) 在多个目录里都有时, 取遍历顺序靠前的
-			// —— 顺序稳定 ⇒ 每次启动选到同一份, 渲染结果可复现 (与
-			// scanSystemFonts 的排序纪律同一条理由)。
-			if _, dup := ix.files[key][axis]; !dup {
-				ix.files[key][axis] = faceSrc{path: path, index: i}
-				ix.styleOf[key] = append(ix.styleOf[key], axis)
+			if _, dup := ix.files[key][e.axis]; !dup {
+				ix.files[key][e.axis] = faceSrc{path: path, index: e.index}
+				ix.styleOf[key] = append(ix.styleOf[key], e.axis)
 			}
-			if mono {
+			if e.mono {
 				ix.mono[key] = true
 			}
 			ix.setAltLocked(compactFamilyKey(key), key)
