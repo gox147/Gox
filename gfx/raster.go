@@ -866,6 +866,7 @@ func FillRect(img *image.RGBA, r Rect, c color.RGBA) {
 	if ca == 0 {
 		return // 全透明: 不改动画面 (也不该白白遍历像素)
 	}
+	censusDraw("fillrect", r.W, r.H, c, ca != 255)
 	stride := img.Stride
 	pix := img.Pix
 	ox, oy := img.Rect.Min.X, img.Rect.Min.Y

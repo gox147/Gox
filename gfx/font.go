@@ -815,6 +815,12 @@ const (
 // 淡出 (P3-2) 的接法是"c.A 当额外覆盖度因子": 调用方 (DrawText) 已经
 // 把不透明度折进了 c.A, 这里再乘一次就得到 final alpha = 覆盖度 × 不透明度。
 func blitGlyph(img *image.RGBA, clip image.Rectangle, e *glyphEntry, dx, dy, baseY int, c color.RGBA) {
+	// 普查口径按"掩码"记一次, 不按 blitMask 次数: 合成粗体重复压的是同一份
+	// 掩码, 图集内存口径下它不该算两份。
+	if e.mask != nil {
+		b := e.mask.Bounds()
+		censusDraw("glyph", b.Dx(), b.Dy(), c, true)
+	}
 	blitMask(img, clip, e, dx, dy, baseY, c)
 	if e.synthB {
 		// 合成粗体: 往右再压一遍 (1px 的横向涂抹)。它是**近似** —— 真粗体

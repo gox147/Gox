@@ -171,6 +171,7 @@ func blendPixel(img *image.RGBA, x, y int, c color.RGBA, cov float64) {
 	if c.A == 0 || cov <= 0 {
 		return
 	}
+	censusDraw("aapixel", 1, 1, c, c.A != 255 || cov < 1)
 	stride := img.Stride
 	i := (y-img.Rect.Min.Y)*stride + (x-img.Rect.Min.X)*4
 	pix := img.Pix
