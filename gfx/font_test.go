@@ -629,4 +629,3 @@ func anyPlainCandidate() bool {
 	}
 	return false
 }
-

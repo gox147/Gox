@@ -127,9 +127,9 @@ func TestColdstartFontStage(t *testing.T) {
 			"total_ms":  scanMed + chooseMed,
 		},
 		"scanned_files": runs[0].Files,
-		"scan_reads":     runs[0].ScanReads,
-		"choose_reads":   runs[0].ChooseReads,
-		"all_runs":       runs,
+		"scan_reads":    runs[0].ScanReads,
+		"choose_reads":  runs[0].ChooseReads,
+		"all_runs":      runs,
 		"host": map[string]any{
 			"platform": runtime.GOOS + "/" + runtime.GOARCH,
 			"cores":    runtime.NumCPU(),
