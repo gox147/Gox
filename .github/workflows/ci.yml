@@ -72,6 +72,26 @@ jobs:
             exit 1
           fi
 
+      # ── 对外性能数字一致性（看板 rrIdLN / T3-7）────────────────────────────
+      # 为什么放在 PR 闸门里而不是 bench job：这一条**不跑基准**，只比「README 表格
+      #   等数字块」与 `docs/perf-numbers.json`（golden）是否逐字一致，纯 Python、
+      #   零依赖、亚秒级 —— 放 bench job 里会被 5 分钟的跑批拖慢，也会因为 bench 是
+      #   PR 必检而让「改了数字没重跑基准」这类问题晚 20 分钟才暴露。
+      # 守的是已经发生过的事故：README 停在 2026-11-14 的 247ms，而 docs 已写到
+      #   11-17 的 201ms —— 同一份宣传材料的三个出口各说各话。
+      - name: 性能对外数字单一真相源（数字块 == docs/perf-numbers.json）
+        run: |
+          set -euo pipefail
+          # 先跑脚本自测：判据本身坏了（比如标记正则失效、--check 永远 ok）时先知道，
+          # 而不是白等一条假绿（与 check-bench.py --self-test 同一纪律）。
+          if ! python3 scripts/test_gen_perf_numbers.py; then
+            echo "::error::gen-perf-numbers.py 自测未通过 —— 数字块的解析/重写判据已失效，它可能不再拦任何东西"
+            exit 1
+          fi
+          if ! python3 scripts/gen-perf-numbers.py --check; then
+            echo "::error::README 里的性能数字与 docs/perf-numbers.json 不一致 —— 不要手改表格，跑 python3 scripts/gen-perf-numbers.py --record --write 重新生成（换数字先跑基准）"
+            exit 1
+          fi
   # ── 包级 init() 纯度（看板 rKjHCl）─────────────────────────────────────────
   # 为什么单独一个作业：它是 Go 侧的 AST 分析（要 Go 工具链），而 registries 是
   #   Python 侧的纯文本分析；两者的失败归因完全不同，混在一条里会互相淹没。

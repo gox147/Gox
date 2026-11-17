@@ -66,7 +66,9 @@ flex 布局 + JSX + 信号驱动更新，win32 / X11 / cocoa 窗口后端）、�
 把边界写在前面，比让读者踩坑再回头更省事：
 
 - **不适合做 Web 后端或替代 Node.js** —— 不支持 CommonJS（`require`）与 npm 生态的大多数包，见 [兼容性矩阵](docs/compat-matrix.md)。
-- **不适合 CPU 密集的计算任务** —— 纯解释器，无 JIT，`fib28` 纯计算相对 goja（同为纯解释器）为 **1.22×**（2026-11-14 CI 复测，落入同类阈值 ×1.25 内），与 V8 等 JIT 栈的差距是数量级且属**"纯解释器 vs JIT"的固有差距**，不能都算 gox 的实现缺陷；同类可比基线是 goja，见 [性能](#性能)。
+- **不适合 CPU 密集的计算任务** —— 纯解释器，无 JIT，`fib28` 纯计算相对 goja（同为纯解释器）为 <!-- perf-numbers:begin readme-threshold -->
+**1.03×**（2026-11-17 本机夜批复测，落入同类阈值 ×1.25 内）
+<!-- perf-numbers:end readme-threshold -->，与 V8 等 JIT 栈的差距是数量级且属**"纯解释器 vs JIT"的固有差距**，不能都算 gox 的实现缺陷；同类可比基线是 goja，见 [性能](#性能)。
 - **不适合需要完整 ES 规范的生产系统** —— test262 `built-ins` 合规率 62%，`Temporal` / `RegExp` 等子集仍有成块缺口。
 - **不适合"一次写完到处跑"的幻想** —— 三端形态（折叠屏、安全区、权限）差异真实存在，需要按平台适配。
 
@@ -672,9 +674,10 @@ go run ./packager app.js --gui --target linux/amd64    # 纯 Go 交叉编译，�
 
 ## 性能
 
-> **数字真相源**：`docs/performance.md`（口径、测量条件、复现命令、历史存档全在那一份文件里；
-> 本节与官网只引用、不手抄新数字 —— 引用与源不一致时以 `docs/performance.md` 为准并修本节）。
-> 下表数字来自 CI runner 上的公开基准（`bench-results/`，AMD EPYC）。
+> **数字真相源**：`docs/perf-numbers.json`（由 `scripts/gen-perf-numbers.py` 从 `bench-results/`
+> 的原始 JSON 提炼）→ 本节表格与 [官网](https://14752222.github.io/Gox/guide/performance)。
+> **禁止手抄数字**：`python3 scripts/gen-perf-numbers.py --check` 在 CI 里校验，表格与 JSON 不一致即红。
+> 口径、测量条件、复现命令与历史存档在 `docs/performance.md`。
 > **含未达标项** —— 口径与阈值全部公开。
 >
 > **口径免责（引用任何 bun / node / V8 对比数字时必须连同本段）**：gox 是**纯解释器**
@@ -683,22 +686,28 @@ go run ./packager app.js --gui --target linux/amd64    # 纯 Go 交叉编译，�
 > **goja 同为纯解释器，才是同类基线**。跨运行时四栈完整台账见
 > `bench-results/CROSS-RUNTIME-LEDGER.md` 与 `docs/performance.md` §3.2。
 
-| 指标 | gox | goja（纯解释器对照） | bun（JSC/JIT 对照） | node / V8（JIT 对照） |
-|---|---:|---:|---:|---:|
-| 启动耗时 | 7 ms | 6 ms | 8 ms | 30 ms |
-| `fib28` 纯计算 | 247 ms | 203 ms | 15 ms | 36 ms |
-| 1 万定时器 | 173 ms | 122 ms | 113 ms | 139 ms |
-| 常驻内存 RSS | 20 MB | 7.6 MB | 15.5 MB | 44 MB |
+<!-- perf-numbers:begin readme-quad -->
+| 指标 | gox | goja（纯解释器对照） | node / V8（JIT 对照） |
+|---|---:|---:|---:|
+| 启动耗时 | 9 | 6 | 36 |
+| `fib28` 纯计算 | 263 | 256 | 46 |
+| 1 万定时器 | 189 | 129 | 153 |
+| 常驻内存 RSS | 16.1 MB | 7.5 MB | 46.6 MB |
 
-> 上表为 2026-11-14 CI runner 复测快照（bench workflow，`bench-results/bench-20261114-122404.json`，
-> runs=5 中位；复现命令见 `docs/performance.md` §9）。**`fib28` 相对 goja（同类纯解释器）
-> = 247/203 ≈ 1.22×，已落入 §3.1 的 ×1.25 阈值内（达标）**；对 node 的原值口径 6.9×
-> 未达 3 倍红线，且 node 列受启动噪声主导（36ms 里启动占 30ms）。
+> 上表由 `scripts/gen-perf-numbers.py` 从 `bench-results/bench-20261117-120235.json` 生成（**不要手改**）。
+> 测量条件：Intel(R) Xeon(R) 6981E-C（32 核）/ Linux-6.6.117-45.11.6.tl4.x86_64-x86_64-with-glibc2.39；每项外部 wall time 跑 5 次取中位；日期 2026-11-17 12:02:35（UTC）；gox commit `b2a6730`；node v22.13.1。
+> 复现命令见 `docs/performance.md` §9。
+<!-- perf-numbers:end readme-quad -->
 
-**结论**：启动与内存与同类解释器同级；**纯计算算力已达 goja 同级**
-（阈值：`gox_fib28 ≤ goja_fib28 × 1.25`，口径见 `docs/performance.md` §3.1，2026-11-14 CI 复测通过）。
-与 bun/node 等 JIT 栈的 fib28 差距是"纯解释器 vs JIT"的固有差距，不作为优化目标。
-**UI 无 GC 毛刺达标**（同日 CI 重压聚合 p95 帧间隔 13.49ms ≤ 16.7ms；单次 GC 停顿 max 0.474ms ≤ 5ms）。
+**结论**：
+<!-- perf-numbers:begin readme-conclusion -->
+- **纯计算算力与 goja（同类纯解释器）同级**：`gox_fib28 / goja_fib28` = 1.03× ≤ 1.25×（docs §3.1 阈值）。
+- **对 node 的 3× 红线未达标**：`gox_fib28 / node_fib28` = 5.72×（原值口径），且 node 列受进程启动噪声主导；按纯计算口径差距是数十倍量级 —— 这是「纯解释器 vs JIT」的固有差距；gox 刻意不做 JIT，该红线在不开 JIT 的前提下结构上不可达（口径待重议）。
+- 与 bun/node 等 JIT 栈的 `fib28` 差距**不作为优化目标**，引用任何 bun/node 数字必须连同上方口径免责。
+<!-- perf-numbers:end readme-conclusion -->
+
+**UI 无 GC 毛刺达标**（2026-11-14 CI 重压聚合 p95 帧间隔 13.49ms ≤ 16.7ms；单次 GC 停顿 max 0.474ms ≤ 5ms，
+口径见 `docs/performance.md` §5 —— 这一条不是算力指标，不随上表自动更新）。
 
 虚拟化长列表（`<scroll vlist>`）与行数脱钩：十万行首帧 89ms vs 全量 2187ms（约 24 倍），
 滚动帧恒在 0.11~0.17ms vs 全量 999ms。

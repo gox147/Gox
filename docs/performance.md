@@ -16,6 +16,12 @@
 > `scripts/mobile-device-accept.sh`）。两套数字**不可直接相减**：口径、单位与
 > 负载形态都不同，对比方式见那篇 §4。
 
+> **对外引用哪一组数字（T3-7 定档，2026-11-17）**：README / 官网的表格**不是手写**的，
+> 它们由 `scripts/gen-perf-numbers.py` 从 `docs/perf-numbers.json`（golden，从
+> `bench-results/*.json` 提炼）生成；PR 闸门 `ci.yml` 的「性能对外数字」步骤逐字比对，
+> 手改即红。本文 §2/§3.2 是**台账**（含全部历史批次、口径论证与归因），照常人工维护；
+> 两者冲突时以本文的口径定义为准，并重新 `./scripts/perf-numbers.sh` 刷新对外数字。
+
 ---
 
 ## 0. 一句话结论
@@ -225,10 +231,53 @@ main@`b331234`，`bench-20261114-122404.json`，runs=5 中位；同 run 的 UI �
 - bench 闸门（`check-bench.py --json bench-20261117-082503.json`）：**绿**，
   8 项判据无回归（startup / rss 因跨机型只记录）。
 
+### 3.3 对外数字定稿批次（T3-7，2026-11-17 夜批：换机复测 + 数字单一真相源）
+
+§3.2 的 11-17 批次（201ms vs goja 185ms）跑在 EPYC 9754 上；本批换到**另一台机器**
+（Intel Xeon 6981E-C，32 核）并同时改了**产出方式**：README 的表格从此由 golden 文件
+生成（见本文开头注记），所以这里给出**这一组数字的完整来历**，便于读者逐项复现。
+
+**机器与版本**：Xeon 6981E-C / 32 核 / Linux 6.6.117 / go1.26.2 / node v22.13.1；
+gox 二进制 `b2a6730`（`gox version` 自带 commit + dirty 标记；本轮工作树上的改动不影响
+`vm/`，见下）。
+
+| 栈 | 启动 (ms) | fib28+10万次调用 (ms) | 1 万次定时器 (ms) | 空载 RSS (KB) |
+|----|-----------|----------------------|------------------|---------------|
+| gox | 9 | **263** | 189 | 16112 |
+| node (V8/JIT) | 36 | 46 | 153 | 46572 |
+| goja（纯解释器） | 6 | **256** | 129 | 7540 |
+
+来源：`bench-results/bench-20261117-120235.json`（`--runs 5` 中位，startup 单独 9 次）。
+
+- **gox/goja fib28 = 263/256 ≈ 1.03×**，是历次最好的一次，落在 §3.1 的 ×1.25 内。
+  注意这台机器上 goja 本身偏慢（256ms，EPYC 上为 185ms）——**比值可信、绝对值不可跨机比**。
+- **对 node 红线**（fib28 差距收敛到 3 倍内）：原值 **5.72×**，未达标。这是第三次如实记录
+  同一结论，并且应当停止把它当「待做优化项」：3× 的目标在不开 JIT 的前提下结构上不可达
+  （§3.1「达标」判据只对同类解释器有意义）。**建议改口径为「对 goja 的倍数 + 对 node 的
+  倍数并列陈述」**，不再单列对 node 的红线 —— 待 owner 拍板，未拍板前照旧如实报未达标。
+- **冷启动同批复测**：进程级到首帧 **245ms**（n=15，Xvfb `:99`，真实 X11 窗口，
+  `bench-results/coldstart-process-20261117-120216.json`）。比 §12.1 的 84ms 慢 2.9 倍，
+  差距来自**机器与显示栈不同**（Xeon + 另一版 Xvfb + 多装了 CJK 字体，字体查找变慢），
+  不是回归 —— 两者**不可相减**，对外只能引用同条件的一组。进程内口径同批为 **1.16ms**
+  （`bench-results/coldstart-20261117-120201.json`，n=7），比 §12.5 记录的 0.92ms 慢，
+  原因同上（字体/显示无关的模块装载在负载不同的机器上更慢）。
+- bench 闸门（`check-bench.py --json bench-20261117-120235.json`）：**绿**，8 项判据
+  2 条记录（startup / rss 跨机型），无回归。
+
+> 对外数字的产出纪律（本批新增，已进 PR 闸门）：README / 官网表格由
+> `scripts/gen-perf-numbers.py` 从 `docs/perf-numbers.json` 生成，
+> `ci.yml` 的「性能对外数字」步骤跑 `--self-test` + `--check`，**手改即红**。
+> 刷新命令只有一条：`./scripts/perf-numbers.sh`（内部固定 record → write → check 顺序；
+> 只跑 `--write` 会「用旧 golden 重排一遍」，看起来更新了其实没更新）。
+> 每个数字在文档里的脚注都带出处 JSON、commit、node 版本与日期 —— 这就是
+> 「每个数字都能用文档里给出的命令在同一条件下复现」的落地形态。
+> **官网**（独立仓库 `gox-website`）的 `guide/performance.md` + `en/guide/performance.md`
+> 用**同一个生成器、同一份 golden** 渲染（`scripts/check-perf-numbers.sh`），并跑一条
+> 每日 `check-perf-numbers` 工作流与主仓 golden 比对 —— 三处数字由此**不可能各不相同**。
+
 ---
 
 ## 4. 现有性能机制盘点
-
 这些是**已经存在**的机制，本文只盘点、不改。它们是"为什么 gox 在 UI 侧不掉链子"
 的答案，也标出了 M9 剩余工作（算力）的位置。
 
@@ -457,6 +506,10 @@ go test ./tools/perf/ -run TestUIFrameGCStress -v
 
 # 5) 结果落盘位置
 ls -l bench-results/               # bench-*.json (算力) / perf-*.json (帧率+GC)
+
+# 6) 刷新对外数字（README / 官网表格；顺序固定 record → write → check）
+./scripts/perf-numbers.sh          # 跑完基准之后跑这一条
+./scripts/perf-numbers.sh --check  # 只校验（CI 的 PR 闸门跑的也是它）
 ```
 
 产物字段口径：算力 JSON 见 `bench-results/bench-*.json` 的 `method`/`host` 字段；

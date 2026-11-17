@@ -92,6 +92,8 @@ dist/
 # 编译出的被测二进制与 stderr 中间文件不入库。
 bench-results/gox-bench
 bench-results/bench-goja
+# 进程级冷启动 harness（scripts/coldstart.sh）编译出的被测二进制同理不入库
+bench-results/gox-coldstart
 bench-results/.last-err
 bench-results/.goja-build-err
 # perf 包（go test ./perf/）每次跑都会留下探针/压测 JSON，那是**观测产物**不是

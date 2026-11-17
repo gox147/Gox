@@ -1,0 +1,41 @@
+{
+  "_generated": "由 scripts/gen-perf-numbers.py --record 生成，勿手改",
+  "source": {
+    "bench": "bench-results/bench-20261117-120235.json",
+    "generated_at": "2026-11-17T12:02:35.314437+00:00",
+    "runs": 5,
+    "host": {
+      "cpu": "Intel(R) Xeon(R) 6981E-C",
+      "cores": 32,
+      "os": "Linux-6.6.117-45.11.6.tl4.x86_64-x86_64-with-glibc2.39"
+    },
+    "gox_commit": "b2a6730934e997d7d0940a760279b43cd2510408+dirty",
+    "node_version": "v22.13.1"
+  },
+  "stacks": {
+    "gox": {
+      "startup_ms": 9,
+      "fib28_ms": 263,
+      "timers10k_ms": 189,
+      "rss_kb": 16112
+    },
+    "node": {
+      "startup_ms": 36,
+      "fib28_ms": 46,
+      "timers10k_ms": 153,
+      "rss_kb": 46572
+    },
+    "goja": {
+      "startup_ms": 6,
+      "fib28_ms": 256,
+      "timers10k_ms": 129,
+      "rss_kb": 7540
+    }
+  },
+  "coldstart": {
+    "source": "bench-results/coldstart-process-20261117-120216.json",
+    "first_frame_ms_median": 245,
+    "runs": 15,
+    "display": ":99"
+  }
+}
