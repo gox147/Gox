@@ -25,6 +25,8 @@
   `--update-baseline` 固化；
 - host 指纹（platform / cpu / cores）与基线不一致时，进程级首帧降级为
   "只记录"—— 换机器后绝对值不可比，这一点与 check-bench 的 startup/rss 同款。
+- 进程内首帧的默认数据源**只认入库存档**：一次 `go test` 连跑三份、或复制的
+  工作树里跑出来的那份都不算 —— 同一次跑批里 CPU 其他核在忙, 产物会自我污染。
 
 ## 用法
 
@@ -42,6 +44,8 @@ import glob
 import json
 import os
 import platform
+import re
+import subprocess
 import sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -52,7 +56,10 @@ BASELINE = os.path.join(RESULTS, "coldstart-baseline.json")
 LIMITS = {
     "font_stage_total_ms": (1.25, 120.0, "首次用字体的扫描+选默认合计（gfx TestColdstartFontStage）"),
     "process_first_frame_ms": (1.25, 400.0, "进程级冷启动到首帧（scripts/coldstart.sh，含窗口/上屏）"),
-    "inproc_first_frame_ms": (1.25, 8.0, "进程内首帧（tools/perf，真窗口替身 Surface）"),
+    # 进程内首帧的绝对量只有 0.7–0.8ms, 受单核负载影响可达 ±30%（2026-11-17 实测
+    # 同树 0.68 / 0.71 / 0.73 / 0.74 / 0.81 / 0.85 / 0.86ms）—— 它守的是"数量级
+    # 劣化", 不是几个百分点, 阈值与 tools/perf 里 p99 的硬闸门同一取向。
+    "inproc_first_frame_ms": (1.60, 8.0, "进程内首帧（tools/perf，真窗口替身 Surface）"),
 }
 
 # 跨机型只记录、不判红的指标：进程级首帧含字体栈与显示栈，换机后绝对值不可比。
@@ -112,6 +119,26 @@ def extract(doc: dict) -> dict:
     return {}
 
 
+# runner 镜像里出现过的发行版名（字体/内核相关行为按发行版分档）。
+# 白名单而不是正则猜: 版本段（45.11.6.tl4）和发行版名（tl4）字段数一样,
+# 猜出来的往往是 "tl" 这种半截词, 既不稳定也没意义。
+_KNOWN_DISTROS = ("ubuntu", "debian", "azure", "generic", "tl4", "tl3", "el9", "el8", "fedora")
+
+
+def linux_distro(plat: str) -> str:
+    low = plat.lower()
+    return next((d for d in _KNOWN_DISTROS if d in low), "")
+
+
+def linux_arch(plat: str) -> str:
+    # 架构恒是 "with-glibc..." 之前那一段的**末段**（kernel 版本与前缀都带点，
+    # 架构名本身带下划线），所以从整个串里找一个独立的架构词即可。
+    for arch in ("x86_64", "aarch64", "amd64", "arm64", "riscv64"):
+        if re.search(r"(?<![A-Za-z0-9_])%s(?![A-Za-z0-9_])" % arch, plat):
+            return arch
+    return ""
+
+
 def host_of(doc: dict) -> str:
     h = doc.get("host") or {}
     # 三种结果文件的 host 字段形状不同（generator 各写各的），统一取三项。
@@ -120,25 +147,55 @@ def host_of(doc: dict) -> str:
     plat = h.get("platform") or ""
     if not plat:
         plat = "%s/%s" % (platform.system(), platform.machine())
+    # 去掉容器/runner 镜像带来的尾巴（内核版本、发行版版本、glibc 版本）：同一个
+    # GitHub runner 镜像升级内核就会让整个指纹"换机"，把本该判红的回归降级成记录。
+    # Linux 的串形如 "Linux-<内核>[-<发行版版本>.<发行版>]-<arch>-with-glibc<版本>"，
+    # 只保留 (发行版名, 架构) 两项，版本号一律丢掉；其余平台原样保留。
+    if plat.startswith("Linux-"):
+        plat = "Linux-%s/%s" % (linux_distro(plat) or "-", linux_arch(plat) or "-")
     return "%s|%s|%s" % (plat, cpu, cores)
 
 
-def collect(paths: list[str]) -> tuple[dict, dict]:
+# 各指标默认只认"本仓库提交的存档"（git ls-files 能列出来的），生成的产物不算：
+# 一条命令连跑三次 benchmark、或在任意目录复制一份仓库跑测试，都会留下带更新
+# 时间戳的文件，顺手把闸门该比数据换成了同一次运行里被负载污染的那一份。
+# 显式 --json 不受这条约束（人工指定就是要比它）。
+COMMITTED_ONLY = {"inproc_first_frame_ms"}
+
+
+def committed_in_repo() -> set[str]:
+    try:
+        out = subprocess.check_output(["git", "ls-files", "bench-results"], cwd=ROOT,
+                                      text=True, stderr=subprocess.DEVNULL)
+    except (OSError, subprocess.CalledProcessError):
+        return set()
+    return {os.path.join(ROOT, ln.strip()) for ln in out.splitlines() if ln.strip()}
+
+
+def collect(paths: list[str], explicit: bool = False) -> tuple[dict, dict]:
     """返回 (指标值, 指标来源文件)。同指标多份时取**最新**（按 generated_at）。"""
     values: dict[str, float] = {}
     from_path: dict[str, str] = {}
     stamps: dict[str, str] = {}
+    committed = None if explicit else committed_in_repo()
+    skipped = []
     for p in paths:
         doc = load(p)
         stamp = str(doc.get("generated_at", ""))
         for metric, v in extract(doc).items():
             if v is None:
                 continue
+            if metric in COMMITTED_ONLY and committed is not None and os.path.abspath(p) not in committed:
+                skipped.append((metric, p))
+                continue
             if metric in stamps and stamp < stamps[metric]:
                 continue
             values[metric] = v
             stamps[metric] = stamp
             from_path[metric] = p
+    for metric, p in skipped:
+        print("跳过（未入库的运行产物, 同一次跑批里会被负载污染）: %s ← %s"
+              % (metric, os.path.relpath(p, ROOT)))
     return values, from_path
 
 
@@ -218,7 +275,8 @@ def self_test() -> int:
     """负向自测：一个从没失败过的闸门等于没有闸门。
 
     合成三份文档，验证 ① 未超阈值 → 绿；② 超过比值阈值 → 红；③ 无基线但
-    超过绝对上限 → 红；④ 跨机型的进程级首帧 → 只记录。
+    超过绝对上限 → 红；④ 跨机型的进程级首帧 → 只记录；⑤ 未入库的运行产物
+    不被采用；⑥ 内核/glibc 尾巴不影响 host 指纹。
     """
     ok = True
 
@@ -260,6 +318,29 @@ def self_test() -> int:
           extract(doc_in) == {"inproc_first_frame_ms": 0.74})
     check("未知口径返回空", extract({"benchmark": "something-else"}) == {})
 
+    # 未入库产物必须被跳过（否则一条命令连跑几份就会把数据换成被污染的那份）。
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        polluted = os.path.join(td, "coldstart-20990101-000000.json")
+        with open(polluted, "w", encoding="utf-8") as f:
+            json.dump({"benchmark": "perf/ColdStartToFirstFrame",
+                       "generated_at": "2099-01-01T00:00:00Z",
+                       "phases_ms": {"first_frame_ms": 9.9}}, f)
+        vals, _ = collect([polluted])
+        check("未入库的进程内产物不被采用", "inproc_first_frame_ms" not in vals)
+        vals, _ = collect([polluted], explicit=True)
+        check("--json 显式指定时照用", vals.get("inproc_first_frame_ms") == 9.9)
+
+    # 同一发行版、内核与 glibc 升级 → 指纹不变；换发行版或换架构 → 指纹必须变
+    a = host_of({"host": {"platform": "Linux-6.6.117-45.11.6.tl4.x86_64-with-glibc2.39",
+                          "cpu": "X", "cores": 32}})
+    b = host_of({"host": {"platform": "Linux-6.6.140-45.13.2.tl4.x86_64-with-glibc2.41",
+                          "cpu": "X", "cores": 32}})
+    c = host_of({"host": {"platform": "Linux-6.8.0-51-ubuntu24.04.x86_64-with-glibc2.39",
+                          "cpu": "X", "cores": 32}})
+    check("内核/glibc 尾巴不影响 host 指纹", a == b)
+    check("换发行版必须改变指纹", a != c)
+
     print("ok  冷启动闸门自测通过" if ok else "coldstart-gate: 自测失败")
     return 0 if ok else 1
 
@@ -275,9 +356,10 @@ def main() -> int:
         return self_test()
 
     paths = args.json if args.json else auto_paths()
+    explicit = bool(args.json)
     if not paths:
         die("bench-results/ 下没有冷启动结果 —— 先跑 TestColdstartFontStage / coldstart.sh / TestColdStartToFirstFrame")
-    values, from_path = collect(paths)
+    values, from_path = collect(paths, explicit)
     if not values:
         die("给定的结果文件里没有任何冷启动字段：%s" % ", ".join(paths))
 
