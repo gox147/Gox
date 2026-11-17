@@ -732,7 +732,6 @@ func hasFallbackTrigger(pattern string, r *RegExp) bool {
 	if r.UnicodeSets {
 		return false
 	}
-	deepOnly := r.Unicode // u 标志下只认"原理级"特征
 	for i := 0; i < len(pattern); i++ {
 		c := pattern[i]
 		if c != '\\' {
@@ -746,8 +745,14 @@ func hasFallbackTrigger(pattern string, r *RegExp) bool {
 					case pattern[i+2] != '<' && pattern[i+2] != '=' &&
 						pattern[i+2] != '!' && pattern[i+2] != ':' &&
 						pattern[i+2] != '#' && pattern[i+2] != 'P':
-						// (?X: 形态（X 非特殊引导符）→ 作用域修饰符组
-						if !deepOnly && isModifierHeader(pattern[i+2:]) {
+						// (?X: 形态（X 非特殊引导符）→ 作用域修饰符组。
+						// T2 第三层 (2026-11-18): u 标志下同样放行 —— 修饰符组
+						// (?i-:…) 与属性转义无关，RE2 原理性做不了它（只认
+						// (?i:…) 加标志形态），带 u 标志的合法用例此前直接
+						// SyntaxError。负向保护仍在：属性转义的"不支持属性"
+						// 在 jsToGoRegex 阶段已被注入 \x{110000} 令两条引擎
+						// 都必然报错，不会因 .NET 宽容解析而复活。
+						if isModifierHeader(pattern[i+2:]) {
 							return true
 						}
 					}

@@ -407,6 +407,17 @@ func jsToGoRegex(pattern string, ignoreCase, multiline, dotAll, unicode, unicode
 	}
 	result = translateUnicodeEscapes(result, unicode)
 
+	// T2 第三层 (2026-11-18): 非 u 模式的裸 '.' 物化为**单码元**类。
+	// JS 的 '.' 匹配一个 UTF-16 码元 —— astral 字符是两个码元, 单个 '.'
+	// 永远吃不下 ("\u{10300}" 对 ^.$ 必不匹配, 即使 (?s:.) 也不行)。
+	// RE2 按码点匹配, '.' 会把整个 astral rune 吃掉 —— 语义偏差
+	// (regexp-modifiers add-dotAll 等 5 例)。物化后顺带修掉既有偏差:
+	// 非 s 时 JS 还排除 \r / \u2028 / \u2029, RE2 的 '.' 只排除 \n。
+	// u/v 模式 '.' 按码点读, RE2 原生语义正确, 不动。
+	if !unicode && !unicodeSets {
+		result = materializeJSDots(result, dotAll)
+	}
+
 	// 添加标志前缀
 	prefix := ""
 	if ignoreCase {
@@ -520,6 +531,161 @@ func translateUnicodeEscapes(pattern string, unicode bool) string {
 	return b.String()
 }
 
+// jsDotAllClass / jsDotClass: 非 u 模式裸 '.' 的码元物化类。
+// jsDotClass 在此基础上排除 JS 行终止符 \n \r \u2028 \u2029 (RE2 默认
+// '.' 只排除 \n, \r 与 U+2028/2029 会漏排 —— 顺带修正)。
+const jsDotAllClass = `[\x{0}-\x{FFFF}]`
+const jsDotClass = `[\x{0}-\x{9}\x{B}-\x{C}\x{E}-\x{2027}\x{202A}-\x{FFFF}]`
+
+// materializeJSDots 把模式中**类外**的裸 '.' 替换为单码元字符类
+// (非 u 模式专用, 见 jsToGoRegex 内注释)。扫描器跟踪:
+//   - 字符类内/外与转义 (\. 的字面点、[.] 类内的点都不动);
+//   - **dotAll 作用域栈**: 修饰符组 (?s:…) / (?-s:…) 只影响组内点号
+//     (regexp-modifiers nesting-* / *-does-not-affect-* 族依赖此语义),
+//     普通分组继承当前状态, 组尾 ')' 回弹; (?s) 内联开关永久改当前态
+//     (Annex B, 仅非 u 模式合法 —— 本函数恰好只在这些模式下调用)。
+//
+// 修饰符头只认 i/m/s 与 '-', 语法合法性由 checkModifiersGroup 在入口
+// 统一早错误, 此处不做二次校验。
+func materializeJSDots(pattern string, dotAll bool) string {
+	if !strings.Contains(pattern, ".") {
+		return pattern
+	}
+	var b strings.Builder
+	b.Grow(len(pattern) + 16)
+	inClass := false
+	type frame struct{ dotAll bool }
+	stack := []frame{{dotAll: dotAll}}
+	cur := func() bool { return stack[len(stack)-1].dotAll }
+	classFor := func(da bool) string {
+		if da {
+			return jsDotAllClass
+		}
+		return jsDotClass
+	}
+	for i := 0; i < len(pattern); i++ {
+		c := pattern[i]
+		if c == '\\' && i+1 < len(pattern) {
+			b.WriteByte(c)
+			b.WriteByte(pattern[i+1])
+			i++
+			continue
+		}
+		if c == '[' {
+			inClass = true
+		} else if c == ']' {
+			// JS 正则空类 [] 与 ] 的开闭语义较怪 (空类从不匹配、] 单独
+			// 出现是字面字符), 这里维持朴素开闭 —— 与既有扫描器同口径。
+			inClass = false
+		}
+		if c == '(' && !inClass {
+			// 先记一层普通分组状态; 若是修饰符组头再覆盖栈顶。
+			stack = append(stack, stack[len(stack)-1])
+			if i+1 < len(pattern) && pattern[i+1] == '?' {
+				// 解析 (?imnsx-imnsx[: …]) 修饰符段
+				j := i + 2
+				add, remove := "", ""
+				removeNext := false
+				header := true
+			seg:
+				for j < len(pattern) {
+					ch := pattern[j]
+					switch ch {
+					case 'i', 'm', 's', 'g', 'v', 'y', 'd':
+						if removeNext {
+							remove += string(ch)
+						} else {
+							add += string(ch)
+						}
+						j++
+					case '-':
+						removeNext = true
+						j++
+					case ':':
+						break seg
+					default:
+						// 非修饰符组 (?<=、(?<!、(?<name>、(?: 等不加态
+						header = false
+						break seg
+					}
+				}
+				if header && j < len(pattern) && pattern[j] == ':' {
+					da := cur()
+					if strings.ContainsRune(remove, 's') {
+						da = false
+					}
+					if strings.ContainsRune(add, 's') {
+						da = true
+					}
+					stack[len(stack)-1] = frame{dotAll: da}
+					if strings.ContainsRune(remove, 'i') || strings.ContainsRune(remove, 'm') {
+						// RE2 无标志减除语法 (?-i:…) —— 组头原样保留,
+						// 令 RE2 必然编译失败走降级引擎 (regexp2/.NET 原生
+						// 支持减除; 降级收到的是原始模式, 点号物化不参与)。
+						b.WriteString(pattern[i : j+1])
+						i = j
+						continue
+					}
+					// 仅加标志 (i/m) 或纯 s: 重建 RE2 合法组头。s 已物化,
+					// 不进组头; i/m 原生支持加形态。
+					b.WriteByte('(')
+					b.WriteByte('?')
+					if strings.ContainsRune(add, 'i') {
+						b.WriteByte('i')
+					}
+					if strings.ContainsRune(add, 'm') {
+						b.WriteByte('m')
+					}
+					b.WriteByte(':')
+					i = j
+					continue
+				}
+				// 非修饰符组: 普通分组, 已入栈
+				b.WriteByte(c)
+				continue
+			}
+			b.WriteByte(c)
+			continue
+		}
+		if c == ')' && !inClass {
+			if len(stack) > 1 {
+				stack = stack[:len(stack)-1]
+			}
+			b.WriteByte(c)
+			continue
+		}
+		// (?s) 内联开关 (无 ':'): 永久改当前态。注意上面已把 '(' 当分组
+		// 入栈, 而内联开关不占一层组 —— 弹掉它。
+		if c == '?' && !inClass && i+1 < len(pattern) {
+			// 判断是否形如 ( ? s ) / ( ? s-i ) 的内联开关: 回看是否刚入栈
+			// 的 '(' 前缀。此分支只在 '(' 后紧跟 '?' 且非 ':/</=/!' 时到达
+			// (修饰符带 ':' 的情况已在上面 continue)。
+			j := i + 1
+			for j < len(pattern) && strings.IndexByte("ims-", pattern[j]) >= 0 {
+				j++
+			}
+			if j < len(pattern) && pattern[j] == ')' && j > i+1 {
+				// 内联开关: 弹掉刚入栈的普通分组层, 改父层状态
+				if len(stack) > 1 {
+					stack = stack[:len(stack)-1]
+				}
+				if strings.ContainsRune(pattern[i+1:j], 's') {
+					stack[len(stack)-1].dotAll = true
+				}
+				b.WriteString(pattern[i+1 : j+1]) // "s)" 等, '(' 已写出
+				i = j
+				continue
+			}
+		}
+		if c == '.' && !inClass {
+			b.WriteString(classFor(cur()))
+			continue
+		}
+		b.WriteByte(c)
+	}
+	return b.String()
+}
+
 // isHexRun 报告 s 是否全为十六进制数字且非空。
 func isHexRun(s string) bool {
 	if s == "" {
@@ -613,6 +779,11 @@ var propScriptAliases = map[string]string{
 	"jpan": "Han", "hans": "Han", "hant": "Han", // 日/简/繁汉字近似为 Han
 	"kore": "Hangul",
 	"latn": "Latin", "grek": "Greek", "cyrl": "Cyrillic", "arab": "Arabic", "hebr": "Hebrew",
+	// T2 第三层 (2026-11-18): 此前只收了"生僻"脚本码, 常用脚本的四字母码
+	// 反而漏了 —— \p{Script=Beng} / \p{Script_Extensions=Beng} 等别名形态
+	// 直接 SyntaxError (property-escapes/generated 族 16 个文件)。
+	"beng": "Bengali", "brah": "Brahmi", "hira": "Hiragana", "knda": "Kannada",
+	"mlym": "Malayalam", "bali": "Balinese", "nbat": "Nabataean", "sind": "Khudawadi",
 	"deva": "Devanagari", "brai": "Braille", "hani": "Han", "hang": "Hangul",
 	"kana": "Katakana", "bopo": "Bopomofo", "armn": "Armenian", "geor": "Georgian",
 	"thai": "Thai", "laoo": "Lao", "tibt": "Tibetan", "mymr": "Myanmar", "khmr": "Khmer",
