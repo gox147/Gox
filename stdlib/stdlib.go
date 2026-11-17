@@ -144,6 +144,9 @@ func SetupGlobals() *runtime.Environment {
 	// ===== parseInt, parseFloat, isNaN, isFinite =====
 	setupNumberFunctions(env)
 
+	// ===== encodeURI / decodeURI / encodeURIComponent / decodeURIComponent =====
+	setupURIFunctions(env)
+
 	// ===== 构造器 prototype / constructor 反向引用 =====
 	// 构造器缺少 prototype 属性会导致 Array.prototype.map.call(...) 这类
 	// 通用调用、以及 Number.prototype / [].constructor 等反射访问全部失效。

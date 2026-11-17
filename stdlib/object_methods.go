@@ -885,6 +885,25 @@ func setupErrorTypes(env *runtime.Environment) {
 		return f
 	}(), false)
 
+	// EvalError (规范 19.5.6.1): 此前构造器从未注册 (typeof EvalError ===
+	// 'undefined'), NativeErrors/EvalError 族 46 条全灭 —— 而 length 表
+	// (builtin_lengths.go "EvalError": 1) 早已登记, 属注册遗漏而非未实现。
+	// 其余 Error 子类 (TypeError/RangeError/…) 均走 RegisterErrorConstructor,
+	// EvalError 对齐同一模型, 保证 is-a-constructor / instance-proto /
+	// proto-from-ctor-realm 等反射口径一致。
+	env.Declare("EvalError", func() *object.BuiltinFunction {
+		f := object.NewBuiltin("EvalError", func(args ...object.Value) object.Value {
+			msg := ""
+			if len(args) > 0 {
+				msg = toStr(args[0])
+			}
+			return &object.Error{Message: msg, Name: "EvalError"}
+		})
+		f.ReturnIsValue = true
+		object.RegisterErrorConstructor("EvalError", f)
+		return f
+	}(), false)
+
 	// SuppressedError (ES2023 explicit resource management): 释放资源时又抛错、
 	// 且此前已有挂起异常时的合成错误 (error = 后发生的, suppressed = 被压制的)。
 	env.Declare("SuppressedError", func() *object.BuiltinFunction {
@@ -985,7 +1004,7 @@ func setupErrorTypes(env *runtime.Environment) {
 	attachPrototype(env, "Error", errorProto)
 	stdlibErrorProto = errorProto
 
-	nativeNames := []string{"TypeError", "RangeError", "ReferenceError", "SyntaxError", "URIError", "SuppressedError"}
+	nativeNames := []string{"TypeError", "RangeError", "ReferenceError", "SyntaxError", "URIError", "SuppressedError", "EvalError"}
 	for _, n := range nativeNames {
 		np := object.NewObject()
 		np.Proto = errorProto

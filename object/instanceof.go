@@ -32,6 +32,15 @@ func MatchBuiltinType(left, right Value) bool {
 		return lt == PROMISE_OBJ
 	case "Error", "TypeError", "RangeError", "ReferenceError", "SyntaxError":
 		return lt == ERROR_OBJ
+	case "EvalError", "URIError":
+		// NativeErrors 家族: 精确按 Name 匹配 (T1 根因单 rxDOIl)。此前
+		// EvalError 构造器未注册、URIError 不在表内, `new URIError()
+		// instanceof URIError` 恒 false。同 SuppressedError 不能并进
+		// "Error" 宽匹配组 (那组对任意 ERROR_OBJ 都返回真)。
+		if e, ok := left.(*Error); ok {
+			return e.Name == ctorName
+		}
+		return false
 	case "SuppressedError":
 		// explicit resource management: 释放期合成错误。精确按 Name 匹配 ——
 		// 不能并进上面那组 (那组对任意 ERROR_OBJ 都返回真)。
