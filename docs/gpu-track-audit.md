@@ -151,3 +151,55 @@ hardware job skipped —— 「CI gpu 跑批接入」验收项闭环。挂硬件
 - [ ] swapchain 接入完成后，在真机验证窗口化上屏（非 Readback）；
 - [ ] 移动端接入决策：android 有 `SurfaceTargetFromAndroidNativeWindow`，
       可作 G-3 阶段项评估。
+
+## 复跑核销（2026-11-18 04:01，Linux x86_64 32 核沙箱，无硬件 —— 兜底口径）
+
+`gpu-track-audit.sh` 全量复跑：三轨与 11-08/11-15 基线逐项一致
+（nogpu=none / wgpu=software 兜底口径 / cgo=none 骨架）；接入面不变。
+`go test ./gfx/gpu` 与 `go test -tags gpu ./gfx/gpu` 双轨全绿，
+`go test ./gfx/...` 全包无失败。本节数字维持兜底口径纪律：不进闸门、不对外。
+
+## 移动端接入决策（2026-11-18，G-1 验收项闭环）
+
+**决策：android / ios / harmony 现阶段不接入 SetPresentWrapper**，理由三条：
+
+1. **架构事实**：移动端上屏由宿主完成，不是 Go 侧窗口 —— android 走
+   direct ByteBuffer + Kotlin `flush`（`Bitmap.copyPixelsFromBuffer`
+   + invalidate），ios 走宿主 malloc 缓冲 + Swift 拷出 CGImage，harmony
+   同构。`SetPresentWrapper` 的 swapchain 语义需要"Go 进程持有可建
+   surface 的原生窗口"，移动端通道层根本不提供这个对象。
+2. **改造成本 vs 收益**：接入需把宿主上屏从 Bitmap/CGImage 拷贝改造成
+   SurfaceView/ANativeWindow 或 CAMetalLayer 直通（Kotlin/Swift 双侧
+   契约改动 + 三处同步纪律），收益仅省宿主侧"一次额外拷贝" —— 该拷贝
+   只占移动端帧预算的小头，且移动端 GPU 轨在 wgpu 交叉编译矩阵里本就
+   未覆盖（android 目标需另行验证 wgpu GLES 后端）。
+3. **优先级口径**：C 路径拍板 A 路径先行，A 路径验收是三桌面平台
+   真机点亮；移动端属 G-3 之后可选阶段项，现在动手只会摊薄验证带宽。
+
+条件重启：G-3 三桌面平台真机点亮后，若移动端实测证明宿主拷贝是帧率
+瓶颈，再以 `SurfaceTargetFromAndroidNativeWindow`（android）/
+`SurfaceTargetFromMetalLayer`（ios）立项，独立验收。
+
+## cocoa 设计约束（2026-11-18，G-3 实现前置输入）
+
+cocoa 的 CPU blit 上屏是 `CALayer.contents = NSImage`（`gfx/cocoa`
+cocoa.go Show 路径：`s.layer.Send(selSetContents, s.nsimg)`）。这与
+win32/x11 有本质差别：**那两家的句柄是纯只读探针，cocoa 的 CAMetalLayer
+获取必然要改写 view 的 layer**。若在 `NativeWindowTarget()` 里直接
+`setWantsLayer + setLayer(CAMetalLayer)`，而 GPU 建链失败（Metal 不可用/
+wgpu 初始化失败）回退 CPU blit 时，`contents` 路径在 CAMetalLayer 上
+不渲染 —— 黑窗，且违反「降级路径窗口照常开」的铁律。
+
+**实现约束（G-3 cocoa 项验收时逐条检查）**：
+
+- 切层必须是**可回滚的两段式**：先探测（GPU 链能在不切层的前提下验证
+  Metal 适配器可用），探测通过才 `setLayer(CAMetalLayer)`；探测失败
+  零副作用，CPU blit 照常。
+- 切层成功后 `allocBackbuffer` 的 `contentsScale` / `nsimg` 路径要分流：
+  Metal 层不再走 NSImage contents，Resize/跨屏（`setScale`）时两层路径
+  都要保鲜（cocoa 是唯一缓存 scale 的后端，见 window.go 注释）。
+- 降级测试钉住：强制 Metal 探测失败时，cocoa 窗口 CPU 上屏行为与
+  未引入 GPU 轨前逐像素一致（26 组件快照口径）。
+
+在满足上述约束前，cocoa 的 NativeWindowProvider 维持未实现状态 ——
+宁可缺一个平台，不做降级会黑窗的实现。

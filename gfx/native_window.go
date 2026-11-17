@@ -24,10 +24,17 @@ package gfx
 //     取 Xlib Display* (gfx/x11/xlib.go, 零 cgo, 不破坏发行链)。
 //     打不开 Xlib 时安静退 0, GPU 侧 gate 拒绝建链、窗口照常 CPU
 //     blit。真机点亮待 G-3 三平台验证 (无头沙箱验不到真上屏)。
-//   - cocoa: ❌ 未实现。wgpu 要 CAMetalLayer*, 需要先给 NSView
-//     setWantsLayer+layer 并取层指针, 纯 Go objc 调用可行但未验证,
-//     留给三平台验证阶段一并做 (G-3 窗口化分阶段)。
-//   - android/ios/harmony: 未接入 (移动端本来就没接 SetPresentWrapper)。
+//   - cocoa: ❌ 未实现, 且**不能照抄 win32/x11 的"只读句柄"模式**
+//     (2026-11-18 决策, 见 docs/gpu-track-audit.md「cocoa 设计约束」)。
+//     原因: CPU blit 上屏走 CALayer.contents = NSImage, 若在
+//     NativeWindowTarget() 里直接把 view 层换成 CAMetalLayer, 一旦 GPU
+//     建链失败回退 CPU, contents 路径在 CAMetalLayer 上不渲染 → 黑窗。
+//     实现必须带「GPU 链建立成功后才切层、失败零副作用」的语义
+//     (purego objc 调用本身可行, gfx/cocoa 同款)。真机验证待 G-3。
+//   - android/ios/harmony: **决策不接入** (2026-11-18, 见
+//     docs/gpu-track-audit.md「移动端接入决策」): 上屏由宿主完成
+//     (Kotlin flush / Swift CGImage / harmony), Go 侧拿不到可建
+//     swapchain 的原生 surface, 接入需改造宿主通道且收益仅省一次拷贝。
 type NativeWindowTarget struct {
 	// Kind 标识窗口系统: "win32" / "x11" / "wayland" / "cocoa"。
 	// GPU 后端按它决定喂给 wgpu 哪个 SurfaceTargetFrom* 构造器。
