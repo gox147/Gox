@@ -1,5 +1,6 @@
 # ─────────────────────────────────────────────────────────────────────────────
-# GPU 呈现跑批：gfx/gpu 三轨核销 + 4K 呈现基准 + 像素级 A/B
+# GPU 呈现跑批：gfx/gpu 三轨核销 + 4K 呈现基准 + 像素级 A/B + G-4 视觉闸门
+# （26 组件 CPU vs GPU 双轨快照，snapshot_ab_test.go，2026-11-18 接入）
 #
 # 为什么需要这个文件：G-1 核销时确认 CI 此前没有任何 -tags gpu 跑批 ——
 # gfx/gpu 的单元测试与像素级 A/B 只靠本地手跑，回归无人钉住。本工作流把
@@ -62,6 +63,14 @@ jobs:
       - name: go test -tags gpu ./gfx/gpu
         run: go test -tags gpu ./gfx/gpu -v 2>&1 | tee gpu-test.txt
 
+      # 1.5) G-4 视觉闸门：26 组件 CPU vs GPU 双轨像素级 A/B
+      #      （gfx/gpu/snapshot_ab_test.go，表驱动，差异阈值 0）。软件适配器
+      #      是确定性后端，视觉闸门跑在它上面不需要显卡；skip 判据被
+      #      TestGPUSnapshotABGate 钉住，不是裸 if。产物单列一份，便于
+      #      「G-4 双轨对照真跑过一次」留证。
+      - name: 26 组件双轨快照 A/B (G-4 视觉闸门)
+        run: go test -tags gpu ./gfx/gpu -run TestGPUSnapshotAB -v 2>&1 | tee gpu-snapshot-ab.txt
+
       # 2) 三轨核销表：每条构建轨在这台 runner 上实际走的路径（可审计）
       - name: scripts/gpu-track-audit.sh
         run: ./scripts/gpu-track-audit.sh 2>&1 | tee gpu-track-audit.txt
@@ -78,6 +87,7 @@ jobs:
           name: gpu-present-no-hardware
           path: |
             gpu-test.txt
+            gpu-snapshot-ab.txt
             gpu-track-audit.txt
             gpu-bench-full.txt
             bench-results/present-4k-*.txt

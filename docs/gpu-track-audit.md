@@ -203,3 +203,36 @@ wgpu 初始化失败）回退 CPU blit 时，`contents` 路径在 CAMetalLayer �
 
 在满足上述约束前，cocoa 的 NativeWindowProvider 维持未实现状态 ——
 宁可缺一个平台，不做降级会黑窗的实现。
+
+## G-4 视觉闸门第一块落地：26 组件 CPU vs GPU 双轨快照 A/B（2026-11-18）
+
+`gfx/gpu/snapshot_ab_test.go`（`-tags gpu`），对应 G-4 验收的
+「26 组件快照像素级 A/B + 无硬件跳过逻辑钉住」两件：
+
+- **表驱动双轨对照**：Prism §3 S3~S7 的 26 个画廊脚本
+  （testdata/shots/*.js）逐个挂两遍 —— CPU 参照帧（captureSurface）与
+  GPU 合成帧（gpu.Surface + Readback）—— 逐像素比对，**阈值 0**。
+  文本/形状/抗锯齿出自同一条 CPU 光栅化链，GPU 只做「帧缓冲 → 合成
+  quad」，差异只能来自 GPU 合成，不存在「可接受的近似」。
+- **非空白守卫**：比对前先断言 CPU 参照帧非空（颜色数 ≥8 / 墨量 ≥400，
+  与画廊判据同源）—— 两张白纸的 0 差异没有意义。
+- **入表纪律（可复现性）**：只收静态脚本。menu 预展开、tree/datepicker
+  收起态；**progress.js 不入表** —— 其 indeterminate 色块是 1200ms 循环
+  动画（16ms 心跳按 wall-clock 推进），双轨两次 mount 取帧相位不可对齐
+  （实测同机双跑 4~14 个 accent 色差异像素，全因相位，不是合成 bug）。
+  tooltip/dialog/drawer/spinner/skeleton/datav-* 同理不入表。
+- **跳过逻辑有测试钉住**（G-4 验收原文要求）：唯一 skip 决策点是
+  `snapshotABGate`，由 `TestGPUSnapshotABGate` 钉住三条语义 ——
+  无适配器必 skip；**软件适配器必须照跑**（它是 CI 确定性后端，视觉
+  闸门要像素一致不要帧率，不许拿「没显卡」当跳过理由）；硬件适配器跑。
+- **CI**：`.github/workflows/gpu-present.yml` no-hardware job 新增显式
+  步骤（`go test -tags gpu ./gfx/gpu -run TestGPUSnapshotAB -v`），产物
+  `gpu-snapshot-ab.txt` 单列 —— 供「双轨对照真跑过一次」留证（兜底
+  口径：跑在 wgpu-software 上，钉像素回归，不钉性能）。
+- 局部帧（脏矩形）分支由既有 `TestGPUPresentPixelExact`（悬停交互）覆盖，
+  本套件钉整帧分支；两者合起来是完整的双轨视觉门禁。
+
+实测（2026-11-18，Linux x86_64 32 核沙箱，无硬件 —— wgpu-software 兜底
+口径）：26/26 子用例差异像素 **0**，套件总耗时 ~0.25s，连跑 5 次 +
+`./gfx/...` 全包回归零失败。帧率/上屏耗时基准进 CI（与 T3-2 共用口径）
+与「无硬件 runner 跳过性能断言」属 G-4 后续项，本次未动。

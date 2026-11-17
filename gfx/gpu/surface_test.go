@@ -96,13 +96,28 @@ func (f *factory) Create(cfg gfx.WindowConfig) (gfx.Surface, error) { return f.s
 // 逼进**局部帧 (脏矩形)** 分支 —— 全帧分支挂载那一下就走过了。
 func mountAndSettle(t *testing.T, src string, s gfx.Surface, ev *captureSurface, interactions ...gfx.Event) {
 	t.Helper()
+	runAndSettle(t, func() (*vm.VM, error) { return vm.EvalVM(src) }, s, ev, interactions...)
+}
+
+// runAndSettle 把 load() 产出的 VM 挂到 s 上并驱动事件循环走到稳定态。
+// EvalVM (内联脚本) 与 EvalFileVM (testdata/shots 组件快照脚本) 共用同一套
+// pump 纪律: 两轮无害事件空转, 让挂载副作用落到画面上; 然后关窗收尾。
+// (26 组件双轨快照套件走文件脚本, 见 snapshot_ab_test.go。)
+//
+// ev 是事件注入源 —— GPU 路径下 s 是 *gpu.Surface, 事件必须由**内层**平台
+// Surface 提供 (gpu.Surface 只接管 Show/ShowRegions, 事件仍走内层)。
+//
+// interactions 是到达稳定态之前要注入的交互序列 (悬停/点击), 用它们把链路
+// 逼进**局部帧 (脏矩形)** 分支 —— 全帧分支挂载那一下就走过了。
+func runAndSettle(t *testing.T, load func() (*vm.VM, error), s gfx.Surface, ev *captureSurface, interactions ...gfx.Event) {
+	t.Helper()
 	object.GlobalScheduler().ClearAll()
 	t.Cleanup(func() { object.GlobalScheduler().ClearAll() })
 
 	gfx.SetDefaultFactory(&factory{s})
 	t.Cleanup(func() { gfx.SetDefaultFactory(nil) })
 
-	v, err := vm.EvalVM(src)
+	v, err := load()
 	if err != nil {
 		t.Fatalf("EvalVM: %v", err)
 	}
