@@ -167,6 +167,10 @@ func DataViewMethod(name string) *BuiltinMethod {
 		if buf == nil || buf.Detach {
 			return NewTypeError("DataView: buffer is detached")
 		}
+		// ES2026 immutable ArrayBuffer: set 抛 TypeError (get 不受影响)。
+		if !isGet && buf.Immutable {
+			return NewTypeError("DataView.%s: buffer is immutable", name)
+		}
 		// 4. 视图大小 (length-tracking 随 resize) 与越界检查。
 		viewSize := dv.currentViewSize(buf)
 		if idx+int64(w) > int64(viewSize) {

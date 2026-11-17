@@ -6,6 +6,7 @@ import (
 	"math"
 	"math/big"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 )
@@ -65,6 +66,10 @@ type ArrayBuffer struct {
 	// MaxByteLength 为 resizable ArrayBuffer (ES2024) 的容量上限;
 	// -1 表示非 resizable。
 	MaxByteLength int
+	// Immutable 为 ES2026 immutable ArrayBuffer (transferToImmutable /
+	// sliceToImmutable 的结果): 分离操作 (transfer 系列) 与一切写入
+	// (TypedArray 元素写 / DataView set / resize) 必须抛 TypeError。
+	Immutable bool
 }
 
 func (b *ArrayBuffer) Type() ObjectType { return OBJECT_OBJ }
@@ -99,10 +104,14 @@ func (b *ArrayBuffer) GetProperty(name string) (Value, bool) {
 			if !ok {
 				buf = b
 			}
+			if buf.Immutable {
+				return NewTypeError("ArrayBuffer.prototype.resize: buffer is immutable")
+			}
 			return buf.Resize(argOr(args, 0))
 		}), true
-	case "transfer", "transferToFixedLength":
+	case "transfer", "transferToFixedLength", "transferToImmutable":
 		fixed := name == "transferToFixedLength"
+		immutable := name == "transferToImmutable"
 		return NewBuiltinMethod(name, func(this Value, args ...Value) Value {
 			buf, ok := this.(*ArrayBuffer)
 			if !ok {
@@ -112,7 +121,29 @@ func (b *ArrayBuffer) GetProperty(name string) (Value, bool) {
 			if err != nil {
 				return err
 			}
+			if immutable {
+				nb.Immutable = true
+			}
 			return nb
+		}), true
+	case "sliceToImmutable":
+		return NewBuiltin("sliceToImmutable", func(args ...Value) Value {
+			if b.Detach {
+				return NewTypeError("ArrayBuffer is detached")
+			}
+			start, end := 0, len(b.Data)
+			if len(args) > 0 {
+				start = clampByteIndex(toF64Value(args[0]), len(b.Data))
+			}
+			if len(args) > 1 && !isUndef(args[1]) {
+				end = clampByteIndex(toF64Value(args[1]), len(b.Data))
+			}
+			if end < start {
+				end = start
+			}
+			cp := make([]byte, end-start)
+			copy(cp, b.Data[start:end])
+			return &ArrayBuffer{Data: cp, MaxByteLength: -1, Immutable: true}
 		}), true
 	case "slice":
 		return NewBuiltin("slice", func(args ...Value) Value {
@@ -152,6 +183,9 @@ func (b *ArrayBuffer) Resize(lenArg Value) Value {
 	if b.Detach {
 		return NewTypeError("ArrayBuffer.prototype.resize: buffer is detached")
 	}
+	if b.Immutable {
+		return NewTypeError("ArrayBuffer.prototype.resize: buffer is immutable")
+	}
 	if b.MaxByteLength < 0 {
 		return NewTypeError("ArrayBuffer.prototype.resize: buffer is not resizable")
 	}
@@ -186,6 +220,9 @@ func (b *ArrayBuffer) DetachNow() {
 func (b *ArrayBuffer) Transfer(newLenArg Value, fixed bool) (*ArrayBuffer, *Error) {
 	if b.Detach {
 		return nil, NewTypeError("ArrayBuffer.prototype.transfer: buffer is detached")
+	}
+	if b.Immutable {
+		return nil, NewTypeError("ArrayBuffer.prototype.transfer: buffer is not detachable")
 	}
 	newByteLen := len(b.Data)
 	resizable := !fixed && b.MaxByteLength >= 0 && isUndef(newLenArg)
@@ -483,6 +520,16 @@ func (t *TypedArray) SetProperty(name string, val Value) {
 	case "length", "byteLength", "byteOffset", "buffer", "BYTES_PER_ELEMENT":
 		return
 	}
+	// 规范 [[Set]](String P): CanonicalNumericIndexString(P) 非 undefined 的键
+	// ("1" / "-0" / "-1" / "1.5" / "Infinity" / "NaN" ...) 走
+	// IntegerIndexedElementSet (越界静默跳过), 绝不落入普通属性存储
+	// (internals/Set key-is-minus-zero / key-is-out-of-bounds 家族)。
+	if f, ok := canonicalNumericIndex(name); ok {
+		if f == float64(int64(f)) && f >= 0 && f <= float64(1<<28) && !math.IsInf(f, 0) {
+			t.setElement(int(f), val)
+		}
+		return
+	}
 	if _, ok := nameIndex(name); ok {
 		if n, ok2 := nameIndex(name); ok2 {
 			t.setElement(n, val)
@@ -493,6 +540,28 @@ func (t *TypedArray) SetProperty(name string, val Value) {
 		t.Props = map[string]Value{}
 	}
 	t.Props[name] = val
+}
+
+// canonicalNumericIndex 实现 CanonicalNumericIndexString 的字符串判定:
+// "-0" → 0 (负零按 0 处理), 其余 ToNumber 后 ToString 回写一致才算数。
+func canonicalNumericIndex(name string) (float64, bool) {
+	if name == "" {
+		return 0, false
+	}
+	f, err := strconv.ParseFloat(name, 64)
+	if err != nil {
+		return 0, false
+	}
+	if name == "-0" {
+		return 0, true
+	}
+	if math.IsNaN(f) {
+		return 0, false
+	}
+	if strconv.FormatFloat(f, 'g', -1, 64) != name {
+		return 0, false
+	}
+	return f, true
 }
 
 // bytes 返回本视图当前生效的字节切片。
@@ -565,6 +634,10 @@ func (t *TypedArray) setElement(i int, val Value) {
 func (t *TypedArray) setElementE(i int, val Value) (err Value) {
 	if i < 0 || i >= t.arrLength() {
 		return nil
+	}
+	// ES2026 immutable ArrayBuffer: 任何元素写入都抛 TypeError。
+	if t.Buffer != nil && t.Buffer.Immutable {
+		return NewTypeError("Cannot write to an immutable ArrayBuffer")
 	}
 	b := t.bytes()
 	w := t.Kind.ElemSize
