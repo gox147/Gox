@@ -23,29 +23,27 @@ import (
 	"time"
 )
 
-// buildCostRuns 是成本测量的轮数: 5 轮取中位足够稳, 又不至于让 CI 多花一秒。
+// buildCostRuns 是成本测量的轮数: 5 轮取最小值足够稳, 又不至于让 CI 多花
+// 一秒。取最小值而不是中位数: 干扰 (GC/邻居负载) 只会让墙钟变大, 不会让它
+// 变小 —— 同一份代码单独跑最小值 12.8ms, 混在大套件里单轮能到 197ms。
 const buildCostRuns = 5
 
-// familyBuildLimit 是族索引建立成本的上限。
+// familyBuildSpeedup 是"并发必须比顺序快多少倍"的下限。
 //
-// 实测 (本机 EPYC 9754 / 32 vCPU / 330 文件 148MB / 342 面, n=5 中位):
+// 用**比值**而不是绝对毫秒: 绝对阈值在 CI 上不可移植 (runner 2~8 核、负载
+// 随邻居变), 而"并发化到底省了多少"是自校准的 —— 同一个进程、同一份页缓存、
+// 同一批文件, 唯一变量就是 parallelFor 的 workers。
 //
-//	顺序实现   41~45ms
-//	并发实现   13~15ms
-//
-// 取 25ms 卡在两者中间: 拦的是"退回单线程"这类结构性回退, 不拦几毫秒浮动。
-//
-// 判据取**最小值**而不是中位数: 并发建的墙钟在同一进程里会被 GC / 邻居负载
-// 抬高 (实测同一份代码, 单独跑中位 13.7ms, 混在大套件里中位能到 103ms、
-// 单轮最大 197ms), 而干扰只会让它**变大**, 不会让它变小 —— 于是"最小值"
-// 是这条路上唯一稳定的判据。顺序实现的 min 同样是 41~45ms, 两者不会混淆。
-const familyBuildLimit = 25 * time.Millisecond
+// 实测 (32 核): 顺序 41.3ms / 并发 13.8ms = 2.99x。要求 ≥ 1.33x 是留足余量:
+// 低核机器上并发收益本来就小 (2 核理论上限 2x), 但绝不该出现"并发更慢"或
+// "并发等于顺序"——那说明并发没接上 (退回单线程) 或者被自己加的锁串行化了。
+const familyBuildSpeedup = 1.33
 
 // measureFamilyIndexBuild 清空索引与字体文件缓存后重跑一次 build。
 //
 // 必须清缓存: build 的早退判据就是 ix.built, 不清等于量了个空函数 (这条
 // 陷阱在第六批的探针里踩过)。
-func measureFamilyIndexBuild() (time.Duration, int) {
+func measureFamilyIndexBuild(workers int) (time.Duration, int) {
 	familyIdx.mu.Lock()
 	familyIdx.built = false
 	familyIdx.mu.Unlock()
@@ -54,7 +52,7 @@ func measureFamilyIndexBuild() (time.Duration, int) {
 	fontFileMu.Unlock()
 
 	t0 := time.Now()
-	familyIdx.build()
+	familyIdx.buildWith(workers)
 	d := time.Since(t0)
 
 	familyIdx.mu.Lock()
@@ -63,11 +61,13 @@ func measureFamilyIndexBuild() (time.Duration, int) {
 	return d, fams
 }
 
-// TestFamilyIndexBuildCost 是族索引建立成本的闸门 (判据见 familyBuildLimit)。
+// TestFamilyIndexBuildCost 是族索引建立成本的闸门 (判据见 familyBuildSpeedup)。
 //
-// 判据用墙钟中位数: 这一批的成本是**逐面解析** (每面一遍 sfnt 的 name/post
-// 解析, 纯 CPU), 与字体库内容无关, 所以墙钟可比; 而"读了几次盘"在这条路上
-// 恒等于"文件数", 换实现也不会变, 当不了判据。
+// 量两遍: 先 workers=1 (等价于并发化之前的逐文件顺序调用), 再 workers=0
+// (自动并发)。两遍用**同一批文件、同一份页缓存**, 所以比值只反映并发本身。
+//
+// 为什么不用"绝对毫秒 ≤ N": 换台机器就假红 (第一版试过 25ms, 在 2 核 runner
+// 上必红), 而放宽到"不会假红"的毫秒数又等于不设闸门。比值没有这个问题。
 func TestFamilyIndexBuildCost(t *testing.T) {
 	if testing.Short() {
 		t.Skip("-short 下跳过 (要遍历整机字体目录)")
@@ -76,29 +76,39 @@ func TestFamilyIndexBuildCost(t *testing.T) {
 		t.Skip("Windows 上 fontScanDirs 只返回静态候选, 本探针无意义")
 	}
 	if raceDetectorEnabled {
-		t.Skip("-race 下插桩本身就让墙钟慢一个数量级 (14ms → 117ms), 成本断言无意义")
+		t.Skip("-race 下插桩让墙钟失真一个数量级, 比值断言无意义")
 	}
-	measureFamilyIndexBuild() // 预热: 目录项进页缓存, 只比解析
+	if runtime.GOMAXPROCS(0) < 4 {
+		t.Skipf("只有 %d 个可用核, 并发收益无法与噪声区分", runtime.GOMAXPROCS(0))
+	}
+	measureFamilyIndexBuild(0) // 预热: 目录项与字体页进缓��, 只比解析
 
-	xs := make([]time.Duration, 0, buildCostRuns)
+	var seqs, pars []time.Duration
 	fams := 0
 	for i := 0; i < buildCostRuns; i++ {
-		d, n := measureFamilyIndexBuild()
-		xs = append(xs, d)
+		d, n := measureFamilyIndexBuild(1) // 顺序
+		seqs = append(seqs, d)
+		fams = n
+		d, n = measureFamilyIndexBuild(0) // 并发
+		pars = append(pars, d)
 		fams = n
 	}
-	med := medianDuration(xs)
-	t.Logf("族索引建立 (n=%d): 中位=%.2fms min=%.2fms max=%.2fms 族数=%d GOMAXPROCS=%d",
-		buildCostRuns, msOf(med), msOf(minDuration(xs)), msOf(maxDuration(xs)), fams, runtime.GOMAXPROCS(0))
+	seq := minDuration(seqs)
+	par := minDuration(pars)
+	speedup := float64(seq) / float64(par)
+	t.Logf("族索引建立 (n=%d, 取最小值): 顺序=%.2fms 并发=%.2fms 加速=%.2fx 族数=%d GOMAXPROCS=%d",
+		buildCostRuns, msOf(seq), msOf(par), speedup, fams, runtime.GOMAXPROCS(0))
 
 	if fams < 50 {
 		t.Skipf("本机只认出 %d 个族 (字体库太小/为空), 成本闸门没有意义", fams)
 	}
-	best := minDuration(xs)
-	if best > familyBuildLimit {
-		t.Fatalf("族索引建立最快一轮 %.1fms 仍超过 %v 上限 (中位 %.1fms) —— 首次用 fontFamily 会白等这一笔。\n"+
-			"先看 build 是不是又退回逐文件顺序调用 (第九批改成了有界并发: 顺序 41~45ms → 并发 13~15ms,"+
-			"见 docs/performance.md §12.8)。", msOf(best), familyBuildLimit, msOf(med))
+	if seq < 5*time.Millisecond {
+		t.Skipf("顺序建索引只用 %.1fms (字体库太小), 比值会被测量误差主导", msOf(seq))
+	}
+	if speedup < familyBuildSpeedup {
+		t.Fatalf("族索引的并发只快了 %.2fx (顺序 %.1fms / 并发 %.1fms), 低于 %.2fx 的下限。\n"+
+			"多半是 build 又退回逐文件顺序调用, 或者新加的共享状态把并行串行化了 "+
+			"(见 docs/performance.md §12.8)。", speedup, msOf(seq), msOf(par), familyBuildSpeedup)
 	}
 }
 
@@ -111,7 +121,7 @@ func TestFamilyIndexParallelMatchesSerial(t *testing.T) {
 	if testing.Short() {
 		t.Skip("-short 下跳过 (要遍历整机字体目录)")
 	}
-	measureFamilyIndexBuild()
+	measureFamilyIndexBuild(0)
 	parallelDump := dumpFamilyIndex()
 
 	serial := &familyIndex{}

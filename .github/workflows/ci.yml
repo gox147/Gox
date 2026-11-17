@@ -323,6 +323,13 @@ jobs:
             echo "::error::字体栈读盘纪律被破坏 —— 扫描不该读字节, 扫描/选默认/按族名取面必须共用 fontFileCache 里同一份解析结果（见 gfx/font.go 的 fontFileEntry 注释）"
             exit 1
           fi
+          # 族索引 (T3-5 第九批): 成本用**比值**判 (并发/顺序 ≥ 1.33x), 与机器
+          # 核数无关; 同时钉住"并发不改变索引内容"。红了先看 build 是否退回
+          # 逐文件顺序调用, 见 docs/performance.md §12.8。
+          if ! go test ./gfx/ -run 'TestFamilyIndexBuildCost|TestFamilyIndexParallelMatchesSerial' -count=1 -v; then
+            echo "::error::族索引闸门被打穿 —— 首次用 fontFamily 的成本或索引内容出了回归（docs/performance.md §12.8）"
+            exit 1
+          fi
           if ! python3 scripts/check-coldstart.py --self-test; then
             echo "::error::check-coldstart.py 自测未通过 —— 闸门判据已失效, 它可能不再拦任何东西"
             exit 1

@@ -96,7 +96,14 @@ var familyIdx = &familyIndex{}
 // build 建索引 (幂等)。整段持锁: 它只在首次用到 fontFamily 时跑一次, 而
 // 查表本身是 GUI 线程上的高频操作 —— 让两者共用一把锁是最简单的正确做法
 // (分阶段加锁会引入"半建成的索引"这种中间态)。
-func (ix *familyIndex) build() {
+func (ix *familyIndex) build() { ix.buildWith(0) }
+
+// buildWith 是 build 的实现; workers <= 0 表示自动 (min(GOMAXPROCS, 16))。
+//
+// 为什么把并发度做成参数而不是常量: 成本闸门 (familyindex_cost_test.go) 要
+// 量"并发到底省了多少", 就得有一个"同一个进程、同一份页缓存、只关掉并发"的
+// 对照。用全局开关会引入"谁先设谁生效"的隐式状态, 走参数则是一次调用的属性。
+func (ix *familyIndex) buildWith(workers int) {
 	ix.mu.Lock()
 	defer ix.mu.Unlock()
 	if ix.built {
@@ -110,7 +117,7 @@ func (ix *familyIndex) build() {
 
 	paths := familyCandidatePaths()
 	results := make([][]familyFaceEntry, len(paths))
-	parallelFor(len(paths), func(i int) {
+	parallelFor(len(paths), workers, func(i int) {
 		results[i] = scanFamilyFaceEntries(paths[i])
 	})
 	for i, p := range paths {
@@ -165,15 +172,20 @@ func familyCandidatePaths() []string {
 	return out
 }
 
-func parallelFor(n int, fn func(i int)) {
+func parallelFor(n, want int, fn func(i int)) {
 	if n <= 0 {
 		return
 	}
-	if n == 1 {
-		fn(0)
+	if want <= 0 {
+		want = min(runtime.GOMAXPROCS(0), 16)
+	}
+	workers := min(want, n)
+	if workers <= 1 {
+		for i := 0; i < n; i++ {
+			fn(i)
+		}
 		return
 	}
-	workers := min(min(runtime.GOMAXPROCS(0), 16), n)
 	var (
 		wg   sync.WaitGroup
 		next atomic.Int64
