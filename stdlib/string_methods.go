@@ -493,7 +493,7 @@ func setupStringProto() *object.Object {
 
 		// 正则分隔符
 		if re, isRe := args[0].(*object.RegExp); isRe {
-			parts := re.Regexp.Split(s.Value, limit)
+			parts := re.Split(s.Value, limit)
 			elements := make([]object.Value, len(parts))
 			for i, part := range parts {
 				elements[i] = object.NewString(part)
@@ -826,13 +826,13 @@ func setupStringProto() *object.Object {
 			if object.IsCallable(args[1]) {
 				fn := args[1]
 				if re.Global {
-					result := re.Regexp.ReplaceAllStringFunc(s.Value, func(match string) string {
+					result := re.ReplaceAllStringFunc(s.Value, func(match string) string {
 						r := object.CallFunction(fn, object.UndefinedSingleton, object.NewString(match))
 						return toStr(r)
 					})
 					return object.NewString(result)
 				}
-				loc := re.Regexp.FindStringIndex(s.Value)
+				loc := re.FindStringIndex(s.Value)
 				if loc == nil {
 					return s
 				}
@@ -849,7 +849,7 @@ func setupStringProto() *object.Object {
 			replacement := rpl.Value
 			// 字符串替换: 展开 $1/$2/$&/$$ 捕获组
 			if re.Global {
-				locs := re.Regexp.FindAllStringSubmatchIndex(s.Value, -1)
+				locs := re.FindAllStringSubmatchIndex(s.Value, -1)
 				if locs == nil {
 					return s
 				}
@@ -859,18 +859,18 @@ func setupStringProto() *object.Object {
 					sb.WriteString(s.Value[lastEnd:loc[0]])
 					matchStr := s.Value[loc[0]:loc[1]]
 					sb.WriteString(expandReplacement(replacement, matchStr,
-						submatchGroups(s.Value, loc), namedGroupsOfSubexp(re.Regexp.SubexpNames(), s.Value, loc)))
+						submatchGroups(s.Value, loc), namedGroupsOfSubexp(re.SubexpNames(), s.Value, loc)))
 					lastEnd = loc[1]
 				}
 				sb.WriteString(s.Value[lastEnd:])
 				return object.NewString(sb.String())
 			}
-			loc := re.Regexp.FindStringSubmatchIndex(s.Value)
+			loc := re.FindStringSubmatchIndex(s.Value)
 			if loc == nil {
 				return s
 			}
 			replacementStr := expandReplacement(replacement,
-				s.Value[loc[0]:loc[1]], submatchGroups(s.Value, loc), namedGroupsOfSubexp(re.Regexp.SubexpNames(), s.Value, loc))
+				s.Value[loc[0]:loc[1]], submatchGroups(s.Value, loc), namedGroupsOfSubexp(re.SubexpNames(), s.Value, loc))
 			return object.NewString(s.Value[:loc[0]] + replacementStr + s.Value[loc[1]:])
 		}
 
@@ -963,13 +963,13 @@ func setupStringProto() *object.Object {
 			replacement := toStr(args[1])
 			if object.IsCallable(args[1]) {
 				fn := args[1]
-				result := re.Regexp.ReplaceAllStringFunc(s.Value, func(match string) string {
+				result := re.ReplaceAllStringFunc(s.Value, func(match string) string {
 					r := object.CallFunction(fn, object.UndefinedSingleton, object.NewString(match))
 					return toStr(r)
 				})
 				return object.NewString(result)
 			}
-			result := re.Regexp.ReplaceAllStringFunc(s.Value, func(match string) string {
+			result := re.ReplaceAllStringFunc(s.Value, func(match string) string {
 				return expandReplacement(replacement, match, []string{}, nil)
 			})
 			return object.NewString(result)
@@ -1230,7 +1230,7 @@ func setupStringProto() *object.Object {
 			return errVal
 		}
 		if re.Global {
-			matches := re.Regexp.FindAllString(s.Value, -1)
+			matches := re.FindAllString(s.Value, -1)
 			if matches == nil {
 				return object.NullSingleton
 			}
@@ -1241,7 +1241,7 @@ func setupStringProto() *object.Object {
 			return object.NewArray(result)
 		}
 
-		loc := re.Regexp.FindStringSubmatchIndex(s.Value)
+		loc := re.FindStringSubmatchIndex(s.Value)
 		if loc == nil {
 			return object.NullSingleton
 		}
@@ -1254,7 +1254,7 @@ func setupStringProto() *object.Object {
 		arr.SetProperty("index", object.NewNumber(float64(loc[0])))
 		arr.SetProperty("input", object.NewString(s.Value))
 		// 命名捕获组 .groups (参与的组为匹配串, 未参与的组为 undefined)
-		names := re.Regexp.SubexpNames()
+		names := re.SubexpNames()
 		hasNamed := false
 		for _, n := range names {
 			if n != "" {
@@ -1307,7 +1307,7 @@ func setupStringProto() *object.Object {
 			return object.NewErrorWithName("TypeError",
 				"String.prototype.matchAll called with a non-global RegExp argument")
 		}
-		allMatches := re.Regexp.FindAllStringSubmatchIndex(s.Value, -1)
+		allMatches := re.FindAllStringSubmatchIndex(s.Value, -1)
 		if allMatches == nil {
 			return object.NewArray([]object.Value{})
 		}
@@ -1322,7 +1322,7 @@ func setupStringProto() *object.Object {
 			arr.SetProperty("index", object.NewNumber(float64(loc[0])))
 			arr.SetProperty("input", object.NewString(s.Value))
 			// 命名捕获组 .groups
-			subNames := re.Regexp.SubexpNames()
+			subNames := re.SubexpNames()
 			hasNamed2 := false
 			for _, n := range subNames {
 				if n != "" {
@@ -1372,7 +1372,7 @@ func setupStringProto() *object.Object {
 		if errVal != nil {
 			return errVal
 		}
-		loc := re.Regexp.FindStringIndex(s.Value)
+		loc := re.FindStringIndex(s.Value)
 		if loc == nil {
 			return object.NewNumber(-1)
 		}

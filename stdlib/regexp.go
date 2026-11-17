@@ -164,7 +164,7 @@ func regExpBuiltinExec(re *object.RegExp, input string) object.Value {
 	}
 
 	searchStr := input[lastIndex:]
-	loc := re.Regexp.FindStringSubmatchIndex(searchStr)
+	loc := re.FindStringSubmatchIndex(searchStr)
 	if loc == nil {
 		if re.Global || re.Sticky {
 			if !re.SetLastIndexStrict(0) {
@@ -202,7 +202,7 @@ func regExpBuiltinExec(re *object.RegExp, input string) object.Value {
 	// 参与的组为匹配到的字符串, 未参与的组为 undefined (规范
 	// RegExpBuiltinExec 步骤 20-23)。Go RE2 自 1.22 起原生接受 (?<name>…)
 	// 语法, SubexpNames() 与 loc 的组序号 1:1 对齐 (下标 0 为整匹配)。
-	names := re.Regexp.SubexpNames()
+	names := re.SubexpNames()
 	hasNamed := false
 	for _, n := range names {
 		if n != "" {
@@ -388,7 +388,7 @@ func setupRegExpProto() *object.Object {
 
 		// 非全局/非粘性: 与 lastIndex 无关，也不修改它
 		if !re.Global && !re.Sticky {
-			return object.NewBoolean(re.Regexp.MatchString(input))
+			return object.NewBoolean(re.MatchString(input))
 		}
 
 		if re.LastIndex < 0 {
@@ -399,7 +399,7 @@ func setupRegExpProto() *object.Object {
 			return object.NewBoolean(false)
 		}
 
-		loc := re.Regexp.FindStringIndex(input[re.LastIndex:])
+		loc := re.FindStringIndex(input[re.LastIndex:])
 		if loc == nil {
 			re.LastIndex = 0
 			return object.NewBoolean(false)
@@ -549,7 +549,7 @@ func setupRegExpProto() *object.Object {
 			limit = int(toFloat(args[1]))
 		}
 
-		parts := re.Regexp.Split(input, limit)
+		parts := re.Split(input, limit)
 		result := make([]object.Value, len(parts))
 		for i, part := range parts {
 			result[i] = object.NewString(part)

@@ -19,19 +19,19 @@ import "testing"
 func TestRegExpUnicodeEscapeTranslate(t *testing.T) {
 	cases := []struct {
 		pat, flags string
-		wantExpr  string // 编译后的 Go 正则文本 (regexp.String())
+		wantExpr   string // 编译后的 Go 正则文本 (regexp.String())
 	}{
 		{`[\u4e00-\u9fa5]`, "", `[\x{4e00}-\x{9fa5}]`},
 		{`\u4e00`, "", `\x{4e00}`},
 		{`\u0041`, "", `\x{0041}`},
 		{`[\u4e00-\u9fa5]+`, "", `[\x{4e00}-\x{9fa5}]+`},
-		{`\\u0041`, "", `\\u0041`},       // 转义反斜杠: 不动
-		{`[a-z]`, "", `[a-z]`},           // 无 \u: 整串不拷贝 (快路径)
-		{`\u{2}`, "", `u{2}`},            // 无 u 标志: IdentityEscape + 量词
-		{`\uz`, "", `uz`},                // 无 u 标志: 畸形 → 字面 u
-		{`\u{1F600}`, "", `u{1F600}`},    // 无 u 标志: 字面
-		{`\u{1F600}`, "u", `\x{1F600}`},  // u 标志: 码点
-		{`\u{d800}`, "u", `\x{d800}`},    // u 标志: 孤立代理也合法 (与 Node 一致)
+		{`\\u0041`, "", `\\u0041`},      // 转义反斜杠: 不动
+		{`[a-z]`, "", `[a-z]`},          // 无 \u: 整串不拷贝 (快路径)
+		{`\u{2}`, "", `u{2}`},           // 无 u 标志: IdentityEscape + 量词
+		{`\uz`, "", `uz`},               // 无 u 标志: 畸形 → 字面 u
+		{`\u{1F600}`, "", `u{1F600}`},   // 无 u 标志: 字面
+		{`\u{1F600}`, "u", `\x{1F600}`}, // u 标志: 码点
+		{`\u{d800}`, "u", `\x{d800}`},   // u 标志: 孤立代理也合法 (与 Node 一致)
 	}
 	for _, tc := range cases {
 		re, err := NewRegExp(tc.pat, tc.flags)
@@ -51,16 +51,16 @@ func TestRegExpUnicodeEscapeMatch(t *testing.T) {
 		pat, flags, input string
 		want              bool
 	}{
-		{`[\u4e00-\u9fa5]`, "", "中", true},          // CJK 判定 (本修的动机)
+		{`[\u4e00-\u9fa5]`, "", "中", true}, // CJK 判定 (本修的动机)
 		{`[\u4e00-\u9fa5]`, "", "A", false},
 		{`[\u4e00-\u9fa5]`, "", "hello 世界", true},
 		{`\u4e00`, "", "一", true},
-		{`\u{1F600}`, "u", "\U0001F600", true},       // u 标志按码点
-		{`\u{2}`, "", "uu", true},                    // 无 u 标志: u + 量词
+		{`\u{1F600}`, "u", "\U0001F600", true}, // u 标志按码点
+		{`\u{2}`, "", "uu", true},              // 无 u 标志: u + 量词
 		{`\u{2}`, "", "u{2}", false},
-		{`\u{1F600}`, "", "u{1F600}", true},          // 无 u 标志: 字面
+		{`\u{1F600}`, "", "u{1F600}", true}, // 无 u 标志: 字面
 		{`\u{1F600}`, "", "\U0001F600", false},
-		{`\\u0041`, "", `\u0041`, true},              // 字面反斜杠+u
+		{`\\u0041`, "", `\u0041`, true}, // 字面反斜杠+u
 		{`[\u4e00-\u9fa5]+`, "", "中文", true},
 	}
 	for _, tc := range cases {

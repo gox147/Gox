@@ -8,6 +8,8 @@ import (
 	"strings"
 	"sync"
 	"unicode"
+
+	"github.com/dlclark/regexp2"
 )
 
 // RegExp 表示 JavaScript 的正则表达式对象。
@@ -19,17 +21,18 @@ import (
 // TypeError。此前 lastIndex 只是裸结构体字段, 无从表达「不可写」, 于是
 // 这 8 个用例全是假阳性通过 (详见 stdlib/regexp.go 的注释与 rEXjyz)。
 type RegExp struct {
-	Pattern     string         // 原始正则表达式模式
-	Flags       string         // 标志位 (g, i, m, s, u, y)
-	Regexp      *regexp.Regexp // Go 编译后的正则
-	Global      bool           // g 标志
-	IgnoreCase  bool           // i 标志
-	Multiline   bool           // m 标志
-	DotAll      bool           // s 标志
-	Sticky      bool           // y 标志 (粘性匹配)
-	Unicode     bool           // u 标志
-	UnicodeSets bool           // v 标志 (unicodeSets, ES2024; 与 u 互斥)
-	HasIndices  bool           // d 标志 (匹配位置索引)
+	Pattern     string          // 原始正则表达式模式
+	Flags       string          // 标志位 (g, i, m, s, u, y)
+	Regexp      *regexp.Regexp  // Go 编译后的正则
+	Regexp2     *regexp2.Regexp // 降级引擎（RE2 编译失败才启用，见 regexp_fallback.go）
+	Global      bool            // g 标志
+	IgnoreCase  bool            // i 标志
+	Multiline   bool            // m 标志
+	DotAll      bool            // s 标志
+	Sticky      bool            // y 标志 (粘性匹配)
+	Unicode     bool            // u 标志
+	UnicodeSets bool            // v 标志 (unicodeSets, ES2024; 与 u 互斥)
+	HasIndices  bool            // d 标志 (匹配位置索引)
 	mu          sync.Mutex
 	LastIndex   int // 上次匹配位置 (g/y 标志使用)
 
@@ -299,6 +302,20 @@ func NewRegExp(pattern, flags string) (*RegExp, error) {
 		return nil, fmt.Errorf("SyntaxError: Invalid regular expression: %s: invalid flags", pattern)
 	}
 
+	// lookbehind 不可量词化早错误 (rvDg77 补充): (?<=…)? 等 .NET 会放行。
+	if err := checkLookbehindNotQuantifiable(pattern); err != nil {
+		return nil, fmt.Errorf("SyntaxError: Invalid regular expression: %s", pattern)
+	}
+
+	// 组名早错误 + 组名转义解码 (rvDg77): 必须在两条引擎路径之前统一做 ——
+	// RE2 会放行 (?<$> 这类非法名, .NET 拒绝名字里的 \uXXXX 转义形态。
+	cleaned, gerr := preprocessGroupNames(pattern)
+	if gerr != nil {
+		return nil, fmt.Errorf("SyntaxError: Invalid regular expression: %s: Invalid capture group name", pattern)
+	}
+	pattern = cleaned
+	r.Pattern = pattern
+
 	// regexp-modifiers (ES2025) 组头早错误校验: (?mods-removed:...)。
 	// 规则: 修饰符只能是 dimgsvy（g/u 不可作内联修饰符），添加/移除集合
 	// 各自不得重复、二者不得重叠。(?s-s:a) 这类必须 SyntaxError。
@@ -311,7 +328,18 @@ func NewRegExp(pattern, flags string) (*RegExp, error) {
 	goPattern := jsToGoRegex(pattern, r.IgnoreCase, r.Multiline, r.DotAll, r.Unicode, r.UnicodeSets)
 	re, err := regexp.Compile(goPattern)
 	if err != nil {
-		return nil, fmt.Errorf("SyntaxError: Invalid regular expression: %s", pattern)
+		// T2 根因单 rvDg77: RE2 无回溯, lookbehind / \k<name> / \1 / (?i-:…)
+		// 一律编译失败。用 regexp2 降级重试 —— 只有原本必败的模式才走到这,
+		// RE2 主路径行为不变 (零退潮是结构保证)。
+		if !hasFallbackTrigger(pattern, r) {
+			return nil, fmt.Errorf("SyntaxError: Invalid regular expression: %s", pattern)
+		}
+		re2, ferr := compileFallback(pattern, r)
+		if ferr != nil {
+			return nil, fmt.Errorf("SyntaxError: Invalid regular expression: %s", pattern)
+		}
+		r.Regexp2 = re2
+		return r, nil
 	}
 	r.Regexp = re
 	return r, nil
@@ -1263,6 +1291,12 @@ func checkModifiersGroup(pattern string) error {
 				if k := bytes.IndexByte(header, '-'); k >= 0 {
 					add, rm = string(header[:k]), string(header[k+1:])
 				}
+				if add == "" && rm == "" && bytes.ContainsRune(header, '-') {
+					// (?-:) 有 '-' 但两集合全空: 规范要求至少一个修饰符
+					// (test262 syntax-err-arithmetic-modifiers-both-empty)。
+					// 注意排除 (?:) 非捕获组 —— header 为空但无 '-'。
+					return fmt.Errorf("empty modifiers")
+				}
 				seen := map[byte]bool{}
 				for _, c := range []byte(add) {
 					if !isModifierFlag(c) {
@@ -1294,8 +1328,11 @@ func checkModifiersGroup(pattern string) error {
 }
 
 func isModifierFlag(c byte) bool {
+	// ES2025 regexp-modifiers 定稿口径: 内联修饰符只有 i / m / s
+	// (g/u 从不内联; d/v/y 是独立标志不是内联修饰符 —— test262
+	// early-err-modifiers-other-code-point-{d,y,v} 全部要求 SyntaxError)。
 	switch c {
-	case 'd', 'i', 'm', 's', 'v', 'y':
+	case 'i', 'm', 's':
 		return true
 	}
 	return false
