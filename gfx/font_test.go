@@ -172,12 +172,19 @@ func firstUsableFontPath(t *testing.T) string {
 	return ""
 }
 
-// TestScanSystemFontsPrefersCJKAndSkipsGarbage 扫描要: ① 只收真能解析的字体;
+// TestScanSystemFontsPrefersCJKAndSkipsNonFontExt 扫描要: ① 只收字体扩展名;
 // ② CJK 字体排在拉丁字体之前。
 //
 // ② 的理由: 拉丁字体同样能正常解析加载, 只是中文全画成豆腐块 —— 那比"完全
 // 不出字"更难排查, 所以宁可让"看起来能覆盖中文"的字体先被选中。
-func TestScanSystemFontsPrefersCJKAndSkipsGarbage(t *testing.T) {
+//
+// ①的**口径在 T3-5 第六批变了**: 扫描不再试解析文件来判断"是不是真字体"
+// (那要读完整份字节, 本机 330 个文件 / 148MB ≈ 50ms), 只按扩展名收集候选。
+// 真伪由 chooseBaseFont / fontFromSrc 在**真正要用**时判定, 见
+// TestScanSystemFontsDoesNotReadFontBytes 与 font.go 的 scanSystemFonts 注释。
+// 于是"垃圾 .ttf"会进候选表 —— 这不是退化: 它最多让首个候选解析失败一次,
+// 而不会选错字体 (判面看真实子族名, 不看文件名)。
+func TestScanSystemFontsPrefersCJKAndSkipsNonFontExt(t *testing.T) {
 	data, err := os.ReadFile(firstUsableFontPath(t))
 	if err != nil {
 		t.Fatalf("读取字体样本: %v", err)
@@ -195,27 +202,27 @@ func TestScanSystemFontsPrefersCJKAndSkipsGarbage(t *testing.T) {
 	write("README.txt", data) // 非字体扩展名
 
 	got := scanSystemFonts([]string{dir}, 100)
-	if len(got) != 2 {
-		t.Fatalf("扫描结果 = %v, 期望恰好 2 个真字体 (垃圾 .ttf 与非字体扩展名都要跳过)", got)
+	if len(got) != 3 {
+		t.Fatalf("扫描结果 = %v, 期望 3 个字体扩展名条目 (非字体扩展名必须跳过, 真伪留给使用方)", got)
 	}
 	if !looksCJK(filepath.Base(got[0])) {
 		t.Fatalf("CJK 字体应排在首位, 实际首个是 %s (完整结果 %v)", filepath.Base(got[0]), got)
 	}
-	if filepath.Base(got[1]) != "DejaVuSans.ttf" {
-		t.Fatalf("非 CJK 字体应排在后面, 实际 %v", got)
+	for _, name := range []string{"DejaVuSans.ttf", "Broken.ttf"} {
+		if !containsString(got, filepath.Join(dir, name)) {
+			t.Errorf("候选里应含 %s (同一分组内保持目录序), 实际 %v", name, got)
+		}
+	}
+	if containsString(got, filepath.Join(dir, "README.txt")) {
+		t.Errorf("非字体扩展名不该进候选, 实际 %v", got)
 	}
 }
 
 // TestScanSystemFontsRespectsLimit 条目上限必须真的生效。
 //
-// 观测方式刻意做成"结果差异"而不是"没卡住": 把 20 个垃圾文件排在真字体之前
-// (ReadDir 按文件名排序), 上限 5 时扫不到真字体, 上限足够时扫得到 —— 只有
-// 上限被真正执行, 才会出现这个区别。
+// 观测方式: 上限直接决定返回的候选条数 (扫描不再解析, "跳过垃圾"这条旧观测
+// 手段随之失效 —— 上限的语义本来就是"最多访问多少条目", 直接数条目更贴近它)。
 func TestScanSystemFontsRespectsLimit(t *testing.T) {
-	data, err := os.ReadFile(firstUsableFontPath(t))
-	if err != nil {
-		t.Fatalf("读取字体样本: %v", err)
-	}
 	dir := t.TempDir()
 	for i := 0; i < 20; i++ {
 		name := filepath.Join(dir, fmt.Sprintf("a%02d.ttf", i))
@@ -223,15 +230,15 @@ func TestScanSystemFontsRespectsLimit(t *testing.T) {
 			t.Fatalf("写垃圾文件 %s: %v", name, err)
 		}
 	}
-	if err := os.WriteFile(filepath.Join(dir, "zzz_real.ttf"), data, 0o644); err != nil {
-		t.Fatalf("写真字体: %v", err)
+	if err := os.WriteFile(filepath.Join(dir, "zzz_real.ttf"), []byte("junk"), 0o644); err != nil {
+		t.Fatalf("写尾部文件: %v", err)
 	}
 
-	if got := scanSystemFonts([]string{dir}, 5); len(got) != 0 {
-		t.Fatalf("上限 5 时不该扫到排在第 21 位的真字体, 实际 %v", got)
+	if got := scanSystemFonts([]string{dir}, 5); len(got) != 5 {
+		t.Fatalf("上限 5 时应收 5 个条目, 实际 %d (%v)", len(got), got)
 	}
-	if got := scanSystemFonts([]string{dir}, 1000); len(got) != 1 {
-		t.Fatalf("上限足够时应恰好扫到那一个真字体, 实际 %v", got)
+	if got := scanSystemFonts([]string{dir}, 1000); len(got) != 21 {
+		t.Fatalf("上限足够时应收全部 21 个条目, 实际 %d (%v)", len(got), got)
 	}
 }
 

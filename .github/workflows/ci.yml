@@ -304,20 +304,23 @@ jobs:
           exit "$rc"
 
       # ── 冷启动闸门（T3-5）──────────────────────────────────────────────────
-      # 为什么单独一步而不是塞进 go test：第一步是两个**不用跑基准**的守卫 ——
+      # 为什么单独一步而不是塞进 go test：第一步是三个**不用跑基准**的守卫 ——
       #   ① 字体文件"一次启动只读一次盘"的断言（纯逻辑, 毫秒级）；
-      #   ② check-coldstart.py 的自测（判据本身坏了要先知道, 与 check-bench
-      #   同一纪律）。这两条一红就是实现/判据坏了, 与机器负载无关。
+      #   ② 目录扫描"一个字体字节都不读"的断言（同上；它守的是 T3-5 第六批
+      #     把 148MB 读盘从启动路径上摘掉的成果, 一旦有人把 parseFontFile 加回
+      #     扫描循环就会红）；
+      #   ③ check-coldstart.py 的自测（判据本身坏了要先知道, 与 check-bench
+      #   同一纪律）。这三条一红就是实现/判据坏了, 与机器负载无关。
       # 第二步才跑分阶段探针并过闸门：它依赖字体目录规模（runner 上装了
       #   fonts-noto-cjk，与我们刷基线时的组织方式一致），所以阈值按比值判；
       #   换了 runner 镜像导致绝对值漂移时, 用 --update-baseline 重新固化。
-      - name: 冷启动闸门（字体只读一次 + 闸门自测 + 分阶段扫描成本）
+      - name: 冷启动闸门（字体只读一次 + 扫描不读字节 + 闸门自测 + 分阶段扫描成本）
         if: runner.os == 'Linux'
         run: |
           set -euo pipefail
           sudo apt-get install -yq fonts-noto-cjk
-          if ! go test ./gfx/ -run 'TestFontFileReadOnceAcrossScanAndChoose|TestFontFileReadHookIsLive|TestFontFileCacheHonoursFileIdentity' -count=1; then
-            echo "::error::字体文件被重复读盘 —— 扫描/选默认字体/按族名取面 必须共用 fontFileCache 里的同一份解析结果（见 gfx/font.go 的 fontFileEntry 注释）"
+          if ! go test ./gfx/ -run 'TestFontFileReadOnceAcrossScanAndChoose|TestScanSystemFontsDoesNotReadFontBytes|TestFontFileReadHookIsLive|TestFontFileCacheHonoursFileIdentity' -count=1; then
+            echo "::error::字体栈读盘纪律被破坏 —— 扫描不该读字节, 扫描/选默认/按族名取面必须共用 fontFileCache 里同一份解析结果（见 gfx/font.go 的 fontFileEntry 注释）"
             exit 1
           fi
           if ! python3 scripts/check-coldstart.py --self-test; then

@@ -37,9 +37,13 @@ import (
 
 // fontStageRun 是一次分阶段测量的结果 (单位: 毫秒)。
 type fontStageRun struct {
-	ScanMs   float64 `json:"scan_ms"`
-	ChooseMs float64 `json:"choose_ms"`
-	Files    int     `json:"scanned_files"`
+	ScanMs    float64 `json:"scan_ms"`
+	ChooseMs  float64 `json:"choose_ms"`
+	Files     int     `json:"scanned_files"`
+	ScanReads int     `json:"scan_reads"`
+	// ChooseReads 是"选默认字体"阶段真读盘的文件数。它是"扫描只收集候选"
+	// 的直接后果: 扫描 0 次, 选默认 1~2 次 —— 一次启动只读真正要用的那份字体。
+	ChooseReads int `json:"choose_reads"`
 }
 
 // resetFontStageCaches 把字体子系统恢复到"本次启动刚开始"的状态。
@@ -71,17 +75,26 @@ func TestColdstartFontStage(t *testing.T) {
 
 	measure := func() fontStageRun {
 		resetFontStageCaches()
+		// 钩子按阶段切换计数对象: 扫描/选默认各自一个计数。
+		scanReads, chooseReads := 0, 0
+		phase := &scanReads
+		fontReadHook = func(path string) { *phase++ }
+		defer func() { fontReadHook = nil }()
+
 		t0 := time.Now()
 		initFontCandidates()
 		tScan := time.Now()
+		phase = &chooseReads
 		if _, err := chooseBaseFont(fontCandidates); err != nil {
 			t.Fatalf("chooseBaseFont: %v", err)
 		}
 		tChoose := time.Now()
 		return fontStageRun{
-			ScanMs:   float64(tScan.Sub(t0)) / float64(time.Millisecond),
-			ChooseMs: float64(tChoose.Sub(tScan)) / float64(time.Millisecond),
-			Files:    len(scannedFonts),
+			ScanMs:      float64(tScan.Sub(t0)) / float64(time.Millisecond),
+			ChooseMs:    float64(tChoose.Sub(tScan)) / float64(time.Millisecond),
+			Files:       len(scannedFonts),
+			ScanReads:   scanReads,
+			ChooseReads: chooseReads,
 		}
 	}
 
@@ -89,13 +102,14 @@ func TestColdstartFontStage(t *testing.T) {
 	runs := make([]fontStageRun, 0, reps)
 	for i := 0; i < reps; i++ {
 		r := measure()
-		t.Logf("[第 %d/%d 次] 扫描=%.2fms 选默认=%.2fms 文件=%d", i+1, reps, r.ScanMs, r.ChooseMs, r.Files)
+		t.Logf("[第 %d/%d 次] 扫描=%.2fms(读盘%d) 选默认=%.2fms(读盘%d) 文件=%d",
+			i+1, reps, r.ScanMs, r.ScanReads, r.ChooseMs, r.ChooseReads, r.Files)
 		runs = append(runs, r)
 	}
 	scanMed := medianOf(runs, func(r fontStageRun) float64 { return r.ScanMs })
 	chooseMed := medianOf(runs, func(r fontStageRun) float64 { return r.ChooseMs })
-	t.Logf("字体冷启动分阶段 (中位, n=%d): 扫描=%.2fms 选默认=%.2fms 合计=%.2fms 文件=%d",
-		reps, scanMed, chooseMed, scanMed+chooseMed, runs[0].Files)
+	t.Logf("字体冷启动分阶段 (中位, n=%d): 扫描=%.2fms 选默认=%.2fms 合计=%.2fms 文件=%d 扫描读盘=%d 选默认读盘=%d",
+		reps, scanMed, chooseMed, scanMed+chooseMed, runs[0].Files, runs[0].ScanReads, runs[0].ChooseReads)
 
 	dir := filepath.Join("..", "bench-results")
 	if err := os.MkdirAll(dir, 0o755); err != nil {
@@ -113,16 +127,20 @@ func TestColdstartFontStage(t *testing.T) {
 			"total_ms":  scanMed + chooseMed,
 		},
 		"scanned_files": runs[0].Files,
-		"all_runs":      runs,
+		"scan_reads":     runs[0].ScanReads,
+		"choose_reads":   runs[0].ChooseReads,
+		"all_runs":       runs,
 		"host": map[string]any{
 			"platform": runtime.GOOS + "/" + runtime.GOARCH,
 			"cores":    runtime.NumCPU(),
 			"go":       runtime.Version(),
 		},
 		"metric_defs": map[string]string{
-			"phases_ms.scan_ms":   "scanSystemFonts: 遍历 fontScanDirs() 并逐个试解析字体文件 (每文件只解正体面, 文件级缓存已重置)",
-			"phases_ms.choose_ms": "chooseBaseFont: 在候选表里挑首个正体面 (扫描结果在前; 命中文件级缓存, 只 stat)",
-			"scanned_files":       "扫描判定为可解析的字体文件数",
+			"phases_ms.scan_ms":   "scanSystemFonts: 遍历 fontScanDirs() 收集候选 (.ttf/.otf/.ttc/.otc), 按 CJK 分组 (T3-5 第六批起不解析文件, 只读目录)",
+			"phases_ms.choose_ms": "chooseBaseFont: 在候选表里挑首个正体面 (只解析到首个正体为止)",
+			"scanned_files":       "扫描收集到的候选文件数",
+			"scan_reads":          "扫描阶段真读盘的文件数 (T3-5 第六批起恒为 0)",
+			"choose_reads":        "选默认字体阶段真读盘的文件数 (典型 1~2: 坏候选 + 首个正体)",
 		},
 		"note": "进程内分阶段口径, 首次用字体时发生; 与进程级 (scripts/coldstart.sh) 和进程内首帧 (tools/perf) 均不可混用",
 	}); err != nil {

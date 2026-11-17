@@ -99,6 +99,87 @@ func TestFontFileReadOnceAcrossScanAndChoose(t *testing.T) {
 	}
 }
 
+// TestScanSystemFontsDoesNotReadFontBytes 是 T3-5 第六批的闸门:
+// **目录扫描阶段一次字体字节都不该读**。
+//
+// 为什么单列一条而不是只靠耗时: 扫描要不要读盘, 是一个"是/否"的事实, 与机器
+// 上有多少字体、页缓存热不热、CPU 忙不忙都无关。2026-11-17 夜批实测, 扫描在
+// 本机要读 330 个文件 / 148MB ≈ 50ms —— 而这 148MB 换来的信息只有"这文件是
+// 不是真字体 + 第一个正体面是谁", 且**只有第一个候选会真的被用上**。为了
+// 300 个永远不会被渲染的字体付 148MB 读盘, 是冷启动里最大的一笔冤枉钱。
+//
+// 判据两条:
+//  1. 扫描期间读盘字节数 == 0 (真伪与字重判定推迟到首次使用时);
+//  2. 扫描之后 chooseBaseFont 仍能选到真字体 —— 目录里混着"改了扩展名的
+//     非字体文件"时, 首个候选解析失败必须能继续往下试, 而不是整屏无字。
+func TestScanSystemFontsDoesNotReadFontBytes(t *testing.T) {
+	data, err := os.ReadFile(firstUsableFontPath(t))
+	if err != nil {
+		t.Fatalf("读取字体样本: %v", err)
+	}
+	dir := t.TempDir()
+	for _, name := range []string{"DejaVuSans.ttf", "NotoSansCJK-Regular.ttf", "a_first.ttf"} {
+		if err := os.WriteFile(filepath.Join(dir, name), data, 0o644); err != nil {
+			t.Fatalf("写样本 %s: %v", name, err)
+		}
+	}
+	// 名字排在 CJK 组最前, 且内容不是字体: 用来证明"扫描不判真伪"之后,
+	// 选默认字体的回退路径仍然把坏候选跳过去。
+	broken := filepath.Join(dir, "NotoSansCJK-0broken.ttf")
+	if err := os.WriteFile(broken, []byte("not a font at all"), 0o644); err != nil {
+		t.Fatalf("写坏样本: %v", err)
+	}
+
+	resetFontStageCaches()
+	t.Cleanup(resetFontStageCaches)
+
+	var reads int
+	perPath := map[string]int{}
+	fontFileMu.Lock()
+	fontFileCache = map[string]*fontFileEntry{}
+	fontFileMu.Unlock()
+	fontReadHook = func(path string) {
+		if filepath.Dir(path) != dir {
+			return
+		}
+		reads++
+		perPath[filepath.Base(path)]++
+	}
+	t.Cleanup(func() { fontReadHook = nil })
+
+	got := scanSystemFonts([]string{dir}, 100)
+	if reads != 0 {
+		t.Errorf("扫描阶段读了 %d 次盘, 期望 0 —— 扫描只按扩展名收集候选, 真伪与字重留给首次使用时判定", reads)
+	}
+	// 坏样本也在候选里: 扫描不替调用方做判定, 这是有意的口径(见上)。
+	if len(got) != 4 {
+		t.Fatalf("候选数 = %d (%v), 期望 4 个 .ttf 条目", len(got), got)
+	}
+	if filepath.Base(got[0]) != "NotoSansCJK-0broken.ttf" {
+		t.Errorf("首个候选 = %s, 期望 CJK 组按目录序排在最前", filepath.Base(got[0]))
+	}
+
+	f, err := chooseBaseFont(got)
+	if err != nil {
+		t.Fatalf("chooseBaseFont: %v —— 坏候选必须能跳过", err)
+	}
+	if f == nil {
+		t.Fatal("chooseBaseFont 返回 nil")
+	}
+	// 样本是同一个字体的副本 (字重都"不正经"), 所以 chooseBaseFont 会一路试到
+	// 最后一个候选才兜底返回首个可解析者 —— 这是设计行为。这里守的是**不重复**:
+	// 每个候选最多读一次, 坏样本排除在外。
+	for name, n := range perPath {
+		if n > 1 {
+			t.Errorf("%s 在选默认字体阶段被读了 %d 次, 期望 ≤1", name, n)
+		}
+	}
+	if perPath["NotoSansCJK-0broken.ttf"] != 1 {
+		t.Errorf("坏样本读盘次数 = %d, 期望 1 (它必须真的被试过, 否则这条断言没验证回退)",
+			perPath["NotoSansCJK-0broken.ttf"])
+	}
+}
+
 // TestFontFileReadHookIsLive 是上面那条断言的反向校验: 故意绕过缓存再读一次,
 // 计数必须变成 2 —— 一个从没失败过的断言等于没有断言。
 func TestFontFileReadHookIsLive(t *testing.T) {
