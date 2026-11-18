@@ -236,3 +236,23 @@ wgpu 初始化失败）回退 CPU blit 时，`contents` 路径在 CAMetalLayer �
 口径）：26/26 子用例差异像素 **0**，套件总耗时 ~0.25s，连跑 5 次 +
 `./gfx/...` 全包回归零失败。帧率/上屏耗时基准进 CI（与 T3-2 共用口径）
 与「无硬件 runner 跳过性能断言」属 G-4 后续项，本次未动。
+
+## 复跑核销（2026-11-18 08:00 执行窗口，Linux x86_64 32 核沙箱，无硬件 —— 兜底口径）
+
+G-1 现状核销的例行复跑，三轨与 11-08/11-15/11-18(04:01) 基线逐项一致：
+
+```text
+TRACK=nogpu kind=none backend=none available=false          （恒 ErrNotBuilt）
+TRACK=wgpu kind=software backend=wgpu-software available=true ← 兜底口径
+TRACK=cgo kind=none backend=cgo available=false             （骨架纪律钉住）
+```
+
+接入面不变：SetPresentWrapper 仅桌面接入；移动端决策不接入；swapchain
+Present 路径在位（真机验证待做）；CI gpu 跑批文件在位（gpu-present.yml）。
+
+回归（同环境同口径）：`go test ./gfx/gpu`（nogpu 轨）、
+`go test -tags gpu ./gfx/gpu`（wgpu 轨）、`go test ./gfx/...` 全包均绿；
+26 组件 CPU vs GPU 双轨快照 A/B（`TestGPUSnapshotAB26`）PASS，
+差异像素阈值 0，耗时 0.24s —— Prism 视觉一致性维持零退化。
+本节数字为无硬件兜底口径：不进闸门、不对外；硬件口径仍属
+「硬件覆盖待办」，未在真机覆盖前不得声称 A 路径完成。
