@@ -92,7 +92,7 @@ if [[ "$XCOMPILE" == 1 ]]; then
   echo ""
   echo "交叉编译矩阵抽查 (-tags gpu, 编译期验证 wgpu 纯 Go 可交叉):"
   for tgt in "windows/amd64" "darwin/arm64" "linux/arm64" "js/wasm"; do
-    GOOS="${tgt%%/*}" GOARCH="${tgt##*/}" go build -tags gpu -o /dev/null ./cmd/gox \
+    GOOS="${tgt%%/*}" GOARCH="${tgt##*/}" CGO_ENABLED=0 go build -tags gpu -o /dev/null ./cmd/gox \
       && echo "  ok   $tgt" || echo "  FAIL $tgt"
   done
 fi

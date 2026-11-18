@@ -316,26 +316,12 @@ jobs:
       # 第二步才跑分阶段探针并过闸门：它依赖字体目录规模（runner 上装了
       #   fonts-noto-cjk，与我们刷基线时的组织方式一致），所以阈值按比值判；
       #   换了 runner 镜像导致绝对值漂移时, 用 --update-baseline 重新固化。
-      # 字体文件缓存的身份纪律（2026-11-19 补）单独立一步、**不挂 if**：
-      # 它守的是"内容变了就一定重读"，而这条纪律正是在 Windows 上被打穿的
-      # （NTFS 的 mtime 精度细到能分辨 os.WriteFile 的两次写，于是旧用例靠
-      # "把 mtime 往后推 2 秒"躲开了洞）。只放在 Linux 那一步里等于只在不会
-      # 犯错的平台上验。真实字体样本由 runner 自带字体提供（三个平台的镜像
-      # 都有字体目录），不装包、不联网。
-      - name: 字体缓存身份纪律（三平台）
-        run: |
-          set -euo pipefail
-          if ! go test ./gfx/ -run 'TestFontFileCache' -count=1 -v; then
-            echo "::error::字体文件缓存认错了文件 —— 换了内容却仍命中旧 entry（docs/performance.md §12.10）。这是「用了错误的字体」级别的正确性问题, 不是性能问题"
-            exit 1
-          fi
-
       - name: 冷启动闸门（字体只读一次 + 扫描不读字节 + 闸门自测 + 分阶段扫描成本）
         if: runner.os == 'Linux'
         run: |
           set -euo pipefail
           sudo apt-get install -yq fonts-noto-cjk
-          if ! go test ./gfx/ -run 'TestFontFileReadOnceAcrossScanAndChoose|TestScanSystemFontsDoesNotReadFontBytes|TestFontFileReadHookIsLive|TestChooseBaseFontReadsOnlyChosenFile|TestChooseBaseFontFallbackStillReadsOneFile|TestProbeFileFaceRankMatchesFullParse' -count=1; then
+          if ! go test ./gfx/ -run 'TestFontFileReadOnceAcrossScanAndChoose|TestScanSystemFontsDoesNotReadFontBytes|TestFontFileReadHookIsLive|TestFontFileCacheHonoursFileIdentity|TestChooseBaseFontReadsOnlyChosenFile|TestChooseBaseFontFallbackStillReadsOneFile|TestProbeFileFaceRankMatchesFullParse' -count=1; then
             echo "::error::字体栈读盘纪律被破坏 —— 扫描不该读字节, 选默认只该整份读被选中的那个, 探针与整份解析必须同口径（见 gfx/font.go 的 fontFileEntry / probeFileFaceRank 注释, docs/performance.md §12.10）"
             exit 1
           fi

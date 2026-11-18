@@ -1,4 +1,4 @@
-//go:build linux
+//go:build linux && !gpu
 
 // Xlib Display* 的 dlopen 方案 —— A 路径「GPU 上屏合成」三平台验证的
 // 硬前提之一 (2026-11-18 落地, docs/gpu-track-audit.md「硬前提缺口」)。

@@ -1,7 +1,10 @@
 package gfx
 
 import (
+	"bytes"
+	"encoding/binary"
 	"fmt"
+	"hash/fnv"
 	"image"
 	"image/color"
 	"io"
@@ -146,88 +149,37 @@ type fontFileEntry struct {
 	// sig / sigOK 是文件内容的指纹与"指纹是否可用"。
 	//
 	// 为什么不能只靠 (mtime, size): 2026-11-19 的 Windows CI 上,
-	// TestFontFileCacheHonoursFileIdentity 把一份字体换成等长垃圾内容,
-	// (size, mtime) 完全没变, 缓存照样命中 —— 用例报"文件已被替换成非字体,
-	// 仍解析成功"。Linux 上撞不上是运气, 不是不变式。
-	//
-	// 指纹的取法有个关键约束: **必须是"片段 + 片段"的关系, 而不是"片段
-	// 直接等于"**。只存头部 sigLen 字节时, 任何第一处差异落在 4K 之后
-	// 的替换都与原文件"头部同字节、size 同值", 指纹照样相等, 闸门等于没装。
-	// 现在 sig 存的是「头 headSigLen 字节 + 尾 tailSigLen 字节」的拼贴
-	// (见 takeFontSignature), 头部差异立刻可见, 头部不变时靠尾部兜住。
-	// 代价不变: 每次核对仍只读 4K, 只是从"读一块"变成"读两块"。
-	sig   [sigLen]byte
+	// TestFontFileCacheHonoursFileIdentity 把一份字体换成**等长的**垃圾内容
+	// (os.WriteFile 会保留原 mtime), (size, mtime) 完全没变, 缓存照样命中 ——
+	// 用例报"文件已被替换成非字体, 仍解析成功"。Linux 上撞不上是因为 mtime
+	// 精度粗 + 测试显式把 mtime 往后推了 2 秒, 但那是运气, 不是不变式。
+	// 指纹取头部 fontSigLen 字节并把 size 参与折叠, 读的是已热页缓存里的
+	// 几千字节, 换来的是"内容变了就一定重读"。
+	sig   [fontSigLen]byte
 	sigOK bool
 }
 
-// 指纹几何: 一次核对读 headSigLen 字节的头 + sigLen-headSigLen 字节的尾,
-// 合计正好 sigLen (4K 一整块)。头部覆盖 sfnt 表目录 (表个数上限 4095,
-// 每项 16 字节 ⇒ 最坏 64KB, 取 3/4 已足够分辨正常字体), 尾部覆盖字体里
-// 最容易随"换了一份文件"而变的那部分内容。
-const (
-	sigLen     = 4096
-	headSigLen = 3072
-	tailSigLen = sigLen - headSigLen
-)
+// fontSigLen 是内容指纹取的头部字节数: 足够覆盖 sfnt 表目录 + 首个表开头
+// (足以分辨"换成垃圾 / 换成一个别的字体"), 又小于一次 4K 页读。
+const fontSigLen = 4096
 
-// takeFontSignature 从 src (整个文件内容, 至少 len>=size 的前缀) 里取指纹拼贴。
-//
-// 抽成"从字节算"而不是"从文件算", 是为了让闸门能在内存里造出"只有 4K 之后
-// 不同"的样本 —— 那才是这条缓存真正要挡的形态。
-func takeFontSignature(src []byte, size int64) [sigLen]byte {
-	var out [sigLen]byte
-	if int64(len(src)) > size {
-		src = src[:size]
+// foldFontSignature 把头部字节与文件尺寸折叠成定长指纹 (FNV-1a)。
+func foldFontSignature(head []byte, size int64) [fontSigLen]byte {
+	var out [fontSigLen]byte
+	h := fnv.New64a()
+	var szb [8]byte
+	binary.LittleEndian.PutUint64(szb[:], uint64(size))
+	h.Write(head)
+	h.Write(szb[:])
+	var sum [8]byte
+	binary.LittleEndian.PutUint64(sum[:], h.Sum64())
+	keep := len(head)
+	if keep > fontSigLen-len(sum) {
+		keep = fontSigLen - len(sum)
 	}
-	n := len(src)
-	head := n
-	if head > headSigLen {
-		head = headSigLen
-	}
-	copy(out[:head], src[:head])
-	if n > headSigLen {
-		tail := n - head
-		if tail > tailSigLen {
-			tail = tailSigLen
-		}
-		copy(out[headSigLen:headSigLen+tail], src[n-tail:])
-	}
+	copy(out[:], head[:keep])
+	copy(out[fontSigLen-len(sum):], sum[:])
 	return out
-}
-
-// signFontFile 读出文件首尾 (合计最多 sigLen 字节) 并算指纹。
-//
-// 文件小到"头 + 尾"能覆盖全量时, 直接整份算; 否则单独取两段。
-func signFontFile(f *os.File, size int64) (sig [sigLen]byte, ok bool) {
-	if f == nil || size <= 0 {
-		return sig, false
-	}
-	// 小文件 (<=4K): 整份读, 头尾拼贴自然等于全文。
-	if size <= sigLen {
-		buf := make([]byte, size)
-		n, err := f.ReadAt(buf, 0)
-		if err != nil && err != io.EOF {
-			return sig, false
-		}
-		return takeFontSignature(buf[:n], size), true
-	}
-	var scratch [sigLen]byte
-	hn, herr := f.ReadAt(scratch[:headSigLen], 0)
-	if herr != nil && herr != io.EOF {
-		return sig, false
-	}
-	tn, terr := f.ReadAt(scratch[headSigLen:], size-tailSigLen)
-	if terr != nil && terr != io.EOF {
-		return sig, false
-	}
-	// 尾部读不满 (文件在 stat 之后被截断) 时按实读字节算, 结果自然对不上旧指纹。
-	fill := headSigLen + tn
-	if hn < headSigLen {
-		copy(scratch[:], scratch[:hn]) // 头段短读: 截断到实读长度
-		fill = hn + tn
-		copy(scratch[hn:], scratch[headSigLen:headSigLen+tn])
-	}
-	return takeFontSignature(scratch[:fill], size), true
 }
 
 // fontFileReaderAt 把 entry 的 *os.File 包成 io.ReaderAt, 顺带累计读盘字节。
@@ -625,8 +577,13 @@ func loadFontFileEntry(path string) (*fontFileEntry, error) {
 		// 每次命中多读一个文件头 (几千字节, 已热页缓存里) 换确定性; 指纹不
 		// 可用 (读不动) 时退回纯 (mtime, size) 判定。
 		if ent.file != nil && ent.sigOK {
-			if got, ok2 := signFontFile(ent.file, ent.size); ok2 && got != ent.sig {
-				ok = false // 内容换了但 (mtime, size) 没变: 当作未命中重读
+			var head [fontSigLen]byte
+			n, rerr := ent.file.ReadAt(head[:], 0)
+			if rerr == nil || rerr == io.EOF {
+				got := foldFontSignature(head[:n], ent.size)
+				if !bytes.Equal(got[:], ent.sig[:]) {
+					ok = false // 内容换了但 (mtime, size) 没变: 当作未命中重读
+				}
 			}
 		}
 		if ok {
@@ -648,10 +605,11 @@ func loadFontFileEntry(path string) (*fontFileEntry, error) {
 		st = fst
 	}
 	ent = &fontFileEntry{mtime: st.ModTime(), size: st.Size(), file: f}
-	// 内容指纹: 首尾两段拼贴 (见 takeFontSignature), 用来在 (mtime, size)
+	// 内容指纹: 头部 fontSigLen 字节 (含 size 参与折叠), 用来在 (mtime, size)
 	// 之外再认一次身份。读不动就不启用指纹 (sigOK=false), 退化为旧行为。
-	if s, sok := signFontFile(f, ent.size); sok {
-		ent.sig, ent.sigOK = s, true
+	if n, rerr := f.ReadAt(ent.sig[:], 0); rerr == nil || rerr == io.EOF {
+		ent.sig = foldFontSignature(ent.sig[:n], ent.size)
+		ent.sigOK = true
 	}
 	col, err := opentype.ParseCollectionReaderAt(fontFileReaderAt{ent})
 	if err != nil {

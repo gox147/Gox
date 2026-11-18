@@ -282,3 +282,38 @@ Present 路径在位（真机验证待做）；CI gpu 跑批文件在位（gpu-p
 差异像素阈值 0，耗时 0.24s —— Prism 视觉一致性维持零退化。
 本节数字为无硬件兜底口径：不进闸门、不对外；硬件口径仍属
 「硬件覆盖待办」，未在真机覆盖前不得声称 A 路径完成。
+
+## 交叉编译矩阵修复：gfx/x11 GPU 轨 purego→goffi（2026-11-19 04:10 执行窗口，Linux x86_64 32 核沙箱，无硬件 —— 兜底口径）
+
+**发现（真实缺陷）**：真零 cgo 口径（`CGO_ENABLED=0`）下 `-tags gpu` 交叉编译矩阵
+只有 windows/amd64 能过 —— linux/amd64、linux/arm64 链接 `cmd/gox` 即炸：
+`link: duplicated definition of symbol _cgo_init, from goffi/internal/fakecgo
+and purego/internal/fakecgo`。此前的「win/linux ok」基线是在宿主 CGO 默认开启
+（gcc 在位）下测得，掩盖了零 cgo 发行约束下的真实状况 —— 审计脚本的
+`--xcompile` 矩阵本窗口起已加 `CGO_ENABLED=0` 对齐口径。
+
+**根因**：`gfx/x11/xlib.go`（2026-11-18 purego dlopen 方案）是 linux 下
+`-tags gpu` 构建中唯一的 purego 入口，与 go-webgpu/goffi 各带一份 fakecgo，
+同时入链即冲突 —— 正是 gfx/softmedia/pulse_disabled.go 早已写进文档的坑，
+xlib.go 恰恰踩中自家纪律的例外。
+
+**修复**：GPU 轨下 xlib 换用 goffi 的 `LoadLibrary/GetSymbol/CallFunction`
+（与 go-webgpu 同源 fakecgo，天然不冲突）：
+- `xlib_gpu.go`（`linux && gpu && amd64||arm64`）：goffi dlopen 版，降级语义与
+  purego 版逐字一致（失败安静退 0、sync.Once 不重试、GOX_XLIB_LIBRARY 覆盖）；
+- `xlib_gpu_stub.go`（`linux && gpu && 其余架构`）：诚实交 0，goffi dlopen 本就
+  只覆盖 amd64/arm64；
+- `xlib.go` 改 `linux && !gpu`：默认构建维持 purego 版不动，零行为变化。
+
+**修复后矩阵（CGO_ENABLED=0，-tags gpu，cmd/gox）**：windows/amd64 ✅、
+linux/amd64 ✅、linux/arm64 ✅、darwin/arm64 ❌（冲突源在 gfx/cocoa 的 purego
+objc_msgSend，与 x11 无关，属已知 darwin 冲突，需 goffi 化或上游解决，另案）。
+
+**功能验证**：Xvfb 真实 X server 下 `go test -tags gpu ./gfx/x11 -run
+TestXlibDisplaySilentDegrade` 拿到真实 Display*（goffi 路径全链路走通，
+非仅降级）；无 X 环境降级路径 PASS。`go test ./gfx/gpu`、
+`go test -tags gpu ./gfx/gpu`、`go test ./gfx/...` 全绿；
+`TestGPUSnapshotAB26` PASS（阈值 0）—— Prism 视觉一致性未受触碰。
+
+**诚实口径**：本节全部为无硬件兜底口径；x11 Display* 真实点亮 swapchain 仍属
+G-3 三平台真机验证待办。darwin 交叉编译矩阵修复不在本窗口范围。
