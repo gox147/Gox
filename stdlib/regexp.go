@@ -1,6 +1,7 @@
 package stdlib
 
 import (
+	"math"
 	"strings"
 
 	"github.com/14752222/Gox/object"
@@ -151,10 +152,26 @@ func regExpBuiltinExec(re *object.RegExp, input string) object.Value {
 
 	lastIndex := 0
 	if re.Global || re.Sticky {
-		lastIndex = re.LastIndex
-		if lastIndex < 0 {
-			lastIndex = 0
+		// 规范步骤 4: lastIndex = ToLength(Get(R, "lastIndex")) —— 必须**属性读**,
+		// 用户给 lastIndex 挂 getter 的可观测性 (success-g-lastindex-no-access /
+		// builtin-y-coerce-lastindex-err 族) 与 Infinity 的 ToLength 截断
+		// (failure-lastindex-set 族) 都落在这里; getter 抛错原样传播。
+		lv, _ := re.GetProperty("lastIndex")
+		if cb := object.TakeCallbackError(); cb != nil {
+			object.SetCallbackError(cb)
+			return object.UndefinedSingleton
 		}
+		lf := toFloat(lv)
+		// ToLength: NaN/负数归零, 超过 2^53-1 截断 (Infinity 同样截断,
+		// 避免 int(f) 对越界浮点的平台相关未定义转换)。
+		const maxSafeLen = float64(1 << 53)
+		switch {
+		case math.IsNaN(lf) || lf < 0:
+			lf = 0
+		case lf >= maxSafeLen || math.IsInf(lf, 1):
+			lf = maxSafeLen - 1
+		}
+		lastIndex = int(lf)
 		if lastIndex > len(input) {
 			if !re.SetLastIndexStrict(0) {
 				return lastIndexTypeError()
@@ -360,13 +377,85 @@ func isErrorResult(v object.Value) bool {
 	return ok
 }
 
+// regExpGetLastIndex 读 lastIndex (规范 Get(R, "lastIndex") 语义 —— 走属性读,
+// 自有访问器/数据属性优先, 再落到 *RegExp 的内建镜像)。
+func regExpGetLastIndex(rx object.Value) int {
+	v, _ := rx.GetProperty("lastIndex")
+	return int(toFloat(v))
+}
+
+// regExpSetLastIndexStrict 对任意 receiver 做严格 Set(rx, "lastIndex", v, true):
+// *RegExp 走内建 SetLastIndexStrict (描述符级精确); 普通对象按描述符裁决 ——
+// 有 setter 调 setter, 不可写数据属性返回 false (调用方据此抛 TypeError)。
+// @@match / @@matchAll / @@search / @@replace 都是泛化方法, fake 对象
+// (lastIndex 数据属性 + 自定义 exec) 必须能走通 (set-lastindex-init 族)。
+func regExpSetLastIndexStrict(rx object.Value, n int) bool {
+	if re, ok := rx.(*object.RegExp); ok {
+		return re.SetLastIndexStrict(n)
+	}
+	o, ok := rx.(*object.Object)
+	if !ok {
+		return false
+	}
+	if d, has := o.OwnDescriptor("lastIndex"); has {
+		if acc, isAcc := d.Value.(*object.Accessor); isAcc {
+			if acc.Setter == nil || !object.IsCallable(acc.Setter) {
+				return false
+			}
+			object.CallFunction(acc.Setter, o, object.NewNumber(float64(n)))
+			return true
+		}
+		if !d.Writable {
+			return false
+		}
+	}
+	o.SetProperty("lastIndex", object.NewNumber(float64(n)))
+	return true
+}
+
+// regExpExecGeneric 是规范 RegExpExec(rx, S) 的泛化版: exec 沿原型链可调用
+// 则调用; 否则 rx 必须是带内部槽的 *RegExp 才能走内建 exec, 否则按规范抛
+// TypeError。
+func regExpExecGeneric(rx object.Value, input string) object.Value {
+	if exec, ok := rx.GetProperty("exec"); ok && exec != nil && object.IsCallable(exec) {
+		if re, isRe := rx.(*object.RegExp); isRe && isBuiltinRegExpExec(exec) {
+			return regExpBuiltinExec(re, input)
+		}
+		pending := object.TakeCallbackError()
+		res := object.CallFunction(exec, rx, object.NewString(input))
+		thrown := object.TakeCallbackError()
+		if pending != nil {
+			object.SetCallbackError(pending)
+			return object.UndefinedSingleton
+		}
+		if thrown != nil {
+			object.SetCallbackError(thrown)
+			return object.UndefinedSingleton
+		}
+		if res == nil {
+			return object.NullSingleton
+		}
+		// 规范 RegExpExec 5.c: 结果既非 Object 也非 Null ⇒ TypeError
+		// (cstm-exec-return-invalid 族: exec 返回 undefined/number/string/bool)。
+		if !object.IsObjectValue(res) && res != object.NullSingleton {
+			return object.NewTypeError("exec result must be an Object or Null")
+		}
+		return res
+	}
+	if re, isRe := rx.(*object.RegExp); isRe {
+		return regExpBuiltinExec(re, input)
+	}
+	return object.NewTypeError("RegExp method called on incompatible receiver")
+}
+
 // collectExecResults 反复 exec 直到未匹配, 收集全部结果 (@@match / @@replace
 // 的 global 分支共用)。空匹配时按规范 AdvanceStringIndex 推进一位, 否则
 // /(?:)/g 会死循环。lastIndex 的任何严格写入失败都以 TypeError 收场。
-func collectExecResults(re *object.RegExp, input string) ([]object.Value, object.Value) {
+// (B7: receiver 泛化 —— fake 对象 receiver 同样可走 collect 循环。)
+func collectExecResults(rx object.Value, input string) ([]object.Value, object.Value) {
 	var results []object.Value
 	for i := 0; i <= len(input)+1; i++ {
-		res := regExpExec(re, input)
+		res := regExpExecGeneric(rx, input)
 		if isNullishExecResult(res) {
 			break
 		}
@@ -375,7 +464,7 @@ func collectExecResults(re *object.RegExp, input string) ([]object.Value, object
 		}
 		results = append(results, res)
 		if matchStringOfResult(res) == "" {
-			if !re.SetLastIndexStrict(re.LastIndex + 1) {
+			if !regExpSetLastIndexStrict(rx, regExpGetLastIndex(rx)+1) {
 				return nil, lastIndexTypeError()
 			}
 		}
@@ -401,10 +490,11 @@ func setupRegExpProto() *object.Object {
 
 	// test(string): 测试是否匹配
 	//
-	// 规范: 在带 g/y 标志时，test 必须像 exec 一样从 lastIndex 处开始匹配，
-	// 成功后推进 lastIndex，失败则重置为 0。
-	// 旧实现用 MatchString 全串匹配，完全忽略 lastIndex，导致
-	// /a/g.test("abc") 连续调用永远返回 true (无法遍历所有匹配)。
+	// 规范 21.2.5.13: test 仅是 RegExpExec(R, S) 的布尔包装 —— lastIndex 的
+	// 读值 / 推进 / 失败重置全部由 RegExpBuiltinExec 按「严格 Set」语义处理。
+	// 旧实现手工改 re.LastIndex 内部字段, 绕过了 SetLastIndexStrict, 于是
+	// y-fail-lastindex-no-write (粘性失败时 lastIndex 不可写应抛 TypeError)
+	// 永远不抛 (B7 第二子根因)。
 	p.SetBuiltinProperty("test", object.NewBuiltinMethod("test", func(this object.Value, args ...object.Value) object.Value {
 		re, errVal := regExpThis(this)
 		if errVal != nil {
@@ -414,32 +504,11 @@ func setupRegExpProto() *object.Object {
 		if len(args) > 0 {
 			input = toStr(args[0])
 		}
-
-		// 非全局/非粘性: 与 lastIndex 无关，也不修改它
-		if !re.Global && !re.Sticky {
-			return object.NewBoolean(re.MatchString(input))
+		res := regExpExec(re, input)
+		if isErrorResult(res) {
+			return res
 		}
-
-		if re.LastIndex < 0 {
-			re.LastIndex = 0
-		}
-		if re.LastIndex > len(input) {
-			re.LastIndex = 0
-			return object.NewBoolean(false)
-		}
-
-		loc := re.FindStringIndex(input[re.LastIndex:])
-		if loc == nil {
-			re.LastIndex = 0
-			return object.NewBoolean(false)
-		}
-		// sticky: 匹配必须正好发生在 lastIndex 处 (相对偏移为 0)
-		if re.Sticky && loc[0] != 0 {
-			re.LastIndex = 0
-			return object.NewBoolean(false)
-		}
-		re.LastIndex += loc[1]
-		return object.NewBoolean(true)
+		return object.NewBoolean(!isNullishExecResult(res))
 	}))
 
 	// toString(): 返回正则的字符串表示
@@ -456,19 +525,28 @@ func setupRegExpProto() *object.Object {
 	// (步骤 8.c), 之后每轮 RegExpExec 推进 lastIndex —— 两处写入都是
 	// **严格**的, 写不进去即抛 TypeError。此前这里用 FindAllString 一次算完,
 	// 既不读 exec 也不碰 lastIndex, 于是 8 个断言 TypeError 的用例全假阳性。
+	// (B7: @@match/@@matchAll/@@search/@@replace 是规范定义的泛化方法,
+	// receiver 只要是对象即可 —— fake 对象 {lastIndex, exec} 必须走通,
+	// 此前一刀切 regExpThis 拒掉了 22+ 条 this-val/自定义 exec 用例。)
 	p.SetBuiltinProperty(object.NewSymbol("Symbol.match").Inspect(), object.NewBuiltinMethod("[Symbol.match]", func(this object.Value, args ...object.Value) object.Value {
-		re, errVal := regExpThis(this)
-		if errVal != nil {
-			return errVal
+		if this == nil || !object.IsObjectValue(this) {
+			return object.NewTypeError("RegExp.prototype method called on incompatible receiver")
 		}
+		rx := this
 		input := ""
 		if len(args) > 0 {
 			input = toStr(args[0])
 		}
 
-		if !re.Global && !re.Sticky {
+		// 规范步骤 5: global = ToBoolean(Get(rx, "global")) —— 必须走属性读
+		// 而非内部槽: 用户 defineProperty 覆写 global 属性后, 单次 exec /
+		// 循环收集的分支决策跟着变 (builtin-success-g-set-lastindex 族:
+		// /b/g 覆写 global=false ⇒ 只 exec 一次, 收尾 lastIndex=e=2)。
+		gv, _ := rx.GetProperty("global")
+		global := toBool(gv)
+		if !global {
 			// 步骤 7: global 为 false ⇒ 直接 RegExpExec(rx, S)。
-			res := regExpExec(re, input)
+			res := regExpExecGeneric(rx, input)
 			if isErrorResult(res) {
 				return res
 			}
@@ -476,10 +554,10 @@ func setupRegExpProto() *object.Object {
 		}
 
 		// 步骤 8.c
-		if !re.SetLastIndexStrict(0) {
+		if !regExpSetLastIndexStrict(rx, 0) {
 			return lastIndexTypeError()
 		}
-		results, errVal := collectExecResults(re, input)
+		results, errVal := collectExecResults(rx, input)
 		if errVal != nil {
 			return errVal
 		}
@@ -502,23 +580,26 @@ func setupRegExpProto() *object.Object {
 	// 字符串侧数组快路径，返回的不是迭代器（named-groups matchall 族
 	// 的 compareIterator 断言因此失败）。
 	p.SetBuiltinProperty(object.NewSymbol("Symbol.matchAll").Inspect(), object.NewBuiltinMethod("[Symbol.matchAll]", func(this object.Value, args ...object.Value) object.Value {
-		re, errVal := regExpThis(this)
-		if errVal != nil {
-			return errVal
+		if this == nil || !object.IsObjectValue(this) {
+			return object.NewTypeError("RegExp.prototype method called on incompatible receiver")
 		}
+		rx := this
 		input := ""
 		if len(args) > 0 {
 			input = toStr(args[0])
 		}
-		if !re.Global {
+		// 规范: global = ToBoolean(Get(rx, "global")) —— 属性读而非内部槽,
+		// 覆写 global 的 getter 抛错要原样传播 (species-regexp-get-global-throws 族)。
+		gv, _ := rx.GetProperty("global")
+		if !toBool(gv) {
 			return object.NewTypeError("matchAll requires a global regular expression")
 		}
-		if !re.SetLastIndexStrict(0) {
+		if !regExpSetLastIndexStrict(rx, 0) {
 			return lastIndexTypeError()
 		}
 		var it *object.JSIterator
 		it = &object.JSIterator{Name: "RegExp String Iterator", NextFn: func() (object.Value, bool) {
-			res := regExpExec(re, input)
+			res := regExpExecGeneric(rx, input)
 			if isErrorResult(res) {
 				it.PendingErr = res
 				return object.UndefinedSingleton, true
@@ -537,9 +618,8 @@ func setupRegExpProto() *object.Object {
 	// replaceAll 快路径三处共用同一份 exec 循环与 GetSubstitution 展开，
 	// 避免快路径丢捕获组 / 丢 groups 实参的口径分叉。
 	p.SetBuiltinProperty(object.NewSymbol("Symbol.replace").Inspect(), object.NewBuiltinMethod("[Symbol.replace]", func(this object.Value, args ...object.Value) object.Value {
-		re, errVal := regExpThis(this)
-		if errVal != nil {
-			return errVal
+		if this == nil || !object.IsObjectValue(this) {
+			return object.NewTypeError("RegExp.prototype method called on incompatible receiver")
 		}
 		input := ""
 		if len(args) > 0 {
@@ -551,27 +631,54 @@ func setupRegExpProto() *object.Object {
 		if len(args) > 1 {
 			replaceValue = args[1]
 		}
-		return regExpReplace(re, input, replaceValue)
+		return regExpReplace(this, input, replaceValue)
 	}))
 
 	// [Symbol.search](string): %RegExp.prototype%[@@search] —— 此前未注册,
 	// typeof RegExp.prototype[Symbol.search] === "undefined"
 	// (T4 r8DmKW: not-a-constructor 族)。规范语义: RegExpExec 一次,
 	// 命中返回 result.index, 未命中返回 -1。
+	//
+	// 规范 sec-regexp.prototype-@@search 完整步骤 (B7: set-lastindex-init /
+	// restore / restore-err 族专测上一轮 lastIndex 的保存与恢复):
+	//   5. previousLastIndex = Get(R, "lastIndex")
+	//   6. 若 previousLastIndex ≠ +0 ⇒ Set(R, "lastIndex", +0, true)
+	//   8. result = RegExpExec(R, S)
+	//   9. result 为 abrupt 或 previousLastIndex ≠ Get(R,"lastIndex")
+	//      ⇒ Set(R, "lastIndex", previousLastIndex, true)
+	// 全部 Set 走严格写 (写不进去抛 TypeError)。
 	p.SetBuiltinProperty(object.NewSymbol("Symbol.search").Inspect(), object.NewBuiltinMethod("[Symbol.search]", func(this object.Value, args ...object.Value) object.Value {
-		re, errVal := regExpThis(this)
-		if errVal != nil {
-			return errVal
+		if this == nil || !object.IsObjectValue(this) {
+			return object.NewTypeError("RegExp.prototype method called on incompatible receiver")
 		}
+		rx := this
 		input := ""
 		if len(args) > 0 {
 			input = toStr(args[0])
 		}
-		res := regExpExec(re, input)
-		if isErrorResult(res) || isNullishExecResult(res) {
+		prev := regExpGetLastIndex(rx)
+		if prev != 0 {
+			if !regExpSetLastIndexStrict(rx, 0) {
+				return lastIndexTypeError()
+			}
+		}
+		res := regExpExecGeneric(rx, input)
+		if isErrorResult(res) {
+			if prev != 0 && !regExpSetLastIndexStrict(rx, prev) {
+				return lastIndexTypeError()
+			}
+			return res
+		}
+		cur := regExpGetLastIndex(rx)
+		if cur != prev {
+			if !regExpSetLastIndexStrict(rx, prev) {
+				return lastIndexTypeError()
+			}
+		}
+		if isNullishExecResult(res) {
 			return object.NewInt(-1)
 		}
-		if idx, found := res.GetProperty("index"); found {
+		if idx, found := res.GetProperty("index"); found && idx != nil {
 			return idx
 		}
 		return object.NewInt(-1)
@@ -594,6 +701,27 @@ func setupRegExpProto() *object.Object {
 
 		return regExpSplit(re, input, limit)
 	}))
+
+	// ===== B7: 内建方法 length 规范值 =====
+	// builtin_lengths.go 的限定名表走 "a.b.c" 点路径, 无法寻址 Symbol 键
+	// 方法, 这里按规范形参个数直接补 (exec/test/@@match/@@matchAll/@@search
+	// = 1, @@replace/@@split = 2)。S15.10.6.x_A11 与 Symbol.*/length 族据此断言。
+	for _, e := range []struct {
+		key string
+		n   int
+	}{
+		{"Symbol.match", 1},
+		{"Symbol.matchAll", 1},
+		{"Symbol.search", 1},
+		{"Symbol.replace", 2},
+		{"Symbol.split", 2},
+	} {
+		if m, ok := p.GetProperty(object.NewSymbol(e.key).Inspect()); ok {
+			if bm, is := m.(*object.BuiltinMethod); is {
+				bm.SetFunctionLength(e.n)
+			}
+		}
+	}
 
 	// ===== 访问器属性族 (source/global/flags/...) =====
 	// 规范: 这些是 %RegExp.prototype% 上的 **getter 访问器** (非数据属性),
@@ -712,7 +840,7 @@ func regExpSplit(re *object.RegExp, input string, limit int) object.Value {
 // @@replace 与 String.prototype.replace 快路径共用。replaceValue 可以是
 // 字符串（GetSubstitution 展开）或函数（[matched, p1..pn, position, S,
 // groups?] 实参表）。
-func regExpReplace(re *object.RegExp, input string, replaceValue object.Value) object.Value {
+func regExpReplace(rx object.Value, input string, replaceValue object.Value) object.Value {
 	// 规范 @@replace 步骤 7: functionalReplace = IsCallable(replaceValue);
 	// 非函数时 ToString(replaceValue) 必须发生在**匹配之前** —— 毒 toString
 	// 即使零匹配也要抛 (arg-2-coerce-err.js)。
@@ -725,18 +853,21 @@ func regExpReplace(re *object.RegExp, input string, replaceValue object.Value) o
 		replaceStr = rpl.Value
 	}
 	var results []object.Value
-	if re.Global {
+	// 规范: global = ToBoolean(Get(rx, "global")) —— 属性读而非内部槽,
+	// 与 @@match 同口径 (覆写 global 属性要改变单次 / 循环收集决策)。
+	gv, _ := rx.GetProperty("global")
+	if toBool(gv) {
 		// 步骤: Set(rx, "lastIndex", 0, true) 后逐轮 exec。
-		if !re.SetLastIndexStrict(0) {
+		if !regExpSetLastIndexStrict(rx, 0) {
 			return lastIndexTypeError()
 		}
-		rs, errVal := collectExecResults(re, input)
+		rs, errVal := collectExecResults(rx, input)
 		if errVal != nil {
 			return errVal
 		}
 		results = rs
 	} else {
-		res := regExpExec(re, input)
+		res := regExpExecGeneric(rx, input)
 		if isErrorResult(res) {
 			return res
 		}
