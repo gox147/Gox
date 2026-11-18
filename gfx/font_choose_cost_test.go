@@ -22,9 +22,9 @@ import (
 	"golang.org/x/image/font"
 )
 
-// fontProbeReadHook / fontFullReadHook 之外的一层计数: 本用例只关心
-// "整份解析 (parseFontFile) 被调用了多少次、读了多少字节", 因此用
-// fontReadHook 数文件、用被读文件的大小累加字节。
+// chooseReadRecorder 只关心"整份解析 (parseFontFile) 被调用了多少次、读了多少
+// 字节": 用 fontReadHook 数文件, 用被读文件的大小累加字节。探针 (只读表头) 不
+// 走这个钩子 —— 那是本批要消灭的成本, 不该混进"整份读盘"的口径里。
 type chooseReadRecorder struct {
 	dir   string
 	files map[string]int
