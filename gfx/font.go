@@ -467,6 +467,13 @@ func fireFontReadHook(path string) {
 	}
 }
 
+// fireFontProbeHook 触发探针钩子 (生产路径上是空操作)。
+func fireFontProbeHook(path string) {
+	if h := fontProbeHook; h != nil {
+		h(path)
+	}
+}
+
 // fontReadHook 是"字体文件真的被读盘了"的测试钩子 (仅测试期非 nil)。
 //
 // 为什么留钩子而不是用耗时断言: 冷启动的浪费形态是"同一个文件读了两次",
@@ -474,6 +481,14 @@ func fireFontReadHook(path string) {
 // 但读盘次数是确定的。钩子只在未命中缓存、真要 os.ReadFile 时触发, 生产
 // 路径上恒为 nil, 代价是一次 nil 判断。
 var fontReadHook func(path string)
+
+// fontProbeHook 是"字体文件被探针打开过"的测试钩子 (仅测试期非 nil)。
+//
+// 与 fontReadHook 分开记: 探针只读表目录 + name 表 (~88KB), 整份解析才读
+// 全部字节。T3-5 第十批把"判面"从整份解析降级成探针之后, 「这个候选到底被
+// 试过没有」只能靠探针计数来守 —— 否则"坏候选被跳过"与"坏候选被静默忽略"
+// 在整份读盘计数上长得一模一样 (都是 0)。
+var fontProbeHook func(path string)
 
 // fontFileFaces 返回文件里的全部面 (按需从已缓存的 Collection 派生, **不再读盘**)。
 //
@@ -632,37 +647,98 @@ func loadBaseFontLocked() (*opentype.Font, error) {
 //
 // 解析结果按 (路径, mtime, size) 缓存 (见 fontFileEntry): 调用方通常已经把
 // 扫描结果试过一轮, 这里再试同一批文件只花一次 stat。
+//
+// T3-5 第十批: 逐个候选**先探针后整份解析**。判面只需要 name 表, 而
+// parseFontFile 会把整份文件读进堆 (本机 CJK 集合字体 19MB ≈ 6ms)。真实路径上
+// 第一个候选通常是 NotoSansCJK-Bold.ttc (rank≠0, 白读 19MB), 第二个才是正体 ——
+// 于是每次启动都为"被否掉的那个"付一次整份读盘。probeFileFaceRank 走
+// ParseCollectionReaderAt, 每个候选只读表目录 + name 表 (~88KB)。
 func chooseBaseFont(paths []string) (*opentype.Font, error) {
-	var first *opentype.Font
+	var fallback string // 首个"能解析但没有正体面"的候选 (兜底用)
 	var lastErr error
 	for _, p := range paths {
 		if filepath.Base(p) == "" {
 			continue
 		}
-		f, err := parseFontFile(p)
-		if err != nil {
+		rank, ok := probeFileFaceRank(p)
+		if !ok {
 			// 带上文件名: 候选动辄几十上百条, 只说"解析失败"没法定位是哪台
 			// 机器上哪个文件的问题。
-			lastErr = fmt.Errorf("%s: %w", filepath.Base(p), err)
+			lastErr = fmt.Errorf("%s: unreadable font", filepath.Base(p))
 			continue
 		}
-		// baseFaceRank == 0 就是正体面 —— 直接返回, **不再走第二次
-		// parseFontFile**: 那条路虽然命中进程缓存, 仍要 stat 一次, 而
-		// 首选候选 (Linux 上恒为扫描结果里的第一个 CJK 正体) 是最热的一条。
-		if baseFaceRank(f) == 0 {
+		// baseFaceRank == 0 就是正体面 —— 对它做整份解析 (这次读盘是必须的:
+		// 栅格化要字形数据), 然后直接返回。
+		if rank == 0 {
+			f, err := parseFontFile(p)
+			if err != nil {
+				lastErr = fmt.Errorf("%s: %w", filepath.Base(p), err)
+				continue
+			}
+			if baseFaceRank(f) != 0 {
+				// 探针与整份解析不同口径时报错而不是静默接受: 两者都以
+				// name 表为准, 出现分歧说明缓存层/解析层出了 bug。
+				lastErr = fmt.Errorf("%s: probe rank 0 but parsed rank %d",
+					filepath.Base(p), baseFaceRank(f))
+				continue
+			}
 			return f, nil
 		}
 		// 候选里没有正体 (整机只有粗体/斜体面): 留首个作兜底, 有字渲染
-		// 永远优于无字渲染 (与 SetCursor 同一套静默降级口径)。
-		if first == nil {
-			first = f
+		// 永远优于无字渲染 (与 SetCursor 同一套静默降级口径)。**这里先不读**:
+		// 万一后面有正体, 这一份整份读盘就是纯浪费。
+		if fallback == "" {
+			fallback = p
 		}
 	}
-	if first != nil {
-		return first, nil
+	if fallback != "" {
+		f, err := parseFontFile(fallback)
+		if err == nil {
+			return f, nil
+		}
+		lastErr = fmt.Errorf("%s: %w", filepath.Base(fallback), err)
 	}
 	return nil, fmt.Errorf("no usable system font (tried %d candidates, last: %v)",
 		len(paths), lastErr)
+}
+
+// probeFileFaceRank 只用文件表头与 name 表判断"这个文件里最好的面是几档",
+// 判据与 baseFaceRank/regularFaceOf 完全一致 (同一个函数, 同一份 name 表),
+// 但不把整份字节读进堆。
+//
+// 返回 ok=false 表示文件打不开或一个面都读不出来 (exe 改名的 .ttf / 损坏文件)，
+// 与 parseFontFile 的失败口径一致。
+func probeFileFaceRank(path string) (rank int, ok bool) {
+	fireFontProbeHook(path)
+	f, err := os.Open(path)
+	if err != nil {
+		return 0, false
+	}
+	// 探针只读表目录与 name 表, 读完就关 —— 面在关闭后失效, 但这里不需要面
+	// 活下来 (真正要渲染时走 parseFontFile 的整份解析)。
+	defer f.Close()
+	col, err := opentype.ParseCollectionReaderAt(f)
+	if err != nil {
+		return 0, false
+	}
+	best := -1
+	for i, n := 0, col.NumFonts(); i < n; i++ {
+		ft, ferr := col.Font(i)
+		if ferr != nil {
+			continue
+		}
+		r := baseFaceRank(ft)
+		if best < 0 || r < best {
+			best = r
+			if r == 0 {
+				break // 已经是正体, 不必再看后面的面 (与 regularFaceOf 同序)
+			}
+		}
+	}
+	if best < 0 {
+		return 0, false
+	}
+	return best, true
 }
 
 // fontFace 返回指定像素字号的 face (懒建并缓存)。

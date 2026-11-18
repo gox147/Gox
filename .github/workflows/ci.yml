@@ -311,6 +311,8 @@ jobs:
       #     扫描循环就会红）；
       #   ③ check-coldstart.py 的自测（判据本身坏了要先知道, 与 check-bench
       #   同一纪律）。这三条一红就是实现/判据坏了, 与机器负载无关。
+      #   ④ (T3-5 第十批) 选默认字体的读盘纪律: 被探针否掉的候选不许整份读,
+      #     且"探针判面"与"整份解析判面"必须同口径（判错 = 默认字体选成粗体）。
       # 第二步才跑分阶段探针并过闸门：它依赖字体目录规模（runner 上装了
       #   fonts-noto-cjk，与我们刷基线时的组织方式一致），所以阈值按比值判；
       #   换了 runner 镜像导致绝对值漂移时, 用 --update-baseline 重新固化。
@@ -319,8 +321,8 @@ jobs:
         run: |
           set -euo pipefail
           sudo apt-get install -yq fonts-noto-cjk
-          if ! go test ./gfx/ -run 'TestFontFileReadOnceAcrossScanAndChoose|TestScanSystemFontsDoesNotReadFontBytes|TestFontFileReadHookIsLive|TestFontFileCacheHonoursFileIdentity' -count=1; then
-            echo "::error::字体栈读盘纪律被破坏 —— 扫描不该读字节, 扫描/选默认/按族名取面必须共用 fontFileCache 里同一份解析结果（见 gfx/font.go 的 fontFileEntry 注释）"
+          if ! go test ./gfx/ -run 'TestFontFileReadOnceAcrossScanAndChoose|TestScanSystemFontsDoesNotReadFontBytes|TestFontFileReadHookIsLive|TestFontFileCacheHonoursFileIdentity|TestChooseBaseFontReadsOnlyChosenFile|TestChooseBaseFontFallbackStillReadsOneFile|TestProbeFileFaceRankMatchesFullParse' -count=1; then
+            echo "::error::字体栈读盘纪律被破坏 —— 扫描不该读字节, 选默认只该整份读被选中的那个, 探针与整份解析必须同口径（见 gfx/font.go 的 fontFileEntry / probeFileFaceRank 注释, docs/performance.md §12.10）"
             exit 1
           fi
           # 族索引 (T3-5 第九批): 成本用**比值**判 (并发/顺序 ≥ 1.33x), 与机器

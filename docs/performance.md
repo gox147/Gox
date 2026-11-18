@@ -1174,3 +1174,98 @@ go test ./gfx/ -run 'TestFamilyIndex' -race -count=1   # 成本断言在 -race �
 **2.37x**，族数 242，`GOMAXPROCS=32`；`TestFamilyIndexParallelMatchesSerial` PASS。
 与本机 11-18 凌晨批记录的 2.45x / 13.18ms 同量级 —— 复核采用比值口径，绝对值
 随机器与后台负载浮动（同机两次采样即可差 30%）。
+
+### 12.10 T3-5 第十批：选默认字体不再整份读被否掉的候选（2026-11-18 夜批）
+
+§12.7 把扫描从 148MB 读盘压到 0 之后，"首次用字体"只剩一步：`chooseBaseFont`。
+当时它对本机是 **11.9ms，读 2 个文件**——因为 Linux 的候选表里
+`NotoSansCJK-Bold.ttc` 排在 `Regular` 之前，而判"它是粗体、跳过"只需要 name 表，
+旧实现却把整份 19MB 读进堆。**每一次启动都为"被否掉的那个候选"付一次整份读盘。**
+
+本批把判面拆成两层：先用 `ParseCollectionReaderAt` 探针（只读表目录 + name 表，
+每个文件 ~88KB）算出"这个文件里最好的面是几档"，**只有 rank==0 的那个才整份解析**
+（栅格化确实要字形数据，这一笔省不掉）；整机没有正体面时的兜底也推迟到扫描结束
+才读一份，而不是沿途每个候选都读。
+
+#### 闸门（先建闸门再优化）
+
+三条断言，全部进 `ci.yml` 的冷启动闸门步骤：
+
+| 断言 | 判据 | 守的形态 |
+|---|---|---|
+| `TestChooseBaseFontReadsOnlyChosenFile` | 候选 `[粗体, 正体]`：粗体整份读 **0** 次，正体 **1** 次，读盘字节 ≤ 一个文件 | 为被否掉的候选付整份读盘 |
+| `TestChooseBaseFontFallbackStillReadsOneFile` | 全机只有非正体面时，兜底仍返回可用面，且只读 **1** 个文件 | 兜底路径被写成"每个候选都读完" |
+| `TestProbeFileFaceRankMatchesFullParse` | 机器上每个可解析字体：探针 rank == 整份解析 rank | **判错档位 = 默认字体选成粗体**（整屏变粗、`fontWeight` 看起来完全失效） |
+
+负向自测（把探针替成"整份解析后取 rank"，即旧行为）确实红了：
+
+```
+粗体候选被整份读了 1 次, 期望 0
+整份读盘 39535544 字节 > 正体文件 19484784 字节
+无正体兜底时整份读了 3 个文件, 期望 1
+```
+
+第三条断言比前两条重要：它是"便宜的探针"与"贵但可信的整份解析"之间的等价性证明，
+也是本批唯一可能画错字的路径。
+
+#### 数字
+
+**进程级 A/B**（`scripts/bench/coldstart_gui.js`，Xvfb `:77` 1024×768，外部 wall time，
+两个二进制随机交错 20 轮/组，预热 2 轮；base = `7750d62`，new = 本批）：
+
+| 口径 | base | 本批 | 变化 |
+|---|---|---|---|
+| 首帧 中位 | 40.06 ms | **34.62 ms** | **−13.6%（−5.44 ms）** |
+| 首帧 min | 38.73 ms | 33.66 ms | −13.1% |
+| 首帧 p10 / p90 | 39.02 / 42.84 ms | 33.90 / 37.10 ms | — |
+| 逐轮胜负 | — | **20/20 轮更快** | — |
+| 峰值 RSS（`/usr/bin/time -v`，各 4 次） | 65.4 / 65.5 / 65.9 / 66.4 MB | **43.1 / 44.7 / 42.9 / 44.0 MB** | **≈ −21.5 MB（−33%）** |
+
+**进程内分阶段**（`go test ./gfx/ -run TestColdstartFontStage -v`，n=5 中位）：
+
+| 阶段 | base | 本批 | 变化 |
+|---|---|---|---|
+| 目录扫描 | 0.60 ms（读盘 0） | 0.58 ms（读盘 0） | — |
+| 选默认字体 | 11.85 ms（读盘 **2**） | **11.13 ms（读盘 1）** | −6%，整份读盘 38 MB → 19 MB |
+
+**两个口径的跌幅不同（−6% vs −13.6%），原因要说清**：进程内探针反复 `reset` 后
+跑在同一份热堆、热页缓存上，只测到"少解析一次"的指令差；进程级是**新进程**，
+还要付 38MB→19MB 的堆分配、缺页与由此少掉的一轮 GC —— 那部分才是 5.4ms 的主体，
+也是 RSS 掉 21.5MB 的同一笔账。所以对外引用取进程级，回归盯梢取进程内。
+
+原始数据：`bench-results/perf-batch-20261118-121030.json`（含 20 轮逐条样本、RSS 四次采样、两个二进制的 commit 与 dirty 标记）。
+
+**机器与条件**（引用时必须一并给出）：AMD EPYC 9K65 / 32 核 / Linux 6.6.117 /
+go1.26.2 / Xvfb `:77` 1024×768×24 软渲染 / 330 个字体文件 148MB / 2026-11-18。
+绝对值**不可**与 §12.1 的 84ms、§3.3 的 245ms 相减（机器与显示栈都不同），
+只有本表内的 base↔new 比值可比。
+
+#### 复现命令
+
+```bash
+# 进程级（对外口径）：两个二进制随机交错；--xvfb 时务必显式指定可用显示
+./scripts/coldstart.sh --runs 15 --xvfb
+# 进程内分阶段（回归口径）
+go test ./gfx/ -run TestColdstartFontStage -v -count=1
+# 本批三条闸门
+go test ./gfx/ -run 'TestChooseBaseFont|TestProbeFileFaceRank' -v -count=1
+```
+
+本节新增/涉及文件：
+
+| 路径 | 作用 |
+|---|---|
+| `gfx/font.go` | `probeFileFaceRank`（表头探针）+ `chooseBaseFont` 改为"探针先、整份读仅命中者"+ `fontProbeHook` |
+| `gfx/font_choose_cost_test.go` | 三条闸门：只读命中者 / 兜底只读一份 / 探针与整份解析同口径 |
+| `gfx/font_file_cache_test.go` | "坏候选被试过"的观测点从整份读盘改为探针计数（读盘 1 → 0） |
+| `bench-results/perf-batch-20261118-121030.json` | 本批 A/B 原始数据（逐轮样本 + RSS + 二进制元数据） |
+
+#### 遗留（下一批的入口）
+- **探针对"全粗体 CJK 集合"仍要 4ms**：判面要看 name 表，而 `sfnt` 的
+  `col.Font(i)` 会连带初始化 cmap/loca/hmtx（10 个面 ≈ 4ms），我们只需要 name。
+  下一批的候选做法是"只读 name 表的极小解析器"或"常驻 ReaderAt 不整份读"
+  （后者还能再省掉命中者那 7ms 的 18MB 读，但要先解决 fd 生命周期与跨平台
+  mmap；**不改判面语义**，并用 `TestProbeFileFaceRankMatchesFullParse` 兜底）。
+- **对外数字未刷新**：README / 官网的冷启动块仍指向 §3.3 的 245ms（Xeon 机器，
+  全量四栈那一次）。本批只给同机 A/B，按 §3.3 的纪律，要换对外数字必须整批
+  重跑 `bench-all.sh` + `coldstart.sh` 再 `./scripts/perf-numbers.sh`，不在本批混做。

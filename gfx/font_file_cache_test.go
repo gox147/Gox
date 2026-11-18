@@ -135,6 +135,7 @@ func TestScanSystemFontsDoesNotReadFontBytes(t *testing.T) {
 
 	var reads int
 	perPath := map[string]int{}
+	probes := map[string]int{}
 	fontFileMu.Lock()
 	fontFileCache = map[string]*fontFileEntry{}
 	fontFileMu.Unlock()
@@ -145,7 +146,15 @@ func TestScanSystemFontsDoesNotReadFontBytes(t *testing.T) {
 		reads++
 		perPath[filepath.Base(path)]++
 	}
-	t.Cleanup(func() { fontReadHook = nil })
+	// 探针计数 (T3-5 第十批): 判面改成"只读表头"之后, 「坏候选被试过没有」
+	// 只剩这个可观测点 —— 它既不该被静默忽略, 也不该被整份读进来。
+	fontProbeHook = func(path string) {
+		if filepath.Dir(path) != dir {
+			return
+		}
+		probes[filepath.Base(path)]++
+	}
+	t.Cleanup(func() { fontReadHook = nil; fontProbeHook = nil })
 
 	got := scanSystemFonts([]string{dir}, 100)
 	if reads != 0 {
@@ -168,15 +177,18 @@ func TestScanSystemFontsDoesNotReadFontBytes(t *testing.T) {
 	}
 	// 样本是同一个字体的副本 (字重都"不正经"), 所以 chooseBaseFont 会一路试到
 	// 最后一个候选才兜底返回首个可解析者 —— 这是设计行为。这里守的是**不重复**:
-	// 每个候选最多读一次, 坏样本排除在外。
+	// 每个候选最多整份读一次 (T3-5 第十批起, 被探针否掉的候选是 0 次)。
 	for name, n := range perPath {
 		if n > 1 {
-			t.Errorf("%s 在选默认字体阶段被读了 %d 次, 期望 ≤1", name, n)
+			t.Errorf("%s 在选默认字体阶段被整份读了 %d 次, 期望 ≤1", name, n)
 		}
 	}
-	if perPath["NotoSansCJK-0broken.ttf"] != 1 {
-		t.Errorf("坏样本读盘次数 = %d, 期望 1 (它必须真的被试过, 否则这条断言没验证回退)",
-			perPath["NotoSansCJK-0broken.ttf"])
+	if probes["NotoSansCJK-0broken.ttf"] != 1 {
+		t.Errorf("坏样本探针次数 = %d, 期望 1 (它必须真的被试过, 否则这条断言没验证回退)",
+			probes["NotoSansCJK-0broken.ttf"])
+	}
+	if n := perPath["NotoSansCJK-0broken.ttf"]; n != 0 {
+		t.Errorf("坏样本整份读盘 %d 次, 期望 0 —— 表头就足以判定它不是字体", n)
 	}
 }
 
