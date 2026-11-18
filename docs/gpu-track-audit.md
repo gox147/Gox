@@ -317,3 +317,52 @@ TestXlibDisplaySilentDegrade` 拿到真实 Display*（goffi 路径全链路走�
 
 **诚实口径**：本节全部为无硬件兜底口径；x11 Display* 真实点亮 swapchain 仍属
 G-3 三平台真机验证待办。darwin 交叉编译矩阵修复不在本窗口范围。
+
+## x11 swapchain 端到端点亮 + BGRA 格式修复（2026-11-19 06:00 执行窗口，Linux x86_64 32 核沙箱，Xvfb + wgpu-software —— 兜底口径）
+
+本窗口把「swapchain 真机点亮」待办里**不依赖 GPU 硬件**的部分拆出来做掉了：
+wgpu 软件后端在 Linux 上原生支持 Xlib window target（`hal/software/blit_linux.go`，
+XPutImage 经 goffi dlopen libX11），**有 X server（Xvfb 即可）就能真点亮**。
+
+### 1. 新测试：TestSwapchainX11WindowE2E（gfx/gpu/swapchain_x11_e2e_test.go，-tags gpu && linux）
+
+真平台窗口（gfx/x11 工厂建真窗）→ gpu.New 建链 → Show 四象限纯色帧 →
+**XGetImage 从窗口读回**逐像素比对（按 XImage 自带 masks 解码，不硬编码字节序）。
+此前两层验证（gate 语义伪句柄 + 离屏 Readback）之间的接缝层首次被钉住。
+
+### 2. 抓到并修复一个真实缺陷：窗口化路径红蓝互换（backend_wgpu.go）
+
+旧 `initSwapchainTry` 优先选 RGBA8Unorm（为了与离屏管线同格式免建第二条管线）；
+但软件适配器的表面格式列表 **BGRA8Unorm 在前**，且其 XPutImage blit **不做任何
+通道转换**（framebuffer 存 [B,G,R,A]）—— 强选 RGBA8 导致红蓝互换直接上屏。
+Xvfb 下逐像素实测复现（红象限读回为蓝）。修复：窗口化 swapchain 优先 BGRA8Unorm
+（三平台原生表面首选格式均为 BGRA：X11 TrueColor / DXGI / CAMetalLayer），拿不到
+再回退首选格式；离屏路径不动。**这也是此前「真机点亮」被整体推迟的隐性风险首次
+被无硬件手段抓到。**
+
+### 3. 发现并钉住一个上游缺陷：goffi libX11 装载 × wgpu-software 同进程段错误
+
+实测复现矩阵（Linux x86_64，32 核沙箱）：
+- TestSwapchainX11WindowE2E **单独进程** 连跑 5 次全绿（含真建链 + 窗口像素逐点一致）；
+- 与其它 gfx/gpu 测试同进程时，后续测试必段错误 —— 且污染在进程级：
+  哪怕 e2e 只走到「goffi LoadLibrary libX11 + 一次失败的 XOpenDisplay」（X server
+  不可达场景），后续 wgpu-software 测试（快照 A/B 等）也崩；崩溃无 Go 栈
+  （gdb core 显示 PC 在未映射内存，调用链经 runtime/cgo），带 6~8 个 OS 线程；
+  二分排除了测试顺序、BGRA 改动、gfx/x11 链接本身三个假设。
+- 判定：**上游 goffi FFI × wgpu-software 交互缺陷**，本仓不可修。CI 上 2026-11-19
+  04:33 记录的 checkbox 偶发段错误（run 44391316067）与本现象同签名（wgpu-software
+  段错误、无栈），建议同案排查。
+
+### 4. 测试的进程隔离闸门（不是裸 if 的口径）
+
+`TestSwapchainX11WindowE2E` 要求 `GOX_GPU_X11_E2E=1` 才运行；CI 用**独立进程**
+专跑（`GOX_GPU_X11_E2E=1 xvfb-run -a go test -run TestSwapchainX11WindowE2E`），
+其余套件进程里恒 skip。三态验证（无 X 全量 / Xvfb 全量 / Xvfb 独立进程 e2e）均
+多次连跑全绿。
+
+### 5. 口径纪律
+
+本节全部为**兜底口径**：软件适配器上钉住的是「接线正确性 + 像素零退化」，
+不产生任何可对外引用的性能数字；硬件口径仍归 hardware job（GPU_HARDWARE_RUNNER）。
+真机三平台点亮（win32 HWND / cocoa CAMetalLayer 侧）仍属 G-3 硬件覆盖待办；
+x11 这一行自此从「纯真机待办」中拆出（接线 + 像素已钉，性能待硬件）。

@@ -267,11 +267,15 @@ func (s *Surface) initSwapchainTry() error {
 	if len(caps.Formats) == 0 {
 		return fmt.Errorf("surface 无可用格式")
 	}
-	// 优先 RGBA8Unorm (与离屏管线同格式, 免建第二条管线); 拿不到就
-	// 用适配器首选格式, 渲染时走 pipelineFor 建对应格式的管线。
+	// 优先 BGRA8Unorm (2026-11-19 修复, TestSwapchainX11WindowE2E 实测抓到):
+	// 三平台的**原生表面**首选格式都是 BGRA (X11 TrueColor 视觉 / win32
+	// DXGI / Metal CAMetalLayer), 软件后端的 XPutImage blit 更是**不做任何
+	// 通道转换** (hal/software/blit_linux.go: framebuffer 存 [B,G,R,A]) ——
+	// 旧逻辑在这里强选 RGBA8 会让红蓝互换直接上屏 (Xvfb 下逐像素复现)。
+	// 代价是窗口化路径经 pipelineFor 建第二条管线 —— 正确性优先。
 	format := caps.Formats[0]
 	for _, f := range caps.Formats {
-		if f == gputypes.TextureFormatRGBA8Unorm {
+		if f == gputypes.TextureFormatBGRA8Unorm {
 			format = f
 			break
 		}

@@ -83,6 +83,17 @@ jobs:
         shell: bash
         run: set -o pipefail; go test -tags gpu ./gfx/gpu -run TestGPUSnapshotAB -v 2>&1 | tee gpu-snapshot-ab.txt
 
+      # 1.6) x11 swapchain 端到端点亮 (A 路径硬前提 #2 接线验证):
+      #      真平台窗口 + wgpu-software XPutImage 上屏 → XGetImage 读回
+      #      窗口像素逐点比对 (2026-11-19 接入; 本 step 抓到并修复了
+      #      窗口化路径红蓝互换的 BGRA 格式缺陷, 见 docs/gpu-track-audit.md
+      #      2026-11-19 06:00 节)。必须独立进程 (GOX_GPU_X11_E2E=1 闸门):
+      #      与其它测试同进程会触发上游 goffi/wgpu-software 段错误。
+      #      口径: 仍属兜底口径 —— 钉接线正确性, 不产生性能数字。
+      - name: x11 swapchain 端到端点亮 (独立进程, 兜底口径)
+        shell: bash
+        run: set -o pipefail; GOX_GPU_X11_E2E=1 xvfb-run -a -s "-screen 0 1280x800x24" go test -tags gpu ./gfx/gpu -run TestSwapchainX11WindowE2E -v 2>&1 | tee gpu-swapchain-e2e.txt
+
       # 2) 三轨核销表：每条构建轨在这台 runner 上实际走的路径（可审计）
       - name: scripts/gpu-track-audit.sh
         shell: bash
@@ -103,6 +114,7 @@ jobs:
           path: |
             gpu-test.txt
             gpu-snapshot-ab.txt
+            gpu-swapchain-e2e.txt
             gpu-track-audit.txt
             gpu-bench-full.txt
             bench-results/present-4k-*.txt
