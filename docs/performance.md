@@ -1298,7 +1298,8 @@ post 表头，判面要的三样东西（子族名、italicAngle、isFixedPitch�
 |---|---|---|
 | `TestProbeReadsOnlyNameAndPost` | 探针读最大字体文件 ≤ **512KB**（实测 2,852 字节 / 文件 27,294,356 字节） | 有人在探针里加回整份解析或 `col.Font(i)` |
 | `TestProbeNamesMatchFullParse` | 逐面比 family / typographic family / subfamily / 轴 / isFixedPitch，与整份解析一致 | 名字解码或 post 头判错 ⇒ 字重登记错 |
-| `TestProbeFileFaceRankMatchesFullParse` | （既有）探针 rank == 整份解析 rank | 判错档位 = 整屏变粗 |
+| `TestProbeFileFaceRankMatchesFullParse` | （既有）探针 rank 不得**比整份解析更悲观**（乐观只记日志，见下） | 判错档位 = 整屏变粗 / 默认字体跳过整个族 |
+| `TestHasRequiredTables` | 9 条表组合：CFF / loca+glyf / CBLC 三个字形来源 + 缺表 + name 缺失仍可用 | 必需表清单改窄改宽都会先在这里红 |
 | `BenchmarkFamilyIndexBuild` | 清缓存后重建族索引的耗时（不进闸门，只留轨迹） | 族索引退化没有曲线会红 |
 
 负向自测就藏在第一条里：一旦探针退回 `col.Font(i)`，读盘量从 36KB 跳到 19MB，
@@ -1317,8 +1318,9 @@ post 表头，判面要的三样东西（子族名、italicAngle、isFixedPitch�
 
 | 现象 | 根因 | 改法 |
 |---|---|---|
-| `HelveticaNeue.ttc`：探针 rank 0 / 整份 rank 1 | 该集合里存在"name 表可读、cmap 解析不了"的面。整份解析里这个面等于不存在，探针只看表目录看不到 cmap 的格式错误，于是多算了一个正体面 | ① 探针补必需表粗筛（head/maxp/cmap/hhea/hmtx/name/post + loca/glyf 或 CFF/CFF2）；② `chooseBaseFont` 遇到"探针 0、解析非 0"记成兜底而不是报错跳过整个候选 —— 判据以整份解析为准 |
-| `TestProbeNamesMatchFullParse` panic（nil deref） | `fontFileFaces` 对解析失败的面留 `nil` 占位，测试直接按下标取 | 测试过滤 `nil`，并且面数不同就跳过（两边面集合本来就允许不同） |
+| macOS `HelveticaNeue.ttc`：探针 rank 0 / 整份 rank 1 | 该集合里存在"name 表可读、cmap 解析不了"的面。整份解析里这个面等于不存在，探针只看表目录看不到 cmap 的格式错误，于是多算了一个正体面 | ① 探针补必需表粗筛；② `chooseBaseFont` 遇到"探针 0、解析非 0"记成兜底而不是报错跳过整个候选 —— 判据以整份解析为准 |
+| macOS `TestProbeNamesMatchFullParse` panic（nil deref） | `fontFileFaces` 对解析失败的面留 `nil` 占位，测试直接按下标取 | 测试过滤 `nil`，并且面数不同就跳过（两边面集合本来就允许不同） |
+| ubuntu `NotoColorEmoji.ttf`：探针判不可用 / 整份解析成功 | 第一版把 `loca+glyf` 当成 TrueType 的唯一字形来源。x/image 的 `parseGlyphData` 有三个分支：CFF/CFF2、`loca+glyf`、**CBLC**（彩色位图，`glyf` 为空但整份解析成功） | 必需表粗筛按三个分支写；`name` 从必需表里删掉（x/image 的 `Font()` 不碰它）。另加 `TestHasRequiredTables` 9 条组合钉住这张清单 |
 | 顺带发现 | 探针原来"整表一次 ReadAt"读 name 表，遇到 `length` 字段不可信（截断/尾部填充）的文件会直接失败，而 x/image 只按需读表头/记录/字符串三段 | 改成同序三段读，读盘量反而从 36,872 降到 **2,852 字节** |
 
 **闸门因此改成不对称的**：只对"探针比整份解析更悲观"判红（会把真能用的正体面

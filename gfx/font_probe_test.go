@@ -115,6 +115,11 @@ func TestProbeNamesMatchFullParse(t *testing.T) {
 				want = append(want, f)
 			}
 		}
+		if len(want) == 0 {
+			// 整份解析一个面都读不出来 (macOS 的 NISC18030.ttf 就是这种):
+			// 探针也读不出来是**对的**, 没有可比对象。
+			continue
+		}
 		got, err := probeFontFaces(p)
 		if err != nil {
 			t.Errorf("%s: 探针失败: %v", filepath.Base(p), err)
@@ -211,12 +216,13 @@ func TestHasRequiredTables(t *testing.T) {
 		want bool
 	}{
 		{"TrueType loca+glyf", with("loca", "glyf"), tt, true},
+		{"TrueType 只有 loca (glyf 长度字段为 0)", with("loca"), tt, true},
 		{"彩色位图 CBLC/CBDT (glyf 为空)", with("CBLC", "CBDT"), tt, true},
 		{"OTTO + CFF", with("CFF "), otto, true},
 		{"OTTO + CFF2", with("CFF2"), otto, true},
 		{"缺 post", tr("head", "maxp", "cmap", "hhea", "hmtx", "loca", "glyf"), tt, false},
 		{"缺 cmap", tr("head", "maxp", "hhea", "hmtx", "post", "loca", "glyf"), tt, false},
-		{"TrueType 但既无 loca/glyf 也无 CBLC", with(), tt, false},
+		{"TrueType 但既无 loca 也无 CBLC", with("glyf"), tt, false},
 		{"OTTO 但没有 CFF/CFF2", with("loca", "glyf"), otto, false},
 		{"name 缺失不影响可用性", tr("head", "maxp", "cmap", "hhea", "hmtx", "post", "loca", "glyf"), tt, true},
 	}

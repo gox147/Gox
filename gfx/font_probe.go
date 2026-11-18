@@ -208,7 +208,7 @@ func probeFaceAt(f io.ReaderAt, off uint32) (probeFaceInfo, bool) {
 //
 // 字形来源三种, 与 sfnt.parseGlyphData 的分支一一对应:
 //   - CFF/CFF2 (OTTO)
-//   - loca + glyf (普通 TrueType)
+//   - loca (普通 TrueType; glyf 的 length 在 x/image 这条路上不查)
 //   - CBLC (彩色位图字体: NotoColorEmoji 这类只有 CBDT/CBLC, glyf 是空的,
 //     x/image 走"位图分支"、字形集合为空但整份解析**成功**)
 //
@@ -223,7 +223,9 @@ func hasRequiredTables(have map[string]bool, version []byte) bool {
 	if binary.BigEndian.Uint32(version) == sfntVersionCFF {
 		return have["CFF "] || have["CFF2"]
 	}
-	return have["loca"] && have["glyf"] || have["CBLC"]
+	// 与 parseGlyphData 同序: 有 loca 就走它 (glyf 的 length 在这条路上不查),
+	// 否则看 CBLC。要求 glyf 非空会误杀"loca 有、glyf 长度字段为 0"的字体。
+	return have["loca"] || have["CBLC"]
 }
 
 // probeNameTable 是一个已读入记录区的 name 表。
