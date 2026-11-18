@@ -1868,6 +1868,10 @@ func (a *app) invalidateFocusRing(n *GuiNode) {
 
 func init() {
 	object.RegisterBuiltinModule("gx/gfx", func() map[string]object.Value {
+		// 脚本一旦 import gx/gfx, 就说明这台进程要 GUI 了 (T3-5 第十六批):
+		// 默认字体放到后台加载, 与后续的模块装载 / 建树 / 建窗并行。
+		// 比"建窗时再起"早 1~1.5ms —— 那段正好盖住 1.78ms 的字体首次使用成本。
+		prefetchBaseFont()
 		return map[string]object.Value{
 			"h":                     object.NewBuiltin("h", JSBuiltinH),
 			"render":                object.NewBuiltin("render", jsRender),
@@ -2150,6 +2154,11 @@ func Mount(root *GuiNode, cfg WindowConfig) (*Window, error) {
 		return nil, fmt.Errorf("no window backend available on this platform")
 	}
 	runtime.LockOSThread()
+
+	// 默认字体在后台与建窗并行加载 (T3-5 第十六批, 见 font_prefetch.go):
+	// 字体初始化是首次文本测量的一次性开销 (本机 1.78ms), 与 X11 握手没有
+	// 数据依赖, 没理由排在它后面。默认关闭, 由 CLI 边界开启。
+	prefetchBaseFont()
 
 	surface, err := defaultFactory.Create(cfg)
 	if err != nil {

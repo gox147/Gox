@@ -41,6 +41,9 @@ func main() {
 	initDevMode()
 	// 严格模式: 同 CLI 边界, 从 gox.json 读 (库不自己读配置)。
 	initStrictAPI()
+	// 建窗时后台预热默认字体 (T3-5 第十六批): 库默认关闭, 由这里显式打开 —
+	// 只有"真的要开窗"的进程才付这份后台 I/O, 且它盖在建窗的 socket 往返上。
+	gfx.EnableFontPrefetch()
 
 	args := os.Args[1:]
 

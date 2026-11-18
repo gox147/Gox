@@ -336,6 +336,23 @@ jobs:
             exit 1
           fi
 
+      # 默认字体预取的边界（2026-11-19 第十六批）。四条判据守的是"预取这件事的
+      # 形状"而不是毫秒数：默认关闭 / 起跑线在 gx/gfx 模块查找 / 结果被首帧复用 /
+      # 每进程只起一次。**起跑线那条最容易悄悄退化** —— 把调用挪回 Mount 不会让
+      # 任何功能用例变红，却会吃掉 2/3 的收益（A/B: −0.23ms vs −0.95ms），
+      # 所以它必须在这里。不挂 if: runner.os: 这四条判据三平台共有，
+      # 且都不依赖具体字体内容（机器上没有可用字体时第三条会 skip 而不是红）。
+      - name: 默认字体预取纪律（三平台）
+        shell: bash
+        run: |
+          set -uo pipefail
+          go test ./gfx/ -run 'TestFontPrefetchOffByDefault|TestGfxModuleLookupStartsPrefetch|TestMountPrefetchesBaseFontWhenEnabled|TestPrefetchSingleShotPerProcess' -count=1 -v 2>&1
+          rc=$?
+          if [ "$rc" -ne 0 ]; then
+            echo "::error::默认字体预取被破坏 —— 库默认不许读字体、起跑线必须在 import gx/gfx、预取结果必须被首帧复用（docs/performance.md §12.16）"
+            exit 1
+          fi
+
       - name: 冷启动闸门（字体只读一次 + 扫描不读字节 + 闸门自测 + 分阶段扫描成本）
         if: runner.os == 'Linux'
         run: |
