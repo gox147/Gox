@@ -3,24 +3,24 @@
   "拍板口径": "2026-11-04：暂缓冲 95%；目标 language 85% / built-ins 50% / 全量 80%",
   "floors": {
     "language": {
-      "floor_pct": 86.7049,
-      "set_at": "2026-11-18T16:28:30Z",
+      "floor_pct": 86.7217,
+      "set_at": "2026-11-18T20:23:39Z",
       "commit": "",
-      "basis": "批末抬升：本批实际 87.0049% - 容差 0.3pp",
+      "basis": "批末抬升：本批实际 87.0217% - 容差 0.3pp",
       "total": 23832
     },
     "built-ins": {
-      "floor_pct": 80.7779,
-      "set_at": "2026-11-18T18:24:35Z",
+      "floor_pct": 81.1635,
+      "set_at": "2026-11-18T20:23:39Z",
       "commit": "",
-      "basis": "批末抬升：本批实际 81.0779% - 容差 0.3pp",
+      "basis": "批末抬升：本批实际 81.4635% - 容差 0.3pp",
       "total": 23861
     },
     "all": {
-      "floor_pct": 83.6725,
-      "set_at": "2026-11-18T16:28:55Z",
+      "floor_pct": 83.9409,
+      "set_at": "2026-11-18T20:23:39Z",
       "commit": "",
-      "basis": "批末抬升：本批实际 83.9725% - 容差 0.3pp",
+      "basis": "批末抬升：本批实际 84.2409% - 容差 0.3pp",
       "total": 47693
     }
   },
@@ -204,6 +204,33 @@
       "total": 23861,
       "suite": "built-ins",
       "prev_floor_pct": 80.6438
+    },
+    {
+      "floor_pct": 81.1635,
+      "set_at": "2026-11-18T20:23:39Z",
+      "commit": "",
+      "basis": "批末抬升：本批实际 81.4635% - 容差 0.3pp",
+      "total": 23861,
+      "suite": "built-ins",
+      "prev_floor_pct": 80.7779
+    },
+    {
+      "floor_pct": 86.7217,
+      "set_at": "2026-11-18T20:23:39Z",
+      "commit": "",
+      "basis": "批末抬升：本批实际 87.0217% - 容差 0.3pp",
+      "total": 23832,
+      "suite": "language",
+      "prev_floor_pct": 86.7049
+    },
+    {
+      "floor_pct": 83.9409,
+      "set_at": "2026-11-18T20:23:39Z",
+      "commit": "",
+      "basis": "批末抬升：本批实际 84.2409% - 容差 0.3pp",
+      "total": 47693,
+      "suite": "all",
+      "prev_floor_pct": 83.6725
     }
   ]
 }

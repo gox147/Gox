@@ -89,11 +89,21 @@ func (it *JSIterator) GetProperty(name string) (Value, bool) {
 			return NewIteratorResult(v, done)
 		}), true
 	case "return":
+		// 规范: %ArrayIteratorPrototype% / %MapIteratorPrototype% 等内建
+		// 迭代器原型上**没有** return 方法 (includes/iterator-has-no-return
+		// 族断言 `iterator.return === undefined`)。只有 helper 派生迭代器
+		// (ReturnHook 非 nil, 转发语义) 才物化 return。
+		if it.ReturnHook == nil {
+			return nil, false
+		}
 		return NewBuiltinMethod("return", func(this Value, args ...Value) Value {
 			if !sameSlots(this) {
 				return NewTypeError("Method Iterator.prototype.return called on incompatible receiver")
 			}
-			if it.ReturnHook != nil && !it.exhausted {
+			// 已关闭 (closed) 或已耗尽 (exhausted) 都不再转发 —— 规范
+			// [[Done]] 槽置真后 return() 直接返回完成结果, 底层 return
+			// 只转发一次 (return-is-forwarded 族: 第二次调用必须保持 1)。
+			if it.ReturnHook != nil && !it.exhausted && !it.closed {
 				it.ReturnHook()
 				if ev := TakeCallbackErrorValue(); ev != UndefinedSingleton {
 					return ev
@@ -121,6 +131,9 @@ func (it *JSIterator) SetProperty(name string, val Value) {}
 
 // MarkExhausted 标记底层迭代器已走完 (此后 return() 不再转发)。
 func (it *JSIterator) MarkExhausted() { it.exhausted = true }
+
+// IsExhausted 报告迭代器是否已走完 (跨包只读访问)。
+func (it *JSIterator) IsExhausted() bool { return it.exhausted }
 
 // NewIteratorResult 构造迭代器协议的结果对象 {value, done}。
 func NewIteratorResult(v Value, done bool) *Object {

@@ -136,15 +136,20 @@ func (d *iteratorDriver) step() (Value, bool, Value) {
 		return UndefinedSingleton, true, ev
 	}
 	var v Value = UndefinedSingleton
-	if vv, found := obj.GetProperty("value"); found {
-		if ev := TakeCallbackErrorValue(); ev != UndefinedSingleton {
+	// 规范 IteratorStepValue: done 为真时**不读** value ( throwing value
+	// getter 在 done=true 的结果对象上不得触发
+	// next-method-returns-throwing-value-done 族)。
+	if !done {
+		if vv, found := obj.GetProperty("value"); found {
+			if ev := TakeCallbackErrorValue(); ev != UndefinedSingleton {
+				return UndefinedSingleton, true, ev
+			}
+			if vv != nil {
+				v = vv
+			}
+		} else if ev := TakeCallbackErrorValue(); ev != UndefinedSingleton {
 			return UndefinedSingleton, true, ev
 		}
-		if vv != nil {
-			v = vv
-		}
-	} else if ev := TakeCallbackErrorValue(); ev != UndefinedSingleton {
-		return UndefinedSingleton, true, ev
 	}
 	return v, done, nil
 }
@@ -167,6 +172,10 @@ func IteratorHelperMethod(name string) *BuiltinMethod {
 			}
 			fn := argOr(args, 0)
 			if !IsCallable(fn) {
+				// 2026 校验语义: 参数校验失败须先 IteratorClose(底层) 再抛
+				// (argument-validation-failure-closes-underlying 族), close
+				// 自身的错误被丢弃 (原 TypeError 胜出)。
+				CloseIterator(this)
 				return NewTypeError("Iterator.prototype.%s: callback must be a function", name)
 			}
 			d, errVal := newIteratorDriver(this)
@@ -185,6 +194,10 @@ func IteratorHelperMethod(name string) *BuiltinMethod {
 			var it *JSIterator
 			it = &JSIterator{Name: "Iterator " + name, NextFn: func() (Value, bool) {
 				for {
+					// completed-after-abrupt-completion: 终态后不再步进底层。
+					if it.exhausted {
+						return UndefinedSingleton, true
+					}
 					if inner != nil {
 						v, done := innerNext()
 						if ev := TakeCallbackErrorValue(); ev != UndefinedSingleton {
@@ -198,12 +211,12 @@ func IteratorHelperMethod(name string) *BuiltinMethod {
 					}
 					v, done, err := d.step()
 					if err != nil {
-						// 协议违规 (next 返回非对象): 直接抛出, 不关闭底层
-						if isNextProtocolViolation(err) {
-							it.PendingErr = err
-						} else {
-							it.PendingErr = closeOuter(err)
-						}
+						// 协议违规 (next 返回非对象): 直接抛出, 不关闭底层。
+						// 其余 step abrupt: 标记终态后传播, 同样**不**关闭
+						// (underlying-iterator-not-closed-when-step-throws /
+						// completed-after-abrupt-completion 族)。
+						it.exhausted = true
+						it.PendingErr = err
 						return UndefinedSingleton, true
 					}
 					if done {
@@ -240,47 +253,83 @@ func IteratorHelperMethod(name string) *BuiltinMethod {
 						}
 						nx, ok := Iterate(r)
 						if !ok {
-							it.PendingErr = closeOuter(NewTypeError("Iterator.prototype.flatMap: callback must return an iterable"))
-							return UndefinedSingleton, true
+							// GetIterator 回退: mapper 结果自带 next 方法时按
+							// 迭代器协议直接驱动 (return-is-forwarded-to-mapper-result)。
+							nx2, ok2 := IteratorNextFrom(r)
+							if !ok2 {
+								it.exhausted = true
+								it.PendingErr = closeOuter(NewTypeError("Iterator.prototype.flatMap: callback must return an iterable"))
+								return UndefinedSingleton, true
+							}
+							nx = nx2
 						}
 						inner, innerNext = r, nx
 					}
 				}
 			}}
-			it.ReturnHook = func() { CloseIterator(this) }
+			// flatMap 的 return 语义: 先关闭当前 inner (mapper 结果迭代器),
+			// 再关闭底层 —— 两层都要转发 (return-is-forwarded-to-mapper-result
+			// 与 return-is-forwarded-to-underlying-iterator 两族)。
+			it.ReturnHook = func() {
+				CloseIterator(this)
+				if inner != nil {
+					CloseIterator(inner)
+				}
+			}
 			return it
 		})
 
 	case "take", "drop":
 		m = NewBuiltinMethod(name, func(this Value, args ...Value) Value {
+			// RequireObjectCoercible 先于 ToNumber (this-non-object 族)。
+			if !IsObjectLike(this) {
+				return NewTypeError("Iterator.prototype.%s: receiver must be an Object", name)
+			}
+			// 2026 校验语义 (limit-rangeerror / argument-validation-* 族):
+			// ToNumber(limit) 在 GetIteratorDirect 之前; 任何校验失败
+			// (ToNumber abrupt / NaN / 负数 / 有限值 > 2^53-1) 一律先
+			// IteratorClose(底层, close 自身错误丢弃) 再抛 RangeError;
+			// 仅 +Infinity 合法。ToIntegerOrInfinity 在此按快照语义内联。
+			raw := argOr(args, 0)
+			num, err2 := iteratorToNumber(raw)
+			if err2 != nil {
+				CloseIterator(this)
+				return err2
+			}
+			limit := num
+			if math.IsNaN(limit) {
+				CloseIterator(this)
+				return NewRangeError("Iterator.prototype.%s: limit must be an integer >= 0, got NaN", name)
+			}
+			if math.IsInf(limit, 1) {
+				limit = math.MaxFloat64
+			} else {
+				if limit > 1<<53 || limit != math.Trunc(limit) {
+					CloseIterator(this)
+					return NewRangeError("Iterator.prototype.%s: limit must be an integer >= 0, got %v", name, num)
+				}
+				if limit < 0 {
+					CloseIterator(this)
+					return NewRangeError("Iterator.prototype.%s: limit must be an integer >= 0, got %v", name, num)
+				}
+			}
+			// limit 校验全部通过后才 GetIteratorDirect (argument-effect-order:
+			// ToNumber limit 必须先于 get next)。
 			d, errVal := newIteratorDriver(this)
 			if errVal != nil {
 				return errVal
 			}
-			// limit: ToNumber (回调桥错误传播)。
-			raw := argOr(args, 0)
-			num, err2 := iteratorToNumber(raw)
-			if err2 != nil {
-				return err2
-			}
-			if math.IsNaN(num) {
-				return NewTypeError("Iterator.prototype.%s: limit must be a number, got NaN", name)
-			}
-			limit := num
-			if name == "drop" && math.IsNaN(limit) {
-				limit = 0
-			}
-			if limit < 0 {
-				if ev := CloseIterator(this); ev != nil {
-					return ev
-				}
-				return NewRangeError("Iterator.prototype.%s: limit must be >= 0, got %v", name, limit)
-			}
 			count := 0.0
 			var it *JSIterator
 			it = &JSIterator{Name: "Iterator " + name, NextFn: func() (Value, bool) {
+				// completed-after-abrupt-completion: step 异常或限额触顶后
+				// helper 进入终态 (done 恒 true, 底层不再步进, return 不转发)。
+				if it.exhausted {
+					return UndefinedSingleton, true
+				}
 				if name == "take" {
 					if count >= limit {
+						it.exhausted = true
 						if ev := CloseIterator(this); ev != nil {
 							it.PendingErr = ev
 						}
@@ -288,6 +337,7 @@ func IteratorHelperMethod(name string) *BuiltinMethod {
 					}
 					v, done, err := d.step()
 					if err != nil {
+						it.exhausted = true
 						it.PendingErr = err
 						return UndefinedSingleton, true
 					}
@@ -303,6 +353,7 @@ func IteratorHelperMethod(name string) *BuiltinMethod {
 					count++
 					_, done, err := d.step()
 					if err != nil {
+						it.exhausted = true
 						it.PendingErr = err
 						return UndefinedSingleton, true
 					}
@@ -313,6 +364,7 @@ func IteratorHelperMethod(name string) *BuiltinMethod {
 				}
 				v, done, err := d.step()
 				if err != nil {
+					it.exhausted = true
 					it.PendingErr = err
 					return UndefinedSingleton, true
 				}
@@ -327,52 +379,56 @@ func IteratorHelperMethod(name string) *BuiltinMethod {
 
 	case "chunks", "windows":
 		m = NewBuiltinMethod(name, func(this Value, args ...Value) Value {
-			d, errVal := newIteratorDriver(this)
-			if errVal != nil {
-				return errVal
-			}
 			// chunkSize/windowSize: 不做数值强制转换 —— 非数字直接 TypeError
-			// (chunkSize-no-coercion: valueOf/toString 不得调用)。
+			// (chunkSize-no-coercion: valueOf/toString 不得调用);
+			// 校验在 GetIteratorDirect 之前 (argument-effect-order: 无副作用)。
 			raw := argOr(args, 0)
 			num, isNum := raw.(*Number)
 			if !isNum {
+				CloseIterator(this) // 校验失败先关闭, close 错误丢弃
 				return NewTypeError("Iterator.prototype.%s: size must be a number", name)
 			}
 			n := num.Value
 			if math.IsNaN(n) || math.IsInf(n, 0) || n != math.Trunc(n) {
+				CloseIterator(this) // 校验失败先关闭, close 错误丢弃
 				return NewTypeError("Iterator.prototype.%s: size must be an integer", name)
 			}
 			if n < 1 || n >= 1<<32 {
-				if ev := CloseIterator(this); ev != nil {
-					return ev
-				}
+				CloseIterator(this) // close 错误丢弃, RangeError 胜出
 				return NewRangeError("Iterator.prototype.%s: size is out of range: %v", name, n)
 			}
-			size := int(n)
 			// undersized 参数 (ES2026): undefined → "only-full"; 其余仅接受
 			// "only-full"/"allow-partial" 两个字符串, 其它一律 TypeError
-			// (不做任何强制转换; abrupt 先 IteratorClose 再抛)。
+			// (不做任何强制转换; 校验失败先 IteratorClose 再抛, close 错误丢弃)。
 			undersized := "only-full"
 			if name == "windows" {
 				rawU := argOr(args, 1)
 				if rawU != UndefinedSingleton {
 					s, isStr := rawU.(*String)
 					if !isStr || (s.Value != "only-full" && s.Value != "allow-partial") {
-						if ev := CloseIterator(this); ev != nil {
-							return ev
-						}
+						CloseIterator(this)
 						return NewTypeError("Iterator.prototype.windows: undersized must be \"only-full\" or \"allow-partial\"")
 					}
 					undersized = s.Value
 				}
 			}
+			// 全部校验通过后才 GetIteratorDirect (argument-effect-order: 零副作用)。
+			d, errVal := newIteratorDriver(this)
+			if errVal != nil {
+				return errVal
+			}
+			size := int(n)
 			allowPartial := undersized == "allow-partial"
 			buf := make([]Value, 0, size)
 			var it *JSIterator
 			it = &JSIterator{Name: "Iterator " + name, NextFn: func() (Value, bool) {
 				for {
+					if it.exhausted {
+						return UndefinedSingleton, true
+					}
 					v, done, err := d.step()
 					if err != nil {
+						it.exhausted = true
 						it.PendingErr = err
 						return UndefinedSingleton, true
 					}
@@ -423,7 +479,7 @@ func IteratorHelperMethod(name string) *BuiltinMethod {
 
 	case "toArray":
 		m = NewBuiltinMethod(name, func(this Value, args ...Value) Value {
-			list, errVal := iteratorCollectList(this, name, true)
+			list, errVal := iteratorCollectList(this, name, false) // 规范: abrupt 不关闭
 			if errVal != nil {
 				return errVal
 			}
@@ -434,6 +490,7 @@ func IteratorHelperMethod(name string) *BuiltinMethod {
 		m = NewBuiltinMethod(name, func(this Value, args ...Value) Value {
 			fn := argOr(args, 0)
 			if !IsCallable(fn) {
+				CloseIterator(this) // 校验失败先关闭 (见上), close 错误丢弃
 				return NewTypeError("Iterator.prototype.forEach: callback must be a function")
 			}
 			_, errVal := iteratorLazy(this, func(v Value, i int) (bool, Value, Value) {
@@ -453,6 +510,7 @@ func IteratorHelperMethod(name string) *BuiltinMethod {
 		m = NewBuiltinMethod(name, func(this Value, args ...Value) Value {
 			fn := argOr(args, 0)
 			if !IsCallable(fn) {
+				CloseIterator(this) // 校验失败先关闭, close 错误丢弃
 				return NewTypeError("Iterator.prototype.%s: callback must be a function", name)
 			}
 			res, errVal := iteratorLazy(this, func(v Value, i int) (bool, Value, Value) {
@@ -559,9 +617,6 @@ func IteratorHelperMethod(name string) *BuiltinMethod {
 			for {
 				v, done, err := d.step()
 				if err != nil {
-					if !isNextProtocolViolation(err) {
-						CloseIterator(this)
-					}
 					return err
 				}
 				if done {
@@ -612,11 +667,9 @@ func iteratorLazy(this Value, visit func(v Value, i int) (stop bool, result Valu
 	for i := 0; ; i++ {
 		v, done, err := d.step()
 		if err != nil {
-			if !isNextProtocolViolation(err) {
-				if ev := CloseIterator(this); ev != nil {
-					return nil, ev
-				}
-			}
+			// 规范: IteratorStepValue / 回调的 abrupt 直接向上传播,
+			// **不** IteratorClose (underlying-iterator-not-closed-when-step-throws
+			// 族); 协议违规同样不关闭。
 			return nil, err
 		}
 		if done {
@@ -624,6 +677,8 @@ func iteratorLazy(this Value, visit func(v Value, i int) (stop bool, result Valu
 		}
 		stop, result, errVal := visit(v, i)
 		if errVal != nil {
+			// 回调抛错: IteratorClose 后传播 (predicate-throws 族,
+			// returnCalls 必须 == 1)。
 			if ev := CloseIterator(this); ev != nil {
 				return nil, ev
 			}

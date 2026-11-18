@@ -50,6 +50,110 @@ func setupObjectPrototype(o *object.BuiltinFunction) {
 		return object.UndefinedSingleton
 	}))
 
+	// ===== Annex B 遗留访问器 (B3/rr27Sf): __defineGetter__ /
+	// __defineSetter__ / __lookupGetter__ / __lookupSetter__ =====
+	// 此前 typeof 检出为 "undefined", typeof 断言族与功能族全红。
+	// 语义 (B.2.2.1.x): RequireObjectCoercible(this) → ToObject;
+	// define 系校验函数可调用后 DefineOwnProperty
+	// {get/set:undefined, enumerable:true, configurable:true};
+	// lookup 系沿原型链找自有访问器属性。
+
+	objOf := func(this object.Value) (*object.Object, object.Value) {
+		if isUndefinedValue(this) || isNullValue(this) {
+			return nil, object.NewTypeError("Object.prototype method called on null or undefined")
+		}
+		if o, ok := this.(*object.Object); ok {
+			return o, nil
+		}
+		return nil, nil // 原始值: 仅 lookup 系沿链查找, 不落盘
+	}
+
+	proto.SetBuiltinProperty("__defineGetter__", object.NewBuiltinMethod("__defineGetter__", func(this object.Value, args ...object.Value) object.Value {
+		if _, err := objOf(this); err != nil {
+			return err
+		}
+		o, _ := this.(*object.Object)
+		if o == nil {
+			return object.UndefinedSingleton
+		}
+		name := ""
+		if len(args) > 0 {
+			name = object.ToString(args[0])
+		}
+		getter := argOrNil(args, 1)
+		if !object.IsCallable(getter) {
+			return object.NewTypeError("Object.prototype.__defineGetter__: getter must be a function")
+		}
+		o.DefineOwnProperty(name, object.PropertyDescriptor{
+			Value:        object.NewAccessor(getter, nil),
+			Enumerable:   true,
+			Configurable: true,
+		})
+		return object.UndefinedSingleton
+	}))
+
+	proto.SetBuiltinProperty("__defineSetter__", object.NewBuiltinMethod("__defineSetter__", func(this object.Value, args ...object.Value) object.Value {
+		if _, err := objOf(this); err != nil {
+			return err
+		}
+		o, _ := this.(*object.Object)
+		if o == nil {
+			return object.UndefinedSingleton
+		}
+		name := ""
+		if len(args) > 0 {
+			name = object.ToString(args[0])
+		}
+		setter := argOrNil(args, 1)
+		if !object.IsCallable(setter) {
+			return object.NewTypeError("Object.prototype.__defineSetter__: setter must be a function")
+		}
+		o.DefineOwnProperty(name, object.PropertyDescriptor{
+			Value:        object.NewAccessor(nil, setter),
+			Enumerable:   true,
+			Configurable: true,
+		})
+		return object.UndefinedSingleton
+	}))
+
+	lookupAccessor := func(this object.Value, args []object.Value, wantGetter bool) object.Value {
+		if _, err := objOf(this); err != nil {
+			return err
+		}
+		name := ""
+		if len(args) > 0 {
+			name = object.ToString(args[0])
+		}
+		cur := this
+		for cur != nil {
+			if o, ok := cur.(*object.Object); ok {
+				if desc, found := o.Properties[name]; found {
+					if acc, isAcc := desc.Value.(*object.Accessor); isAcc {
+						if wantGetter {
+							if acc.Getter != nil {
+								return acc.Getter
+							}
+							return object.UndefinedSingleton
+						}
+						if acc.Setter != nil {
+							return acc.Setter
+						}
+						return object.UndefinedSingleton
+					}
+					return object.UndefinedSingleton // 数据属性: undefined
+				}
+			}
+			cur = object.ProtoOf(cur)
+		}
+		return object.UndefinedSingleton
+	}
+	proto.SetBuiltinProperty("__lookupGetter__", object.NewBuiltinMethod("__lookupGetter__", func(this object.Value, args ...object.Value) object.Value {
+		return lookupAccessor(this, args, true)
+	}))
+	proto.SetBuiltinProperty("__lookupSetter__", object.NewBuiltinMethod("__lookupSetter__", func(this object.Value, args ...object.Value) object.Value {
+		return lookupAccessor(this, args, false)
+	}))
+
 	// toString(): 输出 "[object Tag]"。
 	// 它接收任意 this —— 通过 .call/.apply 反射时可以作用于任何值，
 	// 因此实现必须对所有内置类型有标签，而不能假设 this 是 *object.Object。

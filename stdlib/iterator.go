@@ -127,22 +127,35 @@ func setupIteratorGlobal() *object.BuiltinFunction {
 
 	// ES2026 Iterator.concat(...iterables) — 顺序拼接
 	fn.SetProperty("concat", object.NewBuiltin("concat", func(args ...object.Value) object.Value {
-		nexts, ok := collectIterables(object.NewArray(args))
+		concats, ok := collectIterables(object.NewArray(args))
 		if !ok {
 			return object.NewTypeError("Iterator.concat: arguments must be iterables")
 		}
 		idx := 0
-		return &object.JSIterator{NextFn: func() (object.Value, bool) {
+		started := false
+		var it *object.JSIterator
+		it = &object.JSIterator{NextFn: func() (object.Value, bool) {
 			for {
-				if idx >= len(nexts) {
+				if idx >= len(concats) {
+					it.MarkExhausted()
 					return object.UndefinedSingleton, true
 				}
-				if v, done := nexts[idx](); !done {
+				started = true
+				if v, done := concats[idx].next(); !done {
 					return v, false
 				}
 				idx++
 			}
 		}}
+		// return 转发语义 (concat/return-is-* 族): 已耗尽或尚未开始步进时
+		// 不转发; 否则关闭当前底层迭代器一次。
+		it.ReturnHook = func() {
+			if it.IsExhausted() || !started || idx >= len(concats) {
+				return
+			}
+			object.CloseIterator(concats[idx].iter)
+		}
+		return it
 	}))
 
 	setupZipMethods(fn)
@@ -189,23 +202,30 @@ func setupIteratorGlobal() *object.BuiltinFunction {
 	return fn
 }
 
-// collectIterables 把一组可迭代值转换为 next 闭包列表。
-func collectIterables(v object.Value) ([]func() (object.Value, bool), bool) {
+// iterRec 记录 concat 每个成员的迭代器对象与 next 闭包 (return 转发需要
+// 迭代器本体做 IteratorClose)。
+type iterRec struct {
+	iter object.Value
+	next func() (object.Value, bool)
+}
+
+// collectIterables 把一组可迭代值转换为 (迭代器对象, next 闭包) 列表。
+func collectIterables(v object.Value) ([]iterRec, bool) {
 	next, ok := object.Iterate(v)
 	if !ok {
 		return nil, false
 	}
-	var out []func() (object.Value, bool)
+	var out []iterRec
 	for {
 		item, done := next()
 		if done {
 			return out, true
 		}
-		itemNext, ok := object.Iterate(item)
-		if !ok {
+		itemNext, iok := object.Iterate(item)
+		if !iok {
 			return nil, false
 		}
-		out = append(out, itemNext)
+		out = append(out, iterRec{iter: item, next: itemNext})
 	}
 }
 
