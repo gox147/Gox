@@ -24,6 +24,7 @@ import (
 
 	"github.com/14752222/Gox/gfx"
 	"github.com/jezek/xgb"
+	"github.com/jezek/xgb/randr"
 	"github.com/jezek/xgb/xproto"
 )
 
@@ -149,8 +150,19 @@ func newSurface(cfg gfx.WindowConfig) (gfx.Surface, error) {
 
 	s.loadKeymap(setup)
 
+	// RandR: 为了能收到"显示器拓扑变了"的事件 (根窗口的 ScreenChangeNotify)。
+	// 必须在 MapWindow 之前选事件, 且与 display.go 的 ensureRandr 共用同一张
+	// 已初始化表 (不重复发 QueryExtension)。
+	if ensureRandr(conn) {
+		randr.SelectInputChecked(conn, setup.DefaultScreen(conn).Root, randr.NotifyMaskScreenChange).Check()
+	}
+
 	xproto.MapWindow(conn, win)
 	conn.Sync() // 冲刷建窗请求并确认连接可用
+
+	// 新窗口播种密度缓存 (见 gfx/density.go 的 noteSurfaceCreated): 首帧之前
+	// 就把"我落在哪块屏上"问清楚一次, 之后只在换屏事件里重问。
+	gfx.NoteSurfaceCreated(s)
 
 	// 独立读事件 goroutine: xgb 的 WaitForEvent 阻塞, 借通道转成可 select
 	go func() {
@@ -434,6 +446,13 @@ func (s *surface) translate(ev xgb.Event) bool {
 		ev = *p // 指针传入也归一成值, 兼容调用方不小心取址
 	}
 	switch e := ev.(type) {
+	case randr.ScreenChangeNotifyEvent:
+		// 显示器拓扑变了 (插拔 / 改分辨率 / RandR 重配): 屏表与"窗口落在哪块屏"
+		// 都可能变。两者都经 Post 转投 —— 它们要跑脚本回调, 不能在事件读协程里做。
+		// NotifyDisplaysChanged 内部作废密度缓存 (见 density.go), 随后的
+		// PostWindowDisplayCheck 把窗口的新归属重新播种。
+		gfx.Post(func() { gfx.NotifyDisplaysChanged() })
+		gfx.PostWindowDisplayCheck(s)
 	case xproto.ClientMessageEvent:
 		// WM_DELETE_WINDOW → 关闭
 		if e.Type == s.wmProtocols && len(e.Data.Data32) > 0 &&

@@ -263,6 +263,11 @@ func ResetDisplaysForTest() {
 // (→ 标脏 → 本帧重绘), 同步调用省掉一次跨轮次的延迟。代价是回调抛错必须被
 // 收走 (recordWarn), 否则一次笔误会让整帧挂掉。
 func notifyEnvChanged() {
+	// 屏表变了 ⇒ 所有窗口都可能"落到了另一块屏上"(插拔屏 / 改分辨率 / 改缩放),
+	// 密度缓存整体作废 —— 否则下一次 Layout 会拿着旧系数把整棵树按旧比例排出来
+	// (见 density.go 的"缓存何时作废")。
+	noteSurfaceDisplayMaybeChanged(nil)
+
 	screenMu.Lock()
 	screenRevision++
 	set := screenEnvSet
@@ -1190,6 +1195,10 @@ func windowDisplaySignalLocked() object.Value {
 // **必须在 GUI 线程调用** (会跑脚本回调) —— 后端经 gfx.Post 转投。后端不支持
 // DisplayOf 时 displayOfSurface 恒返回主屏, 于是永远不报 (安静降级)。
 func CheckWindowDisplay(s Surface) {
+	// 换屏 = 密度系数可能变。作废放在**比对之前**: checkWindowDisplayForApp 内部
+	// 本来就要调 displayOfSurface 问后端一次, 作废之后紧接着的 Layout 会重算
+	// 密度 —— 顺序反了会先按旧系数排一帧, 下一帧才纠正 (可见的一次跳动)。
+	noteSurfaceDisplayMaybeChanged(s)
 	if a := appForSurface(s); a != nil {
 		checkWindowDisplayForApp(a)
 	}

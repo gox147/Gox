@@ -473,6 +473,10 @@ func newSurface(cfg gfx.WindowConfig) (gfx.Surface, error) {
 
 	w, h := s.Size()
 	s.reallocDIB(w, h)
+	// 新窗口播种密度缓存 (见 gfx/density.go 的 noteSurfaceCreated): 首帧之前
+	// 就把"我落在哪块屏上"问清楚一次, 之后只在 WM_DPICHANGED / WM_DISPLAYCHANGE
+	// 里重问 —— 布局路径不再每帧向后端要这个答案。
+	gfx.NoteSurfaceCreated(s)
 	return s, nil
 }
 

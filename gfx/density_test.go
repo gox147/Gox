@@ -141,7 +141,14 @@ func TestDensityScaleFollowsWindowAcrossScreens(t *testing.T) {
 	}
 
 	// 窗口被拖到 2x 屏 (后端报告的还是同一块屏的 ID, 但 Scale 变了)。
+	//
+	// 跨屏这条信息只能由后端送进来 —— 内核不问就不知道 (问就是每帧三次同步
+	// 往返, T3-5 第十四批把它拿掉了)。生产上三个后端都经 CheckWindowDisplay
+	// 送达 (X11 ConfigureNotify → PostWindowDisplayCheck、win32 WM_DPICHANGED、
+	// cocoa NSWindowDidChangeScreen), 用例调同一个入口, 顺序也与生产一致:
+	// **先**让后端报"这块窗口换屏了", **再**布局。
 	f.scale = 2
+	CheckWindowDisplay(f.s)
 	Layout(root, 400, 300)
 	if child.Box.W != 100 || child.Box.X != 20 {
 		t.Fatalf("拖到 2x 屏后应为 100 宽 / x=20, got %d / %d", child.Box.W, child.Box.X)
@@ -149,6 +156,7 @@ func TestDensityScaleFollowsWindowAcrossScreens(t *testing.T) {
 
 	// 拖回去也要跟着回落 (不是"只能变大一次")。
 	f.scale = 1
+	CheckWindowDisplay(f.s)
 	Layout(root, 400, 300)
 	if child.Box.W != 50 || child.Box.X != 10 {
 		t.Fatalf("拖回 1x 屏后应回到 50 宽 / x=10, got %d / %d", child.Box.W, child.Box.X)
