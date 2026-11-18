@@ -1800,3 +1800,224 @@ fib28 199/197/204/199 ms，落在上面 −3.5% 的同一区间；startup / time
 这条留作下一批的第一个动作：**先把 `continue` 与帧切换的全部耦合点列清楚**
 （`OP_CALL`/`OP_RETURN`/`OP_NEW`/生成器冻结/try-catch 跳转），再决定新的收尾
 判据放在哪里 —— 而不是先动代码再补语义。
+
+### 12.14 T3-5 第十三批：字体文件缓存的内容指纹（2026-11-19 凌晨批，正确性修复）
+
+本批**不产出性能数字**，它修的是前两批自己在 CI 上暴露出来的一个正确性洞：
+缓存认错文件 ⇒ 用错误的字体渲染。这类问题必须当作 bug 处理，不能挂"性能优化"名下。
+
+#### 12.14.1 现象：同一个用例在 Windows 上红，Linux/macOS 全绿
+
+`TestFontFileCacheHonoursFileIdentity` 的做法是"写一份真字体 → 解析一次 →
+把同一个路径改写成垃圾内容 → 再解析，必须报错"。缓存的身份判据是
+`(size, mtime)`。用例自己留了一手：改写之后**把 mtime 显式往后推 2 秒**。
+
+- Linux / macOS：mtime 秒级精度 + 显式后推 ⇒ 判据必然变化，绿。
+- Windows（NTFS，LastWriteTime 精度 100ns）：`os.WriteFile` 覆盖写会**保留原
+  mtime**，用例把 mtime 写回原值那一步又与"写文件"落在同一粒度里 ⇒ 判据完全
+  没变 ⇒ 缓存命中 ⇒ 解析"成功" ⇒ 红。
+
+结论：**旧用例不是"平台差异"，而是它靠一个偶然的时间后推躲开了洞**。任何人
+在同一秒内热替换字体（换字体目录、包管理器升级、用户拖进一个同名文件）都会
+踩到。先补 `TestFontFileCacheRejectsSameSizeSameMtimeSwap`（等长内容 + 原
+mtime 的替换必须被认出），再修实现。
+
+#### 12.14.2 第一版修法本身也有洞：指纹只存头部 4K 的**原字节**
+
+第一版在 entry 上存 `sig [4096]byte` = 文件首 4K 的原字节（外加 size 折进末尾
+8 字节），命中时重读首 4K 比较。它能挡住"换成垃圾内容"（第一处差异就在表头），
+但挡不住**首 4K 相同、只有后面不同**的替换 —— 那正是"换了一份同族但不同版本
+的字体""把字形数据改了"这类真实形态。契约写的是"内容变了就一定重读"，实现
+只做到了"头部变了才重读"。
+
+这是本批自己引入、又自己撤回的错误。改法是让指纹成为"片段 + 片段"而不是
+"片段直接等于"：
+
+```go
+const (
+    sigLen     = 4096                // 每次核对读的字节总量不变
+    headSigLen = 3072                // 头 3/4: 覆盖 sfnt 表目录 + 前几张表
+    tailSigLen = sigLen - headSigLen // 尾 1/4: 兜住"头部同字节、尾部不同"
+)
+```
+
+`sig` = 「头 3072 字节」+「尾 1024 字节」的拼贴（`takeFontSignature`）。头部
+覆盖表目录（表个数上限 4095、每项 16 字节，最坏 64KB，3KB 足以分辨正常字体的
+表集合），尾部覆盖最容易随"换了一份文件"而变的内容。读盘量仍是每次 4K，改成
+读两块（`ReadAt(off=0)` + `ReadAt(off=size-tailSigLen)`），对页缓存无感。
+
+#### 12.14.3 闸门
+
+| 断言 | 形态 | 守的是什么 |
+|---|---|---|
+| `TestFontFileCacheHonoursFileIdentity` | 换成非字体 + mtime 后推 | 最基本的"文件换了要重读" |
+| `TestFontFileCacheRejectsSameSizeSameMtimeSwap` | 等长垃圾 + 原 mtime 写回 | Windows 上 `os.WriteFile` 保留 mtime 的形态 |
+| `TestFontFileCacheRejectsTailOnlySwap` | 首 4K 完全相同，尾字节翻一位 | **第一版指纹的洞**：指纹只覆盖头部时必红 |
+| `TestFontFileCacheMissDoesNotUseStaleFingerprint` | 内容不变连取两次 | 防"判据过严 ⇒ 每次都重解析"，反向守性能 |
+
+身份用例都走 `loadFontFileEntry`（而不是上层的 `parseFontFile`），因为身份判定
+发生在 entry 层 —— 走上层会把"缓存命中"与"另一个目录级缓存命中"混在一起，
+红了也说不清是谁的问题。
+
+样本目录**不用 `t.TempDir()`**（`useFontSampleDir`）：缓存命中时会持有被缓存
+文件的 fd 直到 `resetFontCaches`，而 Windows 上"文件还被打开着"的目录删不掉，
+`t.TempDir` 的自动清理会报 `The process cannot access the file because it is
+being used by another process` —— 用例本身全过、却在 cleanup 阶段红掉。顺序改
+成"先 `resetFontCaches` 放 fd，再删目录"。
+
+CI 侧补一步**三平台**跑的 `go test ./gfx/ -run TestFontFileCache`，不挂
+`if: runner.os == 'Linux'`：这条纪律恰恰是在 Windows 上被打破的，只放在 Linux
+那一步里等于"只在不会犯错的平台上验"。该步骤必须**显式 `shell: bash`**（不写
+就是 pwsh，`rc=$?` 在那里面不存在），并且**不要 `if ! go test`**（会把命令输出
+吞进条件里，注解只剩一句 exit code 1）—— 这两条都是当天实际踩过的坑。
+
+#### 12.14.4 验证
+
+```
+go test ./gfx/ -run TestFontFileCache -count=1 -v          # 4/4 PASS
+go test ./gfx/ -run 'TestFont|TestSetFontPath|TestScanSystemFonts|...' -race   # ok 4.2s
+python3 scripts/check-coldstart.py                          # 3 项判据全过
+```
+
+冷启动数字化核对：`font_stage_total_ms 1.92ms`（基线 16.73ms）、
+`process_first_frame_ms 13.00ms`（基线 55ms）、`inproc_first_frame_ms 0.75ms`，
+与 §12.12 一致 —— 指纹改动**没有**把读盘量或首帧时间推回去。符合预期：每个
+entry 首次多读 4K，之后每次命中多读 4K（已热页），而一次启动通常只解析 1~2 个
+字体文件。
+
+#### 12.14.5 遗留
+
+- `signFontFile` 的"头段短读"分支（文件在 `stat` 之后被截断）没有独立用例覆盖
+  —— 需要构造"stat 与 open 之间文件变短"的竞态，代价大于收益，先记着。
+- 指纹仍是"首尾采样"，理论上存在"首 4K 相同 + 尾部相同 + 中段不同"的碰撞。
+  要彻底消除得存全长摘要（或改用 `(inode, ctime, size)` 三元组，但 Windows 上
+  `ctime` 不可靠）。判断：中段差异而首尾完全相同的"字体替换"在现实中不存在
+  （字体的表目录与字形数据分布在两头），不值得为它退化成整份读。
+
+### 12.15 T3-5 第十四批：密度缓存改事件驱动 —— 每帧不再问后端"我在哪块屏"（2026-11-19 凌晨批）
+
+#### 12.15.1 先量清楚 14ms 花在哪（§12.12.5 遗留的第一条）
+
+§12.12.5 说"下一批第一个动作应当把 14ms 拆开，而不是继续在字体里抠"。拆的结果
+（临时 env 开关打点，测完即撤，未入库；单进程 3 组一致）：
+
+| 阶段 | 耗时 |
+|---|---|
+| 进程 exec + Go runtime + 包 init（空脚本 `gox empty.js` 整体作差） | 4.7 ~ 6.1ms |
+| `EvalFileVM` 到首帧（含模块装载 + 建窗 + 布局 + 绘制 + 上屏） | 6.1 ~ 6.6ms |
+| ├ 其中 `redraw` 开始前（模块装载 / 建树 / 建窗） | 1.8 ~ 2.0ms |
+| ├ **`Layout` 单次** | **3.6 ~ 3.8ms** |
+| │　├ `refreshDensity`（每帧解析"我在哪块屏"） | 0.30 ~ 0.45ms |
+| │　└ `layoutNode`（树遍历） | 3.1 ~ 3.4ms |
+| ├ `Draw` + 焦点环 | 0.22ms |
+| └ `present`（XPutImage） | 0.5ms |
+
+两条与旧结论冲突的事实：
+
+1. **建窗不是大头**（§12.11 的 11~13ms 已由 §12.12.0 证伪，这里再次确认：建窗在
+   `redraw-start` 之前那 1.8~2.0ms 里，与模块装载、建树混在一起，单项不超过 1ms）。
+2. **进程 exec + Go runtime 占了 14ms 里的约 5ms**（Go 空程序 2.7ms，C 空程序 1.8ms
+   —— 后者是这台机器的 exec 地板）。这一段解释器优化动不到。
+
+#### 12.15.2 靶子：`refreshDensity` 每帧三次同步往返
+
+`Layout` 第一行是 `refreshDensity()` —— 它要回答"本帧 dp 系数是多少"，答案取决于
+窗口落在哪块屏。旧实现是**每帧现场问**：
+
+```
+refreshDensity → resolveDensity → DisplayOf(surface)      ← TranslateCoordinates + QueryVersion + GetMonitors
+                                → findDisplay(id) → Displays()  ← 再枚举一遍
+```
+
+实测各查询的往返成本（同机 Xvfb，各 300 次平均）：
+
+| 调用 | 单次 |
+|---|---|
+| `TranslateCoordinates` | 12.3 µs |
+| `randr.QueryVersion` | 10.8 µs |
+| `randr.GetMonitors` | 13.5 µs |
+| **合计（旧路径每帧）** | **36.6 µs** |
+
+即：**60fps 的帧预算 16.7ms 里有 0.22% 花在"确认我没被挪到别的屏上"，而窗口根本没动。**
+
+#### 12.15.3 改法：事件驱动作废 + 建窗播种
+
+| 旧 | 新 |
+|---|---|
+| 每帧 `DisplayOf` + `Displays()` | 缓存命中时**零后端调用**（一次指针比较） |
+| 作废条件只有"窗口换了" | 再加一条：后端报"这块窗口可能换屏了" |
+| 无 | 建窗后播种一次（`NoteSurfaceCreated`），首帧前确定归属 |
+
+作废信号（全部经已有的事件通道，不新增轮询）：
+
+| 后端 | 信号 | 现有接线 |
+|---|---|---|
+| X11 | `ConfigureNotify` | `PostWindowDisplayCheck` → `CheckWindowDisplay` |
+| X11 | RandR `ScreenChangeNotify`（插拔屏 / 改分辨率） | **本批新增**：建窗时 `SelectInput(NotifyMaskScreenChange)`，事件 → `NotifyDisplaysChanged` + `PostWindowDisplayCheck` |
+| win32 | `WM_DPICHANGED` / `WM_DISPLAYCHANGE` | 已有 `PostWindowDisplayCheck` / `NotifyDisplaysChanged` |
+| cocoa | `NSWindowDidChangeScreen` / `NSApplicationDidChangeScreenParameters` | 已有 `CheckAllWindowsDisplay` / `NotifyDisplaysChanged` |
+| 全部 | 建窗完成 | **本批新增** `gfx.NoteSurfaceCreated(s)`（x11 / win32 / cocoa 各一处） |
+
+语义为什么仍然正确：**系数在"事件到达之后的第一次布局"就更新**，而"没事件"就意味着
+"窗口没换屏"（三个后端的换屏事件都是系统级通知，不依赖轮询）。这正是"每帧刷"要保的
+性质，只是把判断从"每帧问"换成了"事件告诉我"。
+
+#### 12.15.4 A/B 数字（同机、交替采样、每样本间隔 250ms、预热各一次）
+
+**进程级首帧**（Xvfb `:55` 1024×768×24，`scripts/bench/coldstart_gui.js`，n=24 对，
+base = `f0aa198` 干净克隆构建带 vcs stamping，new = 本批 dirty）：
+
+| 口径 | base | 本批 | 变化 |
+|---|---|---|---|
+| 首帧（默认字体，3 行 text） | 14.20 ms | 14.10 ms | **−0.7%（−0.10 ms）** |
+| 逐轮胜负 | — | 13/24 轮更快，平 2 | **噪声带内** |
+| startup_idle（n=5 中位） | 6.19 ms | 6.03 ms | −2.5%（噪声带内） |
+| fib28（n=3） | 197 ms | 200 ms | 噪声带内 |
+| 空载 RSS | — | 未变 | — |
+
+**帧口径**（包内基准，`gfx/density_bench_test.go`，同一棵 3 层宽树、同一假后端，
+只切换"是否每帧作废"）：
+
+| 基准 | ns/op（5 次中位） | backend-calls/op |
+|---|---|---|
+| `BenchmarkLayoutDensityCached`（改动后） | 33,108 | **0** |
+| `BenchmarkLayoutDensityPerFrameResolve`（改动前形态） | 33,273 | 1.000 |
+| 差 | −165 ns（0.5%） | 每帧省 1 次后端解析 |
+
+**这两个数字必须一起读**：包内那 165ns 是**假后端**的代价（纯 Go 函数），真实后端
+在 X11 上是 **36.6µs**（12.15.2 实测往返），差 200 倍。所以本批的正确表述是：
+
+- **每帧省下一次同步往返（X11 36.6µs、≥3 次 socket RTT），这是结构性的、与后端实现无关的收益**；
+- **体现在首帧上的收益是 −0.1ms / 噪声带内** —— 因为首帧只有两次布局，而 14ms 里
+  5ms 是进程启动、3.6ms 是树遍历；
+- **不把它写成"冷启动快了 X%"**，也不写"省了 36µs×N"这种外推。
+
+#### 12.15.5 闸门（先建闸门再优化）
+
+| 断言 | 守的形态 |
+|---|---|
+| `TestLayoutDensityNoBackendRoundTrip` | 连续 6 次 Layout，后端只能被问 1 次（首次）——缓存被关就红 |
+| `TestDensityScaleFollowsWindowAcrossScreens`（既有，改为经 `CheckWindowDisplay` 驱动） | 换屏后下一帧必须按新系数 |
+| `TestLayoutDensityFollowsWindowMove` | 换屏 → 作废 → 重算，且能来回 |
+| `TestCheckAllWindowsDisplayInvalidatesCache` | cocoa 那条逐窗口入口也作废（漏了就 mac 上不重排） |
+| `TestLayoutDensityNotifyOtherSurfaceKeepsCache` | 别的窗口换屏不拖累本窗口 |
+| `TestNoteSurfaceCreatedSeedsOnce` | 播种之后首帧只问一次、后续零次 |
+| `TestDisplayScaleUncachedPathStillResolves` | 没走过 Layout 的读数仍现场解析（不许恒为 0/1） |
+
+反向验证：把 `refreshDensity` 的缓存判断改成永远不命中，`TestLayoutDensityNoBackendRoundTrip`
+与 `TestLayoutDensityNotifyOtherSurfaceKeepsCache` 立刻红；改回即绿。
+
+CI 新增一步 **「密度缓存纪律（每帧不查后端）」**，**不挂 `if: runner.os`** ——
+退回去的形态三平台共有，而这条纪律恰恰不该只在 Linux 上验。
+
+#### 12.15.6 遗留
+
+- **`Layout` 的 3.1~3.4ms 树遍历**是首帧里最大单项（23 行、4 个节点的小树也用掉
+  3.4ms —— 说明其中有大头与节点数无关）。下一批应当先在这个数上取证（pprof 到函数级，
+  §12.12.5 说的"缺 pprof 逐函数证据"仍未补）。
+- **`startup_idle` 的 6ms 里约 2.7ms 是 Go runtime 启动地板**（空 Go 程序同价）。
+  想过 `-ldflags=-s -w` 与去掉 `net`/`crypto` 的链接，但那是"二进制体积/启动"另一个
+  话题（T3-6），且会改变 panic 栈信息，不在本批动。
+- 移动端宿主（Android / 鸿蒙 / iOS）的 `NoteSurfaceCreated` 未接 —— 那些平台的密度
+  由宿主上报，`displayScale` 走的是"无缓存现场解析"路径，行为与改动前一致（不会更慢
+  也不会更快），接线留到对应宿主改动时一并做。

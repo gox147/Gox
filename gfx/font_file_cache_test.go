@@ -221,6 +221,29 @@ func TestFontFileReadHookIsLive(t *testing.T) {
 	}
 }
 
+// useFontSampleDir 准备一个**不在 t.TempDir() 下**的样本目录, 并登记清理。
+//
+// 为什么不用 t.TempDir(): 缓存命中时会持有被缓存文件的 fd 直到
+// resetFontCaches, 而 Windows 上"文件还被打开着"的目录删不掉 —— t.TempDir 的
+// 自动清理会报 "The process cannot access the file because it is being used by
+// another process", 于是**用例本身全过、却在 cleanup 阶段红掉**（2026-11-19 的
+// Windows CI 就是这个形态, 断言一条都没出现）。这里的顺序是: 先 resetFontCaches
+// 放掉 fd, 再删目录。
+func useFontSampleDir(t *testing.T) string {
+	t.Helper()
+	dir, err := os.MkdirTemp("", "gox-fontcache-")
+	if err != nil {
+		t.Fatalf("建样本目录: %v", err)
+	}
+	t.Cleanup(func() {
+		resetFontCaches() // 先松开 fd（Windows 上不松开就删不掉）
+		if err := os.RemoveAll(dir); err != nil {
+			t.Logf("清理样本目录（不致命, 在系统临时目录下）: %v", err)
+		}
+	})
+	return dir
+}
+
 // TestFontFileCacheHonoursFileIdentity 文件被替换后 (mtime/size 变) 必须重读,
 // 不能拿旧的面继续用 —— 同一个进程里换字体目录、热替换字体文件都是真实用法。
 func TestFontFileCacheHonoursFileIdentity(t *testing.T) {
@@ -228,7 +251,7 @@ func TestFontFileCacheHonoursFileIdentity(t *testing.T) {
 	if err != nil {
 		t.Fatalf("读取字体样本: %v", err)
 	}
-	p := filepath.Join(t.TempDir(), "swap.ttf")
+	p := filepath.Join(useFontSampleDir(t), "swap.ttf")
 	if err := os.WriteFile(p, data, 0o644); err != nil {
 		t.Fatalf("写样本: %v", err)
 	}
@@ -243,8 +266,12 @@ func TestFontFileCacheHonoursFileIdentity(t *testing.T) {
 	if err := os.Chtimes(p, future, future); err != nil {
 		t.Fatalf("Chtimes: %v", err)
 	}
-	if _, err := parseFontFile(p); err == nil {
+	if _, err := loadFontFileEntry(p); err == nil {
 		t.Fatalf("文件已被替换成非字体, 仍解析成功 —— 文件身份校验失效")
+	}
+	// 再问一次: 上一次要把"坏文件"也钉成一次未命中, 不能反过来污染缓存。
+	if _, err := loadFontFileEntry(p); err == nil {
+		t.Fatalf("坏文件在第一次未命中之后又被缓存成功了 —— 缓存键没跟着内容走")
 	}
 }
 
@@ -264,7 +291,7 @@ func TestFontFileCacheRejectsSameSizeSameMtimeSwap(t *testing.T) {
 	resetFontCandidateScan(true) // 需要持有 fontMu 的版本自己加锁
 	t.Cleanup(func() { resetFontCandidateScan(true) })
 
-	p := filepath.Join(t.TempDir(), "same_size.ttf")
+	p := filepath.Join(useFontSampleDir(t), "same_size.ttf")
 	if err := os.WriteFile(p, data, 0o644); err != nil {
 		t.Fatalf("写样本: %v", err)
 	}
@@ -293,7 +320,92 @@ func TestFontFileCacheRejectsSameSizeSameMtimeSwap(t *testing.T) {
 				st.Size(), now.Size(), st.ModTime(), now.ModTime())
 		}
 	}
-	if _, err := parseFontFile(p); err == nil {
+	if _, err := loadFontFileEntry(p); err == nil {
 		t.Fatalf("等长内容替换 + 同 mtime 后仍解析成功 —— 缓存只靠 (size, mtime) 认身份, 内容指纹没生效")
+	}
+}
+
+// TestFontFileCacheRejectsTailOnlySwap 首 4K 完全相同、只有后面某个字节不同
+// 的替换也必须被认出来。
+//
+// 为什么还要这一条: 上面两条都是"首 4K 就不同"的形态, 只要指纹存了头部就能
+// 过。2026-11-19 第二次 Windows 红揭示的真洞是: 指纹原先只存头部 4K 的**原字节**
+// 而不是"片段 + 片段", 于是大小相同、头部相同、只在尾部差一个字节的文件
+// 指纹照样相等 —— 契约写的是"内容变了就重读", 实际做不到。这条用例把契约钉死。
+func TestFontFileCacheRejectsTailOnlySwap(t *testing.T) {
+	data, err := os.ReadFile(firstUsableFontPath(t))
+	if err != nil {
+		t.Fatalf("读取字体样本: %v", err)
+	}
+	if len(data) <= sigLen+16 {
+		t.Skipf("样本只有 %d 字节, 造不出首 4K 之外的差异", len(data))
+	}
+	resetFontCandidateScan(true)
+	t.Cleanup(func() { resetFontCandidateScan(true) })
+
+	p := filepath.Join(useFontSampleDir(t), "tail_only.ttf")
+	if err := os.WriteFile(p, data, 0o644); err != nil {
+		t.Fatalf("写样本: %v", err)
+	}
+	st, err := os.Stat(p)
+	if err != nil {
+		t.Fatalf("stat 样本: %v", err)
+	}
+	if _, err := loadFontFileEntry(p); err != nil {
+		t.Fatalf("首解析: %v", err)
+	}
+
+	// 尾段翻一个字节, 长度与 mtime 全部保持原样。
+	swapped := append([]byte(nil), data...)
+	swapped[len(swapped)-1] ^= 0xff
+	if err := os.WriteFile(p, swapped, 0o644); err != nil {
+		t.Fatalf("改写样本: %v", err)
+	}
+	if err := os.Chtimes(p, st.ModTime(), st.ModTime()); err != nil {
+		t.Fatalf("Chtimes: %v", err)
+	}
+	if now, err := os.Stat(p); err == nil && (now.Size() != st.Size() || !now.ModTime().Equal(st.ModTime())) {
+		t.Skipf("本机无法构造等长 + 同 mtime 的样本 (size %d→%d, mtime %v→%v)",
+			st.Size(), now.Size(), st.ModTime(), now.ModTime())
+	}
+
+	// 先确认这份内容真的变了而身份没变: 指纹必须不等。
+	ent, err := loadFontFileEntry(p)
+	if err != nil {
+		t.Fatalf("重解析: %v", err)
+	}
+	want := takeFontSignature(swapped, int64(len(swapped)))
+	if !ent.sigOK {
+		t.Fatalf("重读后仍没有指纹 —— 身份校验退化成了纯 (size, mtime)")
+	}
+	if ent.sig != want {
+		t.Fatalf("缓存返回的是旧 entry (指纹仍是替换前那份) —— 首 4K 相同、尾部不同的替换没被认出来")
+	}
+}
+
+// TestFontFileCacheMissDoesNotUseStaleFingerprint 反向守: 内容没变时必须命中并
+// 复用同一份 entry, 否则每次取面都整份重解析, 冷启动会退回去。
+func TestFontFileCacheMissDoesNotUseStaleFingerprint(t *testing.T) {
+	data, err := os.ReadFile(firstUsableFontPath(t))
+	if err != nil {
+		t.Fatalf("读取字体样本: %v", err)
+	}
+	resetFontCandidateScan(true)
+	t.Cleanup(func() { resetFontCandidateScan(true) })
+
+	p := filepath.Join(useFontSampleDir(t), "stable.ttf")
+	if err := os.WriteFile(p, data, 0o644); err != nil {
+		t.Fatalf("写样本: %v", err)
+	}
+	first, err := loadFontFileEntry(p)
+	if err != nil {
+		t.Fatalf("首解析: %v", err)
+	}
+	again, err := loadFontFileEntry(p)
+	if err != nil {
+		t.Fatalf("二次解析: %v", err)
+	}
+	if first != again {
+		t.Fatalf("内容没变却重建了 entry —— 指纹判定过严, 缓存形同虚设")
 	}
 }
