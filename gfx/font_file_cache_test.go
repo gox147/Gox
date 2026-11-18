@@ -247,3 +247,53 @@ func TestFontFileCacheHonoursFileIdentity(t *testing.T) {
 		t.Fatalf("文件已被替换成非字体, 仍解析成功 —— 文件身份校验失效")
 	}
 }
+
+// TestFontFileCacheRejectsSameSizeSameMtimeSwap 等长内容 + 原 mtime 的替换也必须
+// 被认出来 —— (mtime, size) 不够, 必须验内容指纹。
+//
+// 为什么单独立一条: 2026-11-19 的 Windows CI 上 TestFontFileCacheHonoursFileIdentity
+// 红的正是这个形态 —— os.WriteFile 覆盖写会**保留原 mtime**, 等长内容下
+// (size, mtime) 完全没变, 缓存照样命中, 用例报"换成非字体仍解析成功"。那条
+// 用例自己靠"把 mtime 往后推 2 秒"躲开了这个洞, 于是洞一直在。
+func TestFontFileCacheRejectsSameSizeSameMtimeSwap(t *testing.T) {
+	src := firstUsableFontPath(t)
+	data, err := os.ReadFile(src)
+	if err != nil {
+		t.Fatalf("读取字体样本: %v", err)
+	}
+	resetFontCandidateScan(true) // 需要持有 fontMu 的版本自己加锁
+	t.Cleanup(func() { resetFontCandidateScan(true) })
+
+	p := filepath.Join(t.TempDir(), "same_size.ttf")
+	if err := os.WriteFile(p, data, 0o644); err != nil {
+		t.Fatalf("写样本: %v", err)
+	}
+	st, err := os.Stat(p)
+	if err != nil {
+		t.Fatalf("stat 样本: %v", err)
+	}
+	if _, err := parseFontFile(p); err != nil {
+		t.Fatalf("首解析: %v", err)
+	}
+
+	// 等长垃圾内容, 再把 mtime 按原值写回 (模拟 Windows 上"覆盖写保留 mtime")。
+	junk := make([]byte, len(data))
+	for i := range junk {
+		junk[i] = 0x5a
+	}
+	if err := os.WriteFile(p, junk, 0o644); err != nil {
+		t.Fatalf("改写样本: %v", err)
+	}
+	if err := os.Chtimes(p, st.ModTime(), st.ModTime()); err != nil {
+		t.Fatalf("Chtimes: %v", err)
+	}
+	if now, err := os.Stat(p); err == nil {
+		if now.Size() != st.Size() || !now.ModTime().Equal(st.ModTime()) {
+			t.Skipf("本机无法构造等长 + 同 mtime 的样本 (size %d→%d, mtime %v→%v)",
+				st.Size(), now.Size(), st.ModTime(), now.ModTime())
+		}
+	}
+	if _, err := parseFontFile(p); err == nil {
+		t.Fatalf("等长内容替换 + 同 mtime 后仍解析成功 —— 缓存只靠 (size, mtime) 认身份, 内容指纹没生效")
+	}
+}

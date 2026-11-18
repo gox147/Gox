@@ -1,9 +1,13 @@
 package gfx
 
 import (
+	"bytes"
+	"encoding/binary"
 	"fmt"
+	"hash/fnv"
 	"image"
 	"image/color"
+	"io"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -141,6 +145,41 @@ type fontFileEntry struct {
 	// 会让整份读也显得便宜), 字节数可以 —— 与 probeFontFaces 的
 	// countingReaderAt 同一口径。
 	readBytes atomic.Int64
+
+	// sig / sigOK 是文件内容的指纹与"指纹是否可用"。
+	//
+	// 为什么不能只靠 (mtime, size): 2026-11-19 的 Windows CI 上,
+	// TestFontFileCacheHonoursFileIdentity 把一份字体换成**等长的**垃圾内容
+	// (os.WriteFile 会保留原 mtime), (size, mtime) 完全没变, 缓存照样命中 ——
+	// 用例报"文件已被替换成非字体, 仍解析成功"。Linux 上撞不上是因为 mtime
+	// 精度粗 + 测试显式把 mtime 往后推了 2 秒, 但那是运气, 不是不变式。
+	// 指纹取头部 fontSigLen 字节并把 size 参与折叠, 读的是已热页缓存里的
+	// 几千字节, 换来的是"内容变了就一定重读"。
+	sig   [fontSigLen]byte
+	sigOK bool
+}
+
+// fontSigLen 是内容指纹取的头部字节数: 足够覆盖 sfnt 表目录 + 首个表开头
+// (足以分辨"换成垃圾 / 换成一个别的字体"), 又小于一次 4K 页读。
+const fontSigLen = 4096
+
+// foldFontSignature 把头部字节与文件尺寸折叠成定长指纹 (FNV-1a)。
+func foldFontSignature(head []byte, size int64) [fontSigLen]byte {
+	var out [fontSigLen]byte
+	h := fnv.New64a()
+	var szb [8]byte
+	binary.LittleEndian.PutUint64(szb[:], uint64(size))
+	h.Write(head)
+	h.Write(szb[:])
+	var sum [8]byte
+	binary.LittleEndian.PutUint64(sum[:], h.Sum64())
+	keep := len(head)
+	if keep > fontSigLen-len(sum) {
+		keep = fontSigLen - len(sum)
+	}
+	copy(out[:], head[:keep])
+	copy(out[fontSigLen-len(sum):], sum[:])
+	return out
 }
 
 // fontFileReaderAt 把 entry 的 *os.File 包成 io.ReaderAt, 顺带累计读盘字节。
@@ -499,8 +538,8 @@ func scanSystemFonts(dirs []string, limit int) []string {
 // NotoSansCJK-Bold.ttc 每个面都是粗体), 而拿粗体面当默认字体 = 整屏正文加粗
 // —— 见 chooseBaseFont 的说明。
 //
-// T3-5 第五批: 结果按 (路径, mtime, size) 进进程级缓存; 第六批起调用点只剩
-// "真正要用这个字体"的三处 (chooseBaseFont 选默认 / 按族名取面 / 宿主注入),
+// T3-5 第五批: 结果按 (路径, mtime, size, 内容指纹) 进进程级缓存; 第六批起
+// 调用点只剩"真正要用这个字体"的三处 (chooseBaseFont 选默认 / 按族名取面 / 宿主注入),
 // 一次启动通常只解析 1~2 个文件 —— 同一个文件在同一次启动里只该读一次
 // (见 fontFileEntry)。
 func parseFontFile(path string) (*opentype.Font, error) {
@@ -516,17 +555,41 @@ func parseFontFile(path string) (*opentype.Font, error) {
 	return ent.reg, nil
 }
 
-// loadFontFileEntry 取一个字体文件的解析结果 (带 (mtime, size) 身份校验的
-// 进程级缓存)。键是绝对/给定的路径, 身份在每次命中时重新 stat。
+// loadFontFileEntry 取一个字体文件的解析结果 (带 (mtime, size, 内容指纹)
+// 身份校验的进程级缓存)。键是绝对/给定的路径, 身份在每次命中时重新核对。
 func loadFontFileEntry(path string) (*fontFileEntry, error) {
 	st, err := os.Stat(path)
 	if err != nil {
 		return nil, err
 	}
 	fontFileMu.Lock()
-	if ent, ok := fontFileCache[path]; ok && ent.size == st.Size() && ent.mtime.Equal(st.ModTime()) {
-		fontFileMu.Unlock()
-		return ent, nil
+	ent, ok := fontFileCache[path]
+	if ok && ent.size == st.Size() && ent.mtime.Equal(st.ModTime()) {
+		// 缓存命中也要验一次内容: (mtime, size) 在两个平台上不足以分辨
+		// "文件已换", 而 parseFontFile 的调用方拿"有没有 err"当"是不是真字体"。
+		//
+		// Windows 上 os.WriteFile 覆盖写会**保留原 mtime**, NTFS 的
+		// LastWriteTime 精度又远细于 Linux; 于是"同大小 + 同 mtime"的两份不同
+		// 内容完全可能出现。2026-11-19 的 CI 就是这么红的:
+		// TestFontFileCacheHonoursFileIdentity 把字体换成等长垃圾内容, 缓存照样
+		// 命中, 用例报"换成非字体仍解析成功"。
+		//
+		// 每次命中多读一个文件头 (几千字节, 已热页缓存里) 换确定性; 指纹不
+		// 可用 (读不动) 时退回纯 (mtime, size) 判定。
+		if ent.file != nil && ent.sigOK {
+			var head [fontSigLen]byte
+			n, rerr := ent.file.ReadAt(head[:], 0)
+			if rerr == nil || rerr == io.EOF {
+				got := foldFontSignature(head[:n], ent.size)
+				if !bytes.Equal(got[:], ent.sig[:]) {
+					ok = false // 内容换了但 (mtime, size) 没变: 当作未命中重读
+				}
+			}
+		}
+		if ok {
+			fontFileMu.Unlock()
+			return ent, nil
+		}
 	}
 	fontFileMu.Unlock()
 
@@ -541,7 +604,13 @@ func loadFontFileEntry(path string) (*fontFileEntry, error) {
 	if fst, serr := f.Stat(); serr == nil {
 		st = fst
 	}
-	ent := &fontFileEntry{mtime: st.ModTime(), size: st.Size(), file: f}
+	ent = &fontFileEntry{mtime: st.ModTime(), size: st.Size(), file: f}
+	// 内容指纹: 头部 fontSigLen 字节 (含 size 参与折叠), 用来在 (mtime, size)
+	// 之外再认一次身份。读不动就不启用指纹 (sigOK=false), 退化为旧行为。
+	if n, rerr := f.ReadAt(ent.sig[:], 0); rerr == nil || rerr == io.EOF {
+		ent.sig = foldFontSignature(ent.sig[:n], ent.size)
+		ent.sigOK = true
+	}
 	col, err := opentype.ParseCollectionReaderAt(fontFileReaderAt{ent})
 	if err != nil {
 		// 解析失败 (exe 改名的 .ttf / 损坏文件 / 截断): 立刻关掉这一份,
