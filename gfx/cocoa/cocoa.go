@@ -453,7 +453,16 @@ func impWindowResignKey(self objc.ID, cmd objc.SEL, note objc.ID) uintptr {
 type factory struct{}
 
 func (f *factory) Create(cfg gfx.WindowConfig) (gfx.Surface, error) {
-	return newSurface(cfg)
+	s, err := newSurface(cfg)
+	if err != nil {
+		return nil, err
+	}
+	// 新窗口播种密度缓存 (见 gfx/density.go 的 NoteSurfaceCreated): 首帧之前
+	// 问清楚一次"我落在哪块屏上", 之后只在 NSWindowDidChangeScreen /
+	// NSApplicationDidChangeScreenParameters 通知里重问 —— 布局路径每帧零往返
+	// (docs/performance.md §12.15)。
+	gfx.NoteSurfaceCreated(s)
+	return s, nil
 }
 
 // Displays / DisplayOf 已移至 display.go (NSScreen 全量枚举版)。
