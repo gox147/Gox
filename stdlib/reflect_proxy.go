@@ -84,29 +84,40 @@ func setupReflectProxy(env *runtime.Environment) {
 	// 由 helper 注入, 调用点只传其余参数。此前调用点误传 proxy 本身,
 	// trap 里再操作 proxy 会无限递归 (not-extensible-target-same-target-
 	// prototype 退潮的直接根因)。
+	//
+	// 嵌套 target 转发 (trap-is-null/undefined/missing-target-is-proxy 族):
+	// 外层 trap 缺失且 target 仍是 proxy 时, 逐层深入内层 handler —— trap
+	// 首参始终是**当场那层** proxy 的 target。循环出口: 非 proxy (调用方走
+	// 原 target 路径) / 某层 trap 命中 / 某层 revoked。
 	reflectProxyTrap := func(v object.Value, trapName string, args ...object.Value) (object.Value, bool, object.Value) {
-		p, ok := v.(*object.Proxy)
-		if !ok {
-			return nil, false, nil
+		for {
+			p, ok := v.(*object.Proxy)
+			if !ok {
+				return nil, false, nil
+			}
+			if p.IsRevoked {
+				return nil, true, object.NewTypeError("Cannot perform '%s' on a proxy that has been revoked", trapName)
+			}
+			trap, present := object.GetProxyTrapMethod(p.Handler, trapName)
+			if !present {
+				if tp, isProxy := p.Target.(*object.Proxy); isProxy {
+					v = tp
+					continue
+				}
+				return nil, false, nil
+			}
+			if !object.IsCallable(trap) {
+				return nil, true, object.NewTypeError("'%s' trap must be callable", trapName)
+			}
+			trapArgs := make([]object.Value, 0, len(args)+1)
+			trapArgs = append(trapArgs, p.Target)
+			trapArgs = append(trapArgs, args...)
+			res := object.CallFunction(trap, p.Handler, trapArgs...)
+			if ev := object.TakeCallbackErrorValue(); ev != object.UndefinedSingleton {
+				return nil, true, ev
+			}
+			return res, true, nil
 		}
-		if p.IsRevoked {
-			return nil, true, object.NewTypeError("Cannot perform '%s' on a proxy that has been revoked", trapName)
-		}
-		trap, present := object.GetProxyTrapMethod(p.Handler, trapName)
-		if !present {
-			return nil, false, nil
-		}
-		if !object.IsCallable(trap) {
-			return nil, true, object.NewTypeError("'%s' trap must be callable", trapName)
-		}
-		trapArgs := make([]object.Value, 0, len(args)+1)
-		trapArgs = append(trapArgs, p.Target)
-		trapArgs = append(trapArgs, args...)
-		res := object.CallFunction(trap, p.Handler, trapArgs...)
-		if ev := object.TakeCallbackErrorValue(); ev != object.UndefinedSingleton {
-			return nil, true, ev
-		}
-		return res, true, nil
 	}
 
 	// Reflect.get(target, key, receiver?) — 读取目标属性
@@ -169,6 +180,15 @@ func setupReflectProxy(env *runtime.Environment) {
 		if p, ok := target.(*object.Proxy); ok {
 			target = p.Target
 		}
+		// TypedArray: [[Set]] (10.7.8.5) —— 规范数值索引静默写/忽略恒 true;
+		// 其余键按 OrdinarySet 自有语义 (不可写 → false)。
+		if ta, ok := target.(*object.TypedArray); ok {
+			if sym, isSym := args[1].(*object.Symbol); isSym {
+				ta.SetSymbolProperty(sym, val)
+				return object.TrueSingleton
+			}
+			return object.NewBoolean(ta.SetOwn(key, val))
+		}
 		// 不可写 / 不可扩展时必须返回 false，而不是无条件 true
 		if o, ok := target.(*object.Object); ok {
 			if desc, exists := o.Properties[key]; exists {
@@ -201,6 +221,15 @@ func setupReflectProxy(env *runtime.Environment) {
 		}
 		if p, ok := target.(*object.Proxy); ok {
 			target = p.Target
+		}
+		// TypedArray: [[HasProperty]] —— 规范数值索引按 IsValidIntegerIndex
+		// 裁决 (越界/-0/非整数 → false), 其余键 Ordinary 自有 + 原型链。
+		if ta, ok := target.(*object.TypedArray); ok {
+			if sym, isSym := args[1].(*object.Symbol); isSym {
+				_, found := ta.GetSymbolPropertyDescriptor(sym)
+				return object.NewBoolean(found)
+			}
+			return object.NewBoolean(ta.HasProperty(key))
 		}
 		_, found := target.GetProperty(key)
 		// Array.GetProperty 对任意数字索引都返回 (undefined, true)，
@@ -245,6 +274,14 @@ func setupReflectProxy(env *runtime.Environment) {
 				t.Elements[idx] = object.UndefinedSingleton
 			}
 			return object.TrueSingleton
+		case *object.TypedArray:
+			// [[Delete]] (10.7.8.6): 规范数值索引按 IsValidIntegerIndex 裁决
+			// (范围内元素恒 false), 其余键 OrdinaryDelete。
+			if sym, isSym := args[1].(*object.Symbol); isSym {
+				t.DeleteSymbolProperty(sym)
+				return object.TrueSingleton
+			}
+			return object.NewBoolean(t.DeleteOwn(key))
 		}
 		return object.TrueSingleton
 	}))
@@ -443,6 +480,39 @@ func setupReflectProxy(env *runtime.Environment) {
 			return object.NewTypeError("Reflect.construct: newTarget is not a constructor")
 		}
 
+		// proxy 构造分发 ([[Construct]], trap-is-null/undefined-target-is-proxy
+		// 族): 外层 trap 缺失 → 转发 target 逐层深入; trap 命中 → 以
+		// (target, argsArray, newTarget) 三参调用, 结果必须是对象。
+		for {
+			p, isProxy := fn.(*object.Proxy)
+			if !isProxy {
+				break
+			}
+			if p.IsRevoked {
+				return object.NewTypeError("Cannot perform 'construct' on a proxy that has been revoked")
+			}
+			trap, present := object.GetProxyTrapMethod(p.Handler, "construct")
+			if !present {
+				fn = p.Target
+				continue
+			}
+			if !object.IsCallable(trap) {
+				return object.NewTypeError("'construct' trap must be callable")
+			}
+			trapArgs := []object.Value{p.Target, object.NewArray(ctorArgs), newTarget}
+			res := object.CallFunction(trap, p.Handler, trapArgs...)
+			if thrown := callbackThrown(); thrown != nil {
+				return thrown
+			}
+			if !object.IsObjectLike(res) {
+				return object.NewTypeError("'construct' trap must return an object")
+			}
+			return res
+		}
+		if !object.IsConstructor(fn) {
+			return object.NewTypeError("Reflect.construct: target is not a constructor")
+		}
+
 		// 1) 创建新对象并绑定原型到 newTarget.prototype
 		// 旧实现直接 new Object()，丢失了原型绑定，且把构造器返回值
 		// 原样返回 (构造器不返回对象时应返回新对象)，导致结果为 undefined。
@@ -511,12 +581,19 @@ func setupReflectProxy(env *runtime.Environment) {
 		}
 		if store, ok := target.(object.OwnPropertyStore); ok {
 			key := toPropKey(args[1])
-			if d, errVal2 := descriptorFromJS(args[2]); errVal2 != nil {
+			parsed, errVal2 := toPropertyDescriptor(args[2])
+			if errVal2 != nil {
 				return errVal2
-			} else {
-				store.DefineOwn(key, d)
-				return object.TrueSingleton
 			}
+			// TypedArray 规范数值索引键: exotic [[DefineOwnProperty]], 失败
+			// 按 Reflect.defineProperty 规范返回 false。
+			if ta, isTA := target.(*object.TypedArray); isTA {
+				if f, isCanonical := object.CanonicalNumericIndexString(key); isCanonical {
+					return object.NewBoolean(ta.DefineOwnIndexed(f, taDescFromParsed(parsed)))
+				}
+			}
+			store.DefineOwn(key, parsedToDesc(parsed))
+			return object.TrueSingleton
 		}
 		return object.FalseSingleton
 	}))

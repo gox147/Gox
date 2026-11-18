@@ -9,6 +9,7 @@ import (
 	"github.com/14752222/Gox/bytecode"
 	"github.com/14752222/Gox/object"
 	"github.com/14752222/Gox/runtime"
+	"github.com/14752222/Gox/stdlib"
 )
 
 func (vm *VM) execute() error {
@@ -1199,8 +1200,9 @@ func (vm *VM) runFrom(startFrameIdx int) error {
 					}
 					continue
 				}
-				// 代理构造: 转发到 construct trap
-				result, err := vm.proxyConstruct(proxy, args)
+				// 代理构造: 转发到 construct trap (newTarget = 被构造的代理,
+				// 规范 EvaluateNew step 7 的 newTarget 即 constructor)。
+				result, err := vm.proxyConstruct(proxy, args, fn)
 				if err != nil {
 					if terr := vm.rethrowBridgeError(err); terr != nil {
 						return terr
@@ -1410,6 +1412,22 @@ func (vm *VM) runFrom(startFrameIdx int) error {
 					}
 				}
 				_ = a
+			}
+			// TypedArray: [[Set]] 语义 (SetOwn), 失败在严格模式抛 TypeError。
+			// 此前走 SetProperty 静默吞结果。
+			if ta, isTA := obj.(*object.TypedArray); isTA {
+				if !ta.SetOwn(propName, val) && vm.currentFrameIsStrict() {
+					if err := vm.throwNamedError("TypeError",
+						"Cannot assign to read only property '%s' of object", propName); err != nil {
+						return err
+					}
+				}
+				if err := vm.checkCallbackErr(); err != nil {
+					if terr := vm.rethrowBridgeError(err); terr != nil {
+						return terr
+					}
+				}
+				continue
 			}
 			obj.SetProperty(propName, val)
 			// 函数对象: 普通赋值/class 静态字段转可枚举 (静态方法/访问器保持不可枚举)。
@@ -2193,6 +2211,16 @@ func (vm *VM) runFrom(startFrameIdx int) error {
 				iter := runtime.NewObjectKeysIteratorWithKeys(v, v.EnumerableOwnKeys())
 				vm.stack.Push(iter)
 			default:
+				// Proxy: for-in 走 EnumerateObjectProperties 等价实现
+				// (ownKeys trap 收集 + gOPD 过滤 enumerable; propertyHelper
+				// 的 isEnumerable 用 for-in 探测, 漏枚举会让 Proxy
+				// gOPD 族的 verifyProperty 假阴)。
+				if _, isProxy := val.(*object.Proxy); isProxy {
+					if keys := stdlib.ProxyEnumerableOwnKeys(val); keys != nil {
+						vm.stack.Push(runtime.NewObjectKeysIteratorWithKeys(val, keys))
+						break
+					}
+				}
 				// 函数类 (Closure/BuiltinFunction/BuiltinMethod) 等实现
 				// OwnPropertyStore 的对象: 用自有可枚举键 (排除 name/length/
 				// prototype 与内置/class 静态方法)。其余值 (原始值等) 空迭代。
@@ -2752,9 +2780,29 @@ func (vm *VM) runFrom(startFrameIdx int) error {
 				}
 			} else if ds, ok := obj.(object.PropDeleter); ok {
 				// 函数类的 length/name 等自有属性事实来源在结构体字段,
-				// delete 需落墓碑 (见 object.PropDeleter)。
+				// delete 需落墓碑 (见 object.PropDeleter)。TypedArray 也实现
+				// PropDeleter: 规范数值索引按 IsValidIntegerIndex 裁决 (范围
+				// 内元素恒 false —— configurable:false), 其余键 OrdinaryDelete
+				// (internals/Delete 族)。
 				if s, ok := key.(*object.String); ok {
-					vm.stack.Push(object.NewBoolean(ds.DeleteOwn(s.Value)))
+					deleted := ds.DeleteOwn(s.Value)
+					// [[Delete]] 返回 false 且严格模式 → TypeError。
+					if !deleted && vm.currentFrameIsStrict() {
+						if err := vm.throwNamedError("TypeError",
+							"Cannot delete property '%s' of object", s.Value); err != nil {
+							return err
+						}
+						continue
+					}
+					vm.stack.Push(object.NewBoolean(deleted))
+				} else if sym, ok := key.(*object.Symbol); ok {
+					// Symbol 键: 走各类型的符号键删除 (TypedArray 符号属性恒
+					// 可配置); 未实现符号删除的类型按规范返回 true。
+					if spd, ok2 := obj.(interface{ DeleteSymbolProperty(*object.Symbol) bool }); ok2 {
+						vm.stack.Push(object.NewBoolean(spd.DeleteSymbolProperty(sym)))
+					} else {
+						vm.stack.Push(object.NewBoolean(true))
+					}
 				} else {
 					vm.stack.Push(object.NewBoolean(false))
 				}

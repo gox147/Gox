@@ -170,7 +170,20 @@ func (r *RegExp) SetProperty(name string, val Value) {
 					r.PropDescs[name] = d
 				}
 			}
+			return
 		}
+		// 非数值写入: lastIndex 是普通可写数据属性, 规范允许存任意值
+		// (propertyHelper 的 isWritable 用 "unlikelyValue" 探测可写性)。
+		// 落进描述符承载 (GetProperty 已优先读描述符值), 字段不动 ——
+		// 匹配逻辑仍以数值字段为准, 下一次数值写入会覆盖回来。
+		if d, exists := r.PropDescs[name]; exists && !d.Deleted {
+			if _, isAcc := d.Value.(*Accessor); !isAcc {
+				d.Value = val
+				r.PropDescs[name] = d
+			}
+			return
+		}
+		r.DefineOwn(name, PropertyDescriptor{Value: val, Writable: true, Enumerable: false, Configurable: false})
 		return
 	}
 	// 其余键 (r.exec = fn / r.foo = 1) 落成普通自有数据属性。

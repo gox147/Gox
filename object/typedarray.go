@@ -450,7 +450,16 @@ type TypedArray struct {
 	// (MyU8.prototype), 而非同类型注册表里的 Uint8Array.prototype。
 	// nil 表示走注册表按类型名解析的默认原型。
 	ProtoOverride Value
+	// NonExtensible 表示 [[Extensible]] 为 false (Object.preventExtensions /
+	// seal / freeze 落点), 与 *Array.NonExtensible 同构。
+	NonExtensible bool
 	mu            sync.Mutex
+}
+
+// CanonicalNumericIndexString 导出规范数值索引字符串判定 (供 stdlib/vm 的
+// Reflect/Object 与 VM 索引通道复用同一判据)。
+func CanonicalNumericIndexString(name string) (float64, bool) {
+	return canonicalNumericIndex(name)
 }
 
 func (t *TypedArray) Type() ObjectType { return OBJECT_OBJ }
@@ -515,35 +524,152 @@ func (t *TypedArray) Inspect() string {
 }
 func (t *TypedArray) IsTruthy() bool { return true }
 func (t *TypedArray) SetProperty(name string, val Value) {
-	// 数字索引写经 vm 索引路径; length 等固定属性只读。
+	// 数字索引写经 vm 索引路径; length 等固定属性只读 (实例不落键,
+	// 避免遮蔽 %TypedArray%.prototype 上的同名访问器)。
 	switch name {
 	case "length", "byteLength", "byteOffset", "buffer", "BYTES_PER_ELEMENT":
 		return
 	}
-	// 规范 [[Set]](String P): CanonicalNumericIndexString(P) 非 undefined 的键
-	// ("1" / "-0" / "-1" / "1.5" / "Infinity" / "NaN" ...) 走
-	// IntegerIndexedElementSet (越界静默跳过), 绝不落入普通属性存储
-	// (internals/Set key-is-minus-zero / key-is-out-of-bounds 家族)。
-	if f, ok := canonicalNumericIndex(name); ok {
-		if f == float64(int64(f)) && f >= 0 && f <= float64(1<<28) && !math.IsInf(f, 0) {
-			t.setElement(int(f), val)
-		}
-		return
-	}
-	if _, ok := nameIndex(name); ok {
-		if n, ok2 := nameIndex(name); ok2 {
-			t.setElement(n, val)
-		}
-		return
-	}
-	if t.Props == nil {
-		t.Props = map[string]Value{}
-	}
-	t.Props[name] = val
+	_ = t.SetOwn(name, val)
 }
 
-// canonicalNumericIndex 实现 CanonicalNumericIndexString 的字符串判定:
-// "-0" → 0 (负零按 0 处理), 其余 ToNumber 后 ToString 回写一致才算数。
+// SetOwn 实现 Integer-Indexed exotic [[Set]] (10.7.8.5) 并返回布尔结果:
+//   - 规范数值索引键: IsValidIntegerIndex → IntegerIndexedElementSet (越界/
+//     -0/非整数静默忽略), 恒返回 true (绝不落普通属性存储);
+//   - 其余键: OrdinarySet 自有分支 —— 自有访问器调 setter / 不可写数据属性
+//     返回 false / 可扩展时新建 (internals/Set key-is-not-canonical-index /
+//     key-is-not-numeric-index 家族)。
+func (t *TypedArray) SetOwn(name string, val Value) bool {
+	if f, ok := canonicalNumericIndex(name); ok {
+		if t.isValidIntegerIndex(f) {
+			if err := t.setElementE(int(f), val); err != nil {
+				panic(err) // BigInt 转换错误经 panic 桥抛出 (与 setElement 一致)
+			}
+		}
+		return true
+	}
+	if t.PropDescs != nil {
+		if d, ok := t.PropDescs[name]; ok && !d.Deleted {
+			if acc, isAcc := d.Value.(*Accessor); isAcc {
+				if acc.Setter == nil {
+					return false
+				}
+				CallFunction(acc.Setter, t, val)
+				if ev := TakeCallbackErrorValue(); ev != UndefinedSingleton {
+					panic(ev)
+				}
+				return true
+			}
+			if !d.Writable {
+				return false
+			}
+			d.Value = val
+			t.PropDescs[name] = d
+			if t.Props != nil {
+				if _, ok2 := t.Props[name]; ok2 {
+					t.Props[name] = val
+				}
+			}
+			return true
+		}
+	}
+	if _, ok := t.Props[name]; ok {
+		t.Props[name] = val
+		return true
+	}
+	if !t.IsExtensible() {
+		return false
+	}
+	if t.Props == nil {
+		t.Props = make(map[string]Value)
+	}
+	if _, exists := t.Props[name]; !exists {
+		t.propOrder = append(t.propOrder, name)
+	}
+	t.Props[name] = val
+	return true
+}
+
+// DeleteOwn 实现 Integer-Indexed exotic [[Delete]] (10.7.8.6):
+// 规范数值索引键: 分离 buffer → true; IsValidIntegerIndex → false (元素
+// configurable:false, delete 恒败); 越界/-0/非整数 → true。
+// 其余键: OrdinaryDelete 自有描述符/属性, 恒 true (不存在的键也 true)。
+func (t *TypedArray) DeleteOwn(name string) bool {
+	if f, ok := canonicalNumericIndex(name); ok {
+		if t.Buffer == nil || t.Buffer.Detach {
+			return true
+		}
+		return !t.isValidIntegerIndex(f)
+	}
+	if t.PropDescs != nil {
+		if d, ok := t.PropDescs[name]; ok && !d.Deleted {
+			d.Deleted = true
+			t.PropDescs[name] = d
+			if t.Props != nil {
+				delete(t.Props, name)
+			}
+			return true
+		}
+	}
+	if t.Props != nil {
+		if _, ok := t.Props[name]; ok {
+			delete(t.Props, name)
+			return true
+		}
+	}
+	return true
+}
+
+// HasProperty 实现 Integer-Indexed exotic [[HasProperty]] (10.7.8.2):
+// 规范数值索引键: 分分离 → false; IsValidIntegerIndex → true; 其余 false
+// (**不做** OrdinaryHasProperty 回落 —— out-of-bounds 索引不得穿透到原型链,
+// internals/HasProperty key-is-out-of-bounds / inherited-property 家族)。
+// 其余键: 自有 (PropDescs / Props) → 原型链 [[HasProperty]] (父为 Proxy 时
+// 经 has trap, abrupt-from-ordinary-has-parent-hasproperty 族)。
+func (t *TypedArray) HasProperty(name string) bool {
+	if f, ok := canonicalNumericIndex(name); ok {
+		return t.isValidIntegerIndex(f)
+	}
+	if t.PropDescs != nil {
+		if d, ok := t.PropDescs[name]; ok && !d.Deleted {
+			return true
+		}
+	}
+	if t.Props != nil {
+		if _, ok := t.Props[name]; ok {
+			return true
+		}
+	}
+	for cur := t.GetProto(); cur != nil; {
+		// 父链上的 [[HasProperty]]: Proxy 走 has trap (object 层), 其余类型
+		// 若自带 HasProperty 方法直接复用。
+		if hp, ok := cur.(interface{ HasProperty(string) bool }); ok {
+			return hp.HasProperty(name)
+		}
+		if obj, ok := cur.(*Object); ok {
+			if _, found := obj.Properties[name]; found {
+				return true
+			}
+			cur = obj.Proto
+			continue
+		}
+		if gp, ok := cur.(interface{ GetProto() Value }); ok {
+			if _, found := cur.GetProperty(name); found {
+				return true
+			}
+			cur = gp.GetProto()
+			continue
+		}
+		break
+	}
+	return false
+}
+
+// canonicalNumericIndex 实现 CanonicalNumericIndexString (7.1.16) 的字符串键
+// 判定: ToNumber(P) 后按 Number::toString 回写, 与 P 逐字符一致才算规范数值
+// 索引。"-0" 特判返回 -0; "NaN"/"Infinity"/"-Infinity" 是规范数值索引 (非
+// 整数, IsValidIntegerIndex 必为 false); "1.0"/"+1"/"01"/"0.0000001"/"1e21"
+// 字面量形态不是 —— 这些键必须走 Ordinary* 普通属性语义。
 func canonicalNumericIndex(name string) (float64, bool) {
 	if name == "" {
 		return 0, false
@@ -553,15 +679,37 @@ func canonicalNumericIndex(name string) (float64, bool) {
 		return 0, false
 	}
 	if name == "-0" {
-		return 0, true
+		return math.Copysign(0, -1), true
 	}
-	if math.IsNaN(f) {
-		return 0, false
+	// NumberToString 实现 JS Number::toString (含 NaN/±Infinity/指数记法)。
+	return f, NumberToString(f) == name
+}
+
+// isValidIntegerIndex 实现 IsValidIntegerIndex (10.7.9): 分离 buffer → false;
+// NaN/±Infinity/非整数/-0/负数/越界 → false。out-of-bounds 视图 arrLength
+// 归零, 全部索引自然无效。
+func (t *TypedArray) isValidIntegerIndex(f float64) bool {
+	if t.Buffer == nil || t.Buffer.Detach {
+		return false
 	}
-	if strconv.FormatFloat(f, 'g', -1, 64) != name {
-		return 0, false
+	if math.IsNaN(f) || math.IsInf(f, 0) {
+		return false
 	}
-	return f, true
+	if f != math.Trunc(f) {
+		return false
+	}
+	if f == 0 && math.Signbit(f) {
+		return false
+	}
+	if f < 0 || f >= float64(t.arrLength()) {
+		return false
+	}
+	return true
+}
+
+// IsValidIntegerIndex 导出 isValidIntegerIndex (供 vm 索引通道复用同一判据)。
+func (t *TypedArray) IsValidIntegerIndex(f float64) bool {
+	return t.isValidIntegerIndex(f)
 }
 
 // bytes 返回本视图当前生效的字节切片。
@@ -798,13 +946,20 @@ func clampI(v, min, max int64) int64 {
 }
 
 func (t *TypedArray) GetProperty(name string) (Value, bool) {
-	// 数字索引
-	if n, ok := nameIndex(name); ok {
-		return t.getElement(n), true
+	// 规范数值索引键 (CanonicalNumericIndexString 非 undefined): 走
+	// IntegerIndexedElementGet —— 分离 buffer / 无效索引 (-0 / 1.5 /
+	// "Infinity" / 越界) 一律 undefined, **绝不**回落原型链查找
+	// (internals/Get key-is-not-integer / key-is-out-of-bounds /
+	// detached-buffer 家族)。
+	if f, ok := canonicalNumericIndex(name); ok {
+		if t.isValidIntegerIndex(f) {
+			return t.getElement(int(f)), true
+		}
+		return UndefinedSingleton, true
 	}
 	// defineProperty 定义的描述符优先 (访问器调 getter)。
 	if t.PropDescs != nil {
-		if d, ok := t.PropDescs[name]; ok {
+		if d, ok := t.PropDescs[name]; ok && !d.Deleted {
 			if acc, isAcc := d.Value.(*Accessor); isAcc {
 				if acc.Getter == nil {
 					return UndefinedSingleton, true
@@ -857,7 +1012,13 @@ func (t *TypedArray) GetProperty(name string) (Value, bool) {
 	if v, found := t.lookupPrototypeChain(name); found {
 		return v, true
 	}
-	return t.callMethod(name)
+	if v, ok := t.callMethod(name); ok && v != nil {
+		return v, true
+	}
+	// 未知键返回 (undefined, false): 之前返回 (nil, false) 会把 nil Value
+	// 漏进 VM 读取通道 (internals/Get key-is-not-canonical-index 的
+	// "_isSameValue operation threw" 即由此而来)。
+	return UndefinedSingleton, false
 }
 
 // lookupPrototypeChain 沿 [[Prototype]] 链查找字符串自有属性 (不调用元素的
@@ -2149,8 +2310,21 @@ func (t *TypedArray) getSpecValue(name string) Value {
 }
 
 // GetElement / SetElement 导出的元素读写 (stdlib 构造器用)。
+// GetElement 读第 i 个元素 (越界返回 undefined)。
 func (t *TypedArray) GetElement(i int) Value    { return t.getElement(i) }
 func (t *TypedArray) SetElement(i int, v Value) { t.setElement(i, v) }
+
+// SetElementValidated 按规范 [[Set]] 数字键语义写元素: f 是 CanonicalNumeric
+// IndexString(number) 的结果本身; IsValidIntegerIndex → IntegerIndexedElement
+// Set, 否则静默忽略 (恒返回 true 的 [[Set]])。此前 vm 层 int(f) 截断导致
+// x[1.5]=v 写元素 1、x[-0]=v 写元素 0 (internals/Set 族)。
+func (t *TypedArray) SetElementValidated(f float64, v Value) {
+	if t.isValidIntegerIndex(f) {
+		if err := t.setElementE(int(f), v); err != nil {
+			panic(err)
+		}
+	}
+}
 
 // Base64Decode 导出 base64 解码 (Uint8Array.fromBase64 用)。
 func Base64Decode(s string) ([]byte, bool) { return base64Decode(s) }
@@ -2447,6 +2621,25 @@ func (t *TypedArray) SetSymbolProperty(sym *Symbol, val Value) {
 	t.SymbolProperties[sym.ID] = DataProperty(val)
 }
 
+// DeleteSymbolProperty 实现 [[Delete]] 的 Symbol 键分支 (Reflect.deleteProperty
+// 落点): 符号键属性恒可配置, 存在则删, 不存在按规范也返回 true。
+func (t *TypedArray) DeleteSymbolProperty(sym *Symbol) bool {
+	if t.SymbolProperties == nil {
+		return true
+	}
+	if _, exists := t.SymbolProperties[sym.ID]; !exists {
+		return true
+	}
+	delete(t.SymbolProperties, sym.ID)
+	for i, s := range t.symbolKeyOrder {
+		if s.ID == sym.ID {
+			t.symbolKeyOrder = append(t.symbolKeyOrder[:i], t.symbolKeyOrder[i+1:]...)
+			break
+		}
+	}
+	return true
+}
+
 func (t *TypedArray) DefineOwnSymbolProperty(sym *Symbol, desc PropertyDescriptor) {
 	if t.SymbolProperties == nil {
 		t.SymbolProperties = make(map[uint64]PropertyDescriptor)
@@ -2469,8 +2662,9 @@ func (t *TypedArray) SymbolKeys() []*Symbol { return t.symbolKeyOrder }
 // Object.getOwnPropertyNames(new Uint8Array(2)) === ["0","1"]),
 // 实例读它们由 GetProperty 从原型链解析。
 
-// OwnKeys 返回 TypedArray 自有键: 整数索引升序在前, 之后是显式定义的
-// 字符串键 (propOrder 插入顺序) 与 SetProperty 写入的键。
+// OwnKeys 返回 TypedArray 自有键 ([[OwnPropertyKeys]]): 整数索引升序在前,
+// 之后是字符串键按插入顺序 (propOrder 统一记录 defineProperty 与赋值写入的
+// 键, map 迭代随机序会打乱 makePassthrough/makeArray 断言)。
 func (t *TypedArray) OwnKeys() []string {
 	n := t.arrLength()
 	keys := make([]string, 0, n+len(t.propOrder))
@@ -2485,23 +2679,24 @@ func (t *TypedArray) OwnKeys() []string {
 		if seen[k] {
 			continue
 		}
+		// 墓碑 / 已被 delete 的键不再列出
+		if d, ok := t.PropDescs[k]; ok && d.Deleted {
+			continue
+		}
+		_, inDescs := t.PropDescs[k]
+		_, inProps := t.Props[k]
+		if !inDescs && !inProps {
+			continue
+		}
 		seen[k] = true
 		keys = append(keys, k)
-	}
-	if t.Props != nil {
-		for k := range t.Props {
-			if seen[k] {
-				continue
-			}
-			seen[k] = true
-			keys = append(keys, k)
-		}
 	}
 	return keys
 }
 
 // EnumerableOwnKeys 返回可枚举自有键: 全部整数索引 (TypedArray 元素恒可枚举)
-// 与显式标记可枚举的字符串键。
+// 与可枚举的字符串键 (defineProperty 描述符按 Enumerable 标记; 赋值语义的
+// Props 键恒可枚举)。
 func (t *TypedArray) EnumerableOwnKeys() []string {
 	n := t.arrLength()
 	keys := make([]string, 0, n)
@@ -2509,7 +2704,16 @@ func (t *TypedArray) EnumerableOwnKeys() []string {
 		keys = append(keys, Itoa(i))
 	}
 	for _, k := range t.propOrder {
-		if d, ok := t.PropDescs[k]; ok && d.Enumerable {
+		if d, ok := t.PropDescs[k]; ok {
+			if d.Deleted {
+				continue
+			}
+			if d.Enumerable {
+				keys = append(keys, k)
+			}
+			continue
+		}
+		if _, ok := t.Props[k]; ok {
 			keys = append(keys, k)
 		}
 	}
@@ -2529,6 +2733,11 @@ func (t *TypedArray) HasOwn(name string) bool {
 		}
 		return idx < t.arrLength()
 	}
+	// 其余规范数值索引键 ("-0"/"1.5"/"Infinity"/"NaN"): [[GetOwnProperty]]
+	// 语义, 无效索引 → false (不落普通属性存储)。
+	if f, ok := canonicalNumericIndex(name); ok {
+		return t.isValidIntegerIndex(f)
+	}
 	if t.PropDescs != nil {
 		if d, ok := t.PropDescs[name]; ok && !d.Deleted {
 			return true
@@ -2542,12 +2751,24 @@ func (t *TypedArray) HasOwn(name string) bool {
 	return false
 }
 
-// OwnDescriptor 返回 TypedArray 自有属性描述符:
+// OwnDescriptor 返回 TypedArray 自有属性描述符 ([[GetOwnProperty]], 10.7.8.1):
+//   - 规范数值索引键: IsValidIntegerIndex → 元素描述符 {value, writable:true,
+//     enumerable:true, configurable:true}; 无效索引 (分离 / -0 / "1.5" /
+//     越界) → 不存在 (internals/GetOwnProperty key-is-minus-zero /
+//     key-is-not-canonical-index 家族);
 //   - 显式 defineProperty 定义的键: 返回存储的完整描述符;
-//   - 范围内的整数索引: {value, writable:true, enumerable:true,
-//     configurable:true} (规范: 元素属性可配置);
 //   - 其余字符串键 (Props 赋值): 普通可写可枚举可配置数据属性。
 func (t *TypedArray) OwnDescriptor(name string) (PropertyDescriptor, bool) {
+	if f, ok := canonicalNumericIndex(name); ok {
+		if !t.isValidIntegerIndex(f) {
+			return PropertyDescriptor{}, false
+		}
+		v := t.getElement(int(f))
+		if v == nil {
+			v = UndefinedSingleton
+		}
+		return PropertyDescriptor{Value: v, Writable: true, Enumerable: true, Configurable: true}, true
+	}
 	if t.PropDescs != nil {
 		if d, ok := t.PropDescs[name]; ok {
 			if d.Deleted {
@@ -2555,13 +2776,6 @@ func (t *TypedArray) OwnDescriptor(name string) (PropertyDescriptor, bool) {
 			}
 			return d, true
 		}
-	}
-	if idx, err := Atoi(name); err == nil && idx >= 0 && idx < t.arrLength() {
-		v := t.getElement(idx)
-		if v == nil {
-			v = UndefinedSingleton
-		}
-		return PropertyDescriptor{Value: v, Writable: true, Enumerable: true, Configurable: true}, true
 	}
 	if t.Props != nil {
 		if v, ok := t.Props[name]; ok {
@@ -2576,12 +2790,21 @@ func (t *TypedArray) OwnDescriptor(name string) (PropertyDescriptor, bool) {
 
 // DefineOwn 以完整描述符定义 TypedArray 自有属性 (Object.defineProperty 落点)。
 //
-//   - 整数索引 (范围内): 数据描述符写入元素; 访问器描述符违反 Integer-Indexed
-//     exotic 的 [[DefineOwnProperty]] (元素不可为访问器), 由调用方依据
-//     描述符合法性抛错, 这里按数据落值。
-//   - 其余字符串键: 存入 PropDescs (访问器 getter 由 GetProperty 调用), 数据
-//     属性同时落 Props 以支持不经描述符通道的读取。
+//   - 规范数值索引键: 走 DefineOwnIndexed (exotic [[DefineOwnProperty]]) ——
+//     无效索引 / 访问器描述符 / 收窄 writable-enumerable-configurable 必须
+//     返回 false, **绝不**把这种键落进普通属性存储;
+//   - 其余字符串键 ("1.0"/"+1"/"foo" 等): 存入 PropDescs (访问器 getter 由
+//     GetProperty 调用), 数据属性同时落 Props 以支持不经描述符通道的读取。
 func (t *TypedArray) DefineOwn(name string, desc PropertyDescriptor) bool {
+	if f, ok := canonicalNumericIndex(name); ok {
+		return t.DefineOwnIndexed(f, TypedArrayDesc{
+			IsAccessor:  func() bool { _, isAcc := desc.Value.(*Accessor); return isAcc }(),
+			HasWritable: true, Writable: desc.Writable,
+			HasEnumerable: true, Enumerable: desc.Enumerable,
+			HasConfigurable: true, Configurable: desc.Configurable,
+			HasValue: true, Value: desc.Value,
+		})
+	}
 	if t.PropDescs == nil {
 		t.PropDescs = make(map[string]PropertyDescriptor)
 	}
@@ -2590,15 +2813,64 @@ func (t *TypedArray) DefineOwn(name string, desc PropertyDescriptor) bool {
 		t.propOrder = append(t.propOrder, name)
 	}
 	t.PropDescs[name] = desc
-	// 索引: 数据描述符同步写元素, 使 SetProperty 通道外的读也看到新值。
-	if idx, err := Atoi(name); err == nil && idx >= 0 {
-		if _, isAcc := desc.Value.(*Accessor); !isAcc && idx < t.arrLength() {
-			if desc.Value == nil {
-				t.setElement(idx, UndefinedSingleton)
-			} else {
-				t.setElement(idx, desc.Value)
-			}
+	// 数据描述符同步落 Props (SetOwn 的读取通道看到同一值); propOrder 已在
+	// 上面登记过该键, 这里只落值不重复登记。
+	if _, isAcc := desc.Value.(*Accessor); !isAcc && desc.Value != nil {
+		if t.Props == nil {
+			t.Props = make(map[string]Value)
+		}
+		t.Props[name] = desc.Value
+	}
+	return true
+}
+
+// TypedArrayDesc 是 stdlib 传给 DefineOwnIndexed 的解析后描述符视图: 保留
+// "字段是否显式指定" 的 has 标记, 供 exotic [[DefineOwnProperty]] 区分
+// 部分描述符 ({value: 5} 允许, {enumerable: false} 拒绝)。
+type TypedArrayDesc struct {
+	IsAccessor                    bool
+	HasWritable, Writable         bool
+	HasEnumerable, Enumerable     bool
+	HasConfigurable, Configurable bool
+	HasValue                      bool
+	Value                         Value
+}
+
+// DefineOwnIndexed 实现规范数值索引键的 [[DefineOwnProperty]] (10.7.8.3)。
+// f 是 CanonicalNumericIndexString 的结果:
+//   - 无效索引 (分离 / -0 / 非整数 / 越界) → false;
+//   - 访问器描述符 → false (元素不可为访问器);
+//   - 显式收窄 writable/enumerable/configurable → false;
+//   - 数据描述符 (含 {value: v} 部分形态) → 转换写元素, true。
+func (t *TypedArray) DefineOwnIndexed(f float64, d TypedArrayDesc) bool {
+	if !t.isValidIntegerIndex(f) {
+		return false
+	}
+	if d.IsAccessor {
+		return false
+	}
+	if d.HasWritable && !d.Writable {
+		return false
+	}
+	if d.HasEnumerable && !d.Enumerable {
+		return false
+	}
+	if d.HasConfigurable && !d.Configurable {
+		return false
+	}
+	if d.HasValue && d.Value != nil {
+		if err := t.setElementE(int(f), d.Value); err != nil {
+			panic(err)
 		}
 	}
 	return true
 }
+
+// ===== 可扩展性 ([[Extensible]]) =====
+// 与 *Array.NonExtensible 同构: Object.preventExtensions / seal / freeze 经
+// object.PreventExtensions 接口落到这里, 此后 SetOwn / DefineOwn 拒绝新建
+// 自有属性 (internals/DefineOwnProperty non-extensible-* 家族)。
+
+func (t *TypedArray) IsExtensible() bool { return !t.NonExtensible }
+
+func (t *TypedArray) PreventExtensions() { t.NonExtensible = true }

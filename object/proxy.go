@@ -56,6 +56,31 @@ func (p *Proxy) SetProperty(name string, val Value) {
 	}
 }
 
+// HasProperty 实现代理的 [[HasProperty]] (has trap 分发), 供 OrdinaryHasProperty
+// 的父链查询使用 (TypedArray 原型链上挂 Proxy 时, "prop in ta" 必须经父的
+// has trap 而不是 get trap —— abrupt-from-ordinary-has-parent-hasproperty 族)。
+// trap 内异常经回调错误桥, 由调用方 TakeCallbackError 拾取。
+func (p *Proxy) HasProperty(name string) bool {
+	if p.IsRevoked {
+		panic(NewTypeError("Cannot perform 'has' on a proxy that has been revoked"))
+	}
+	if trap := GetProxyTrap(p.Handler, "has"); trap != nil {
+		r := CallFunction(trap, p.Handler, p.Target, NewString(name))
+		if r == nil {
+			return false
+		}
+		return IsTruthyValue(r)
+	}
+	if p.Target != nil {
+		if hp, ok := p.Target.(interface{ HasProperty(string) bool }); ok {
+			return hp.HasProperty(name)
+		}
+		_, found := p.Target.GetProperty(name)
+		return found
+	}
+	return false
+}
+
 // NewProxy 创建代理对象。
 // target 必须是对象或可调用函数，handler 必须是对象。
 // 返回错误时，对应值为 nil。

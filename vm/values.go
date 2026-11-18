@@ -41,8 +41,25 @@ func (vm *VM) inOperator(obj, key object.Value) object.Value {
 		}
 	}
 
+	// TypedArray: [[HasProperty]] (10.7.8.2) —— 规范数值索引按 IsValidInteger
+	// Index 裁决 (越界/-0/非整数 → false, 不得穿透原型链), 其余键走 Ordinary
+	// 自有 + 原型链。此前掉进 GetProperty, 越界数字键恒 true。
+	if ta, ok := obj.(*object.TypedArray); ok {
+		return object.NewBoolean(ta.HasProperty(k))
+	}
+
 	_, found := obj.GetProperty(k)
 	return object.NewBoolean(found)
+}
+
+// currentFrameIsStrict 报告当前执行帧是否处于严格模式 (函数帧按闭包印章;
+// 主帧 script 恒非严格)。供 delete/赋值的严格失败 TypeError 判据使用。
+func (vm *VM) currentFrameIsStrict() bool {
+	frame := vm.currentFrame()
+	if frame == nil || frame.Closure == nil || frame.Closure.Fn == nil {
+		return false
+	}
+	return frame.Closure.Fn.IsStrict
 }
 
 // instanceOf 实现 `obj instanceof Constructor` 语义。
@@ -322,10 +339,13 @@ func (vm *VM) getIndex(obj, index object.Value) object.Value {
 		return object.UndefinedSingleton
 
 	case *object.TypedArray:
+		// Number 键: CanonicalNumericIndexString(number) 即其自身。按
+		// IsValidIntegerIndex 裁决 → 元素或 undefined, **不**回落原型链
+		// ([[Get]] 10.7.8.4)。此前 int(n.Value) 直接截断, x[1.5] 会错读
+		// 元素 1、x[-0] 错读元素 0。
 		if n, ok := index.(*object.Number); ok {
-			idx := int(n.Value)
-			if idx >= 0 && idx < o.ArrLength() {
-				return o.GetElement(idx)
+			if o.IsValidIntegerIndex(n.Value) {
+				return o.GetElement(int(n.Value))
 			}
 			return object.UndefinedSingleton
 		}
@@ -750,16 +770,24 @@ func (vm *VM) setIndex(obj, index, val object.Value, inStaticInit bool) error {
 			o.SetSymbolProperty(sym, val)
 			return nil
 		}
+		// Number 键: CanonicalNumericIndexString(number) 即其自身。
+		// IsValidIntegerIndex → IntegerIndexedElementSet (越界/-0/非整数
+		// 静默忽略, [[Set]] 恒 true); 此前 int(n.Value) 截断, x[1.5]=v 会
+		// 错写元素 1、x[-0]=v 错写元素 0。
 		if n, ok := index.(*object.Number); ok {
-			idx := int(n.Value)
-			if idx >= 0 {
-				// 越界写按规范静默忽略 (setElement 内部处理)
-				o.SetElement(idx, val)
-			}
+			o.SetElementValidated(n.Value, val)
 			return nil
 		}
 		if s, ok := index.(*object.String); ok {
-			o.SetProperty(s.Value, val)
+			// [[Set]] 失败 (自有不可写数据属性 / 无 setter 访问器 / 不可扩展)
+			// 在严格模式必须抛 TypeError ([[Set]] 10.7.8.5 → OrdinarySet)。
+			if !o.SetOwn(s.Value, val) {
+				if vm.currentFrameIsStrict() {
+					return vm.throwNamedError("TypeError",
+						"Cannot assign to read only property '%s' of object", s.Value)
+				}
+				return nil
+			}
 			return vm.checkCallbackErr()
 		}
 	case object.RxIndexed:

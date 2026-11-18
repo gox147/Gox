@@ -160,6 +160,26 @@ func (vm *VM) callFunction(fn object.Value, this object.Value, args []object.Val
 		}
 		return result, nil
 
+	case *object.Proxy:
+		// Go 侧回调桥对代理的 [[Call]] (此前缺分支, p.call(...) / Reflect.apply
+		// 等桥路径报 "[object Proxy] is not a function" —— trap-is-null/undefined
+		// 嵌套转发族): 代理可调用按 target 决定, 分发走 proxyApply (含嵌套
+		// target 递归转发与 revoked 前置校验)。
+		if callee.IsRevoked {
+			return nil, typeErrorThrow("Cannot perform 'apply' on a proxy that has been revoked")
+		}
+		if !object.IsCallable(callee) {
+			return nil, fmt.Errorf("TypeError: %s is not a function", describeCallee(fn))
+		}
+		res, err := vm.proxyApply(callee, this, args)
+		if err != nil {
+			return nil, err
+		}
+		if res == nil {
+			return object.UndefinedSingleton, nil
+		}
+		return res, nil
+
 	case *object.Closure:
 		// 绑定 this: 箭头函数复用自身的词法 this; 非箭头函数一律以传入的
 		// this 作接收者 (this 为 nil 即"无接收者", 等价 undefined —— 交给

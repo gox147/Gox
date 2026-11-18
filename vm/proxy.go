@@ -179,16 +179,20 @@ func (vm *VM) proxyApply(proxy *object.Proxy, thisArg object.Value, args []objec
 // proxyConstruct 处理对代理的 new 调用。
 // 注意: OP_NEW 侧已先校验 IsConstructor(proxy) (target 可构造), 因此带
 // construct trap 的 proxy 只要 target 不可构造就不会走到这里。
+// newTarget 是规范 [[Construct]] 的第三参 (EvaluateNew: newTarget = 被构造的
+// 代理本身; Reflect.construct 显式传入) —— 此前 trap 拿不到它,
+// construct/call-parameters-new-target 族失败。
 
-func (vm *VM) proxyConstruct(proxy *object.Proxy, args []object.Value) (object.Value, error) {
-	res, handled, err := vm.proxyTrap(proxy, "construct", []object.Value{proxy.Target, object.NewArray(args)})
+func (vm *VM) proxyConstruct(proxy *object.Proxy, args []object.Value, newTarget object.Value) (object.Value, error) {
+	res, handled, err := vm.proxyTrap(proxy, "construct", []object.Value{proxy.Target, object.NewArray(args), newTarget})
 	if err != nil {
 		return nil, err
 	}
 	if !handled {
 		// 无 trap: 以 new 方式调用目标; target 是嵌套 proxy 时递归
+		// (newTarget 保持不变, 规范 [[Construct]] step 6.a)。
 		if tp, ok := proxy.Target.(*object.Proxy); ok {
-			return vm.proxyConstruct(tp, args)
+			return vm.proxyConstruct(tp, args, newTarget)
 		}
 		newObj := object.NewObject()
 		result, err := vm.callFunction(proxy.Target, newObj, args)

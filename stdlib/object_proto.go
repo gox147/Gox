@@ -114,7 +114,12 @@ func setupObjectPrototype(o *object.BuiltinFunction) {
 		if len(args) == 0 {
 			return object.NewBoolean(false)
 		}
-		return object.NewBoolean(propertyIsEnumerableImpl(this, args[0]))
+		// proxy 不变式错误经 panic(*Error) 上抛, 在此恢复为 JS 错误值。
+		v, errVal := ownPropResult(func() bool { return propertyIsEnumerableImpl(this, args[0]) })
+		if errVal != nil {
+			return errVal
+		}
+		return object.NewBoolean(v)
 	}))
 
 	// isPrototypeOf(): 检查 this 是否出现在参数的原型链上。
@@ -398,6 +403,17 @@ func hasOwnPropertyImpl(this object.Value, key object.Value) bool {
 	if this == nil {
 		return false
 	}
+	// Proxy: [[HasOwnProperty]] = [[GetOwnProperty]](P) 结果非 undefined
+	// (10.5.x)。trap 分发/不变式/转发统一复用 proxyGetOwnPropertyDescriptor
+	// (trap-is-undefined 等 gOPD 族同时依赖本路径, verifyProperty harness
+	// 用 hasOwnProperty.call(proxy, ...) 断言自有属性)。
+	if p, ok := this.(*object.Proxy); ok {
+		d := proxyGetOwnPropertyDescriptor(p, key)
+		if e, isErr := d.(*object.Error); isErr {
+			panic(e)
+		}
+		return d != nil && d != object.UndefinedSingleton
+	}
 	// Symbol 键: 查符号键槽 (与字符串键空间隔离)。*Object 与函数类/数组/
 	// 类型化数组都经 SymbolPropertyStore 提供符号键自有属性。
 	if sym, ok := key.(*object.Symbol); ok {
@@ -437,6 +453,18 @@ func hasOwnPropertyImpl(this object.Value, key object.Value) bool {
 func propertyIsEnumerableImpl(this object.Value, key object.Value) bool {
 	if this == nil {
 		return false
+	}
+	// Proxy: [[GetOwnProperty]] 结果的 Enumerable 位 (复用 gOPD trap 分发,
+	// undefined → false; 不变式错误经 panic(*Error) 上抛)。
+	if p, ok := this.(*object.Proxy); ok {
+		d := proxyGetOwnPropertyDescriptor(p, key)
+		if e, isErr := d.(*object.Error); isErr {
+			panic(e)
+		}
+		if d == nil || d == object.UndefinedSingleton {
+			return false
+		}
+		return resDescBool(d, "enumerable")
 	}
 	// Symbol 键: 自有且 Enumerable=true。
 	if sym, ok := key.(*object.Symbol); ok {

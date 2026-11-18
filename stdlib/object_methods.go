@@ -286,10 +286,25 @@ func setupObjectGlobal() *object.BuiltinFunction {
 			return errVal
 		} else if handled {
 			if res == nil || res == object.UndefinedSingleton || res == object.NullSingleton {
-				return object.NullSingleton
-			}
-			if !object.IsObjectLike(res) {
+				res = object.NullSingleton
+			} else if !object.IsObjectLike(res) {
 				return object.NewTypeError("'getPrototypeOf' trap must return an object or null")
+			}
+			// 不变式 (10.5.4 step 13): target 不可扩展且 trap 结果与 target
+			// 实际 [[Prototype]] 不同 → TypeError
+			// (not-extensible-not-same-proto-throws / instanceof- 变体)。
+			if p, isP := args[0].(*object.Proxy); isP && p.Target != nil {
+				if ext, ev := targetIsExtensibleOf(p.Target); ev != nil {
+					return ev
+				} else if !ext {
+					tp, ev2 := targetProtoOf(p.Target)
+					if ev2 != nil {
+						return ev2
+					}
+					if res != tp {
+						return object.NewTypeError("'getPrototypeOf' trap must return the same value as the [[GetPrototypeOf]] of the proxy target")
+					}
+				}
 			}
 			return res
 		}
@@ -644,13 +659,19 @@ func setupObjectGlobal() *object.BuiltinFunction {
 
 	// Object.getOwnPropertyDescriptor(obj, prop)
 	o.SetProperty("getOwnPropertyDescriptor", object.NewBuiltin("getOwnPropertyDescriptor", func(args ...object.Value) object.Value {
-		if len(args) < 2 {
-			return object.UndefinedSingleton
-		}
 		// Proxy: [[GetOwnProperty]] 走 trap 分发 (9.5.5), 支持规范不变式
 		// 校验 (rFXXbq: Proxy/getOwnPropertyDescriptor 回归族)。
+		// 缺第二参按 undefined 属性键处理 (null-handler.js: revoked proxy
+		// 的单参调用必须经 [[GetOwnProperty]] 抛 TypeError)。
 		if pxy, ok := args[0].(*object.Proxy); ok {
-			return proxyGetOwnPropertyDescriptor(pxy, args[1])
+			prop := object.Value(object.UndefinedSingleton)
+			if len(args) > 1 {
+				prop = args[1]
+			}
+			return proxyGetOwnPropertyDescriptor(pxy, prop)
+		}
+		if len(args) < 2 {
+			return object.UndefinedSingleton
 		}
 		// globalThis: 自有属性来自全局环境记录 (顶层 var/函数声明/隐式赋值/
 		// 内建全局); 顶层 let/const/class 只存在于词法环境，不是自有属性。
@@ -749,6 +770,27 @@ func setupObjectGlobal() *object.BuiltinFunction {
 		} else if handled {
 			if !object.IsTruthyValue(res) {
 				return object.NewTypeError("'setPrototypeOf' trap returned false")
+			}
+			// 不变式 (10.5.5 step 26): target 不可扩展且 proto 与 target 实际
+			// [[Prototype]] 不同 → TypeError。
+			if p, isP := args[0].(*object.Proxy); isP && p.Target != nil {
+				if ext, ev := targetIsExtensibleOf(p.Target); ev != nil {
+					return ev
+				} else if !ext {
+					tp, ev2 := targetProtoOf(p.Target)
+					if ev2 != nil {
+						return ev2
+					}
+					var want object.Value = object.NullSingleton
+					if args[1] != nil {
+						if _, isNullP := args[1].(*object.Null); !isNullP {
+							want = args[1]
+						}
+					}
+					if want != tp {
+						return object.NewTypeError("'setPrototypeOf' trap: proxy target is non-extensible but the prototype does not match the target's prototype")
+					}
+				}
 			}
 			return args[0]
 		}
@@ -915,7 +957,17 @@ func setupObjectGlobal() *object.BuiltinFunction {
 		if res, handled, errVal := proxyTrapDispatch(args[0], "isExtensible"); errVal != nil {
 			return errVal
 		} else if handled {
-			return object.NewBoolean(object.IsTruthyValue(res))
+			r := object.IsTruthyValue(res)
+			// 不变式 (10.5.3 step 9): trap 结果必须与 target 的 [[Extensible]]
+			// 一致, 否则 TypeError (return-is-different-from-target)。
+			if p, isP := args[0].(*object.Proxy); isP && p.Target != nil {
+				if ext, ev := targetIsExtensibleOf(p.Target); ev != nil {
+					return ev
+				} else if ext != r {
+					return object.NewTypeError("'isExtensible' trap result is inconsistent with the extensibility of the proxy target")
+				}
+			}
+			return object.NewBoolean(r)
 		}
 		// 无 trap: 解包 target 取真实 Extensible 状态 (此前 *Proxy 不被
 		// IsExtensible 识别, 无 trap 也误报 false)。
@@ -934,6 +986,17 @@ func setupObjectGlobal() *object.BuiltinFunction {
 			} else if handled {
 				if !object.IsTruthyValue(res) {
 					return object.NewTypeError("'preventExtensions' trap returned false")
+				}
+				// 不变式 (10.5.2 step 15-18): 先把 target 置为不可扩展, 若
+				// trap 返回 true 但 target 原本可扩展 → TypeError
+				// (return-true-target-is-extensible)。
+				if p, isP := args[0].(*object.Proxy); isP && p.Target != nil {
+					if ext, ev := targetIsExtensibleOf(p.Target); ev != nil {
+						return ev
+					} else if ext {
+						object.PreventExtensions(p.Target)
+						return object.NewTypeError("'preventExtensions' trap returned true but the proxy target is extensible")
+					}
 				}
 				return args[0]
 			}
@@ -1135,9 +1198,15 @@ func proxyOwnKeysInvariant(p *object.Proxy) ([]object.Value, object.Value) {
 	}
 	targetKeys := map[string]keyInfo{}
 	targetSyms := map[*object.Symbol]keyInfo{}
+	var targetStore object.OwnPropertyStore
 	if store, ok := p.Target.(object.OwnPropertyStore); ok {
-		for _, k := range store.OwnKeys() {
-			d, found := store.OwnDescriptor(k)
+		targetStore = store
+	} else if wrapped, ok := toObjectValue(p.Target).(object.OwnPropertyStore); ok {
+		targetStore = wrapped
+	}
+	if targetStore != nil {
+		for _, k := range targetStore.OwnKeys() {
+			d, found := targetStore.OwnDescriptor(k)
 			targetKeys[k] = keyInfo{val: object.NewString(k), configurable: found && d.Configurable}
 		}
 	}
@@ -1152,9 +1221,20 @@ func proxyOwnKeysInvariant(p *object.Proxy) ([]object.Value, object.Value) {
 		return nil, errVal
 	}
 	if !handled {
+		// target 仍是 proxy → 递归深入内层 ownKeys (trap-is-missing/
+		// null/undefined-target-is-proxy 族)。
+		if tp, isProxy := p.Target.(*object.Proxy); isProxy {
+			return proxyOwnKeysInvariant(tp)
+		}
 		var out []object.Value
+		var fwdStore object.OwnPropertyStore
 		if store, ok := p.Target.(object.OwnPropertyStore); ok {
-			for _, k := range store.OwnKeys() {
+			fwdStore = store
+		} else if wrapped, ok := toObjectValue(p.Target).(object.OwnPropertyStore); ok {
+			fwdStore = wrapped
+		}
+		if fwdStore != nil {
+			for _, k := range fwdStore.OwnKeys() {
 				out = append(out, object.NewString(k))
 			}
 		}
@@ -1901,90 +1981,222 @@ func newDynamicFunction(env *runtime.Environment, args []object.Value, kind dyna
 //
 // 只做 GetMethod + 分发, 不做不变式校验 (invariant 族单列)。
 func proxyTrapDispatch(v object.Value, trapName string, args ...object.Value) (object.Value, bool, object.Value) {
+	for {
+		p, ok := v.(*object.Proxy)
+		if !ok {
+			return nil, false, nil
+		}
+		if p.IsRevoked {
+			return nil, true, object.NewTypeError("Cannot perform '%s' on a proxy that has been revoked", trapName)
+		}
+		trap, present := object.GetProxyTrapMethod(p.Handler, trapName)
+		if !present {
+			// trap 缺失且 target 仍是 proxy → 逐层深入内层 handler
+			// (trap-is-null/undefined/missing-target-is-proxy 族)。
+			if tp, isProxy := p.Target.(*object.Proxy); isProxy {
+				v = tp
+				continue
+			}
+			return nil, false, nil
+		}
+		if !object.IsCallable(trap) {
+			return nil, true, object.NewTypeError("'%s' trap must be callable", trapName)
+		}
+		trapArgs := make([]object.Value, 0, len(args)+1)
+		trapArgs = append(trapArgs, p.Target)
+		trapArgs = append(trapArgs, args...)
+		res := object.CallFunction(trap, p.Handler, trapArgs...)
+		if ev := object.TakeCallbackErrorValue(); ev != object.UndefinedSingleton {
+			return nil, true, ev
+		}
+		return res, true, nil
+	}
+}
+
+// targetProtoOf 取任意值的实际 [[Prototype]] (支持嵌套 proxy: 无 trap 时沿
+// target 转发, 有 trap 时结果必须是对象或 null)。返回 (proto, errVal)。
+func targetProtoOf(v object.Value) (object.Value, object.Value) {
+	for {
+		p, ok := v.(*object.Proxy)
+		if !ok {
+			break
+		}
+		res, handled, errVal := proxyTrapDispatch(v, "getPrototypeOf")
+		if errVal != nil {
+			return nil, errVal
+		}
+		if !handled {
+			v = p.Target
+			continue
+		}
+		if res == nil || res == object.UndefinedSingleton || res == object.NullSingleton {
+			return object.NullSingleton, nil
+		}
+		if !object.IsObjectLike(res) {
+			return nil, object.NewTypeError("'getPrototypeOf' trap must return an object or null")
+		}
+		return res, nil
+	}
+	switch t := v.(type) {
+	case *object.GlobalObject:
+		if t.Proto != nil {
+			return t.Proto, nil
+		}
+		return object.NullSingleton, nil
+	case *object.Object:
+		if t.Proto != nil {
+			return t.Proto, nil
+		}
+		return object.NullSingleton, nil
+	case *object.Array:
+		if p := t.GetProto(); p != nil {
+			return p, nil
+		}
+		return object.NullSingleton, nil
+	}
+	if gp, ok := v.(interface{ GetProto() object.Value }); ok {
+		if p := gp.GetProto(); p != nil {
+			return p, nil
+		}
+	}
+	return object.NullSingleton, nil
+}
+
+// targetIsExtensibleOf 取任意值的实际 [[Extensible]] (嵌套 proxy 沿 trap
+// 转发)。返回 (extensible, errVal)。
+func targetIsExtensibleOf(v object.Value) (bool, object.Value) {
+	for {
+		p, ok := v.(*object.Proxy)
+		if !ok {
+			break
+		}
+		res, handled, errVal := proxyTrapDispatch(v, "isExtensible")
+		if errVal != nil {
+			return false, errVal
+		}
+		if !handled {
+			v = p.Target
+			continue
+		}
+		return object.IsTruthyValue(res), nil
+	}
+	return object.IsExtensible(v), nil
+}
+
+// ProxyEnumerableOwnKeys 计算 proxy 的 for-in 键集 (规范
+// EnumerateObjectProperties 13.7.5.15 的等价实现): ownKeys trap (嵌套转发)
+// 收集自有键, 每个键经 [[GetOwnProperty]] (gOPD trap/转发) 过滤 enumerable
+// 位; 符号键被排除 (for-in 仅字符串键)。出错 (不变式 TypeError) 返回空集。
+func ProxyEnumerableOwnKeys(v object.Value) []string {
 	p, ok := v.(*object.Proxy)
 	if !ok {
-		return nil, false, nil
+		return nil
 	}
-	if p.IsRevoked {
-		return nil, true, object.NewTypeError("Cannot perform '%s' on a proxy that has been revoked", trapName)
+	keys, errVal := proxyOwnKeysInvariant(p)
+	if errVal != nil {
+		return []string{}
 	}
-	trap, present := object.GetProxyTrapMethod(p.Handler, trapName)
-	if !present {
-		return nil, false, nil
+	out := []string{}
+	for _, k := range keys {
+		s, isStr := k.(*object.String)
+		if !isStr {
+			continue // for-in 仅枚举字符串键
+		}
+		d := proxyGetOwnPropertyDescriptor(p, k)
+		if e, isErr := d.(*object.Error); isErr {
+			_ = e // 不变式错误按空集处理 (for-in 不抛)
+			return []string{}
+		}
+		if d == nil || d == object.UndefinedSingleton {
+			continue
+		}
+		if resDescBool(d, "enumerable") {
+			out = append(out, s.Value)
+		}
 	}
-	if !object.IsCallable(trap) {
-		return nil, true, object.NewTypeError("'%s' trap must be callable", trapName)
-	}
-	trapArgs := make([]object.Value, 0, len(args)+1)
-	trapArgs = append(trapArgs, p.Target)
-	trapArgs = append(trapArgs, args...)
-	res := object.CallFunction(trap, p.Handler, trapArgs...)
-	if ev := object.TakeCallbackErrorValue(); ev != object.UndefinedSingleton {
-		return nil, true, ev
-	}
-	return res, true, nil
+	return out
 }
 
 // proxyGetOwnPropertyDescriptor 实现 Proxy [[GetOwnProperty]] (9.5.5):
 // trap 分发 + 规范不变式校验。错误以 *Error 值返回 (builtin throw 语义)。
+// GetMethod 语义: trap 为 undefined/null → 视同缺失, 转发 target;
+// trap 存在且不可调用 → TypeError; target 仍是 proxy → 逐层深入
+// (trap-is-null/undefined[-target-is-proxy] 族)。
 func proxyGetOwnPropertyDescriptor(pxy *object.Proxy, prop object.Value) object.Value {
-	if pxy.IsRevoked {
-		return object.NewTypeError("Cannot perform 'getOwnPropertyDescriptor' on a proxy that has been revoked")
-	}
-	// GetMethod(handler, "getOwnPropertyDescriptor"): 属性存在但不可调用
-	// → TypeError (trap-is-not-callable)。
-	trapVal, found := pxy.Handler.GetProperty("getOwnPropertyDescriptor")
-	if ev := object.TakeCallbackErrorValue(); ev != object.UndefinedSingleton {
-		return ev
-	}
-	if found && trapVal != nil && !object.IsCallable(trapVal) {
-		return object.NewTypeError("'getOwnPropertyDescriptor' trap must be callable")
-	}
-	// target 描述符 (供不变式校验)。
-	var targetDesc *object.PropertyDescriptor
-	if store, ok := pxy.Target.(object.OwnPropertyStore); ok {
-		if d, exists := store.OwnDescriptor(toStr(prop)); exists {
-			td := d
-			targetDesc = &td
+	for {
+		if pxy.IsRevoked {
+			return object.NewTypeError("Cannot perform 'getOwnPropertyDescriptor' on a proxy that has been revoked")
 		}
-	}
-	if !found || trapVal == nil {
-		// 无 trap → 转发 target 自有描述符。
-		if targetDesc != nil {
-			return describeProperty(*targetDesc)
+		trapVal, found := pxy.Handler.GetProperty("getOwnPropertyDescriptor")
+		if ev := object.TakeCallbackErrorValue(); ev != object.UndefinedSingleton {
+			return ev
 		}
-		return object.UndefinedSingleton
-	}
-	res := object.CallFunction(trapVal, pxy.Handler, pxy.Target, prop, pxy)
-	if ev := object.TakeCallbackErrorValue(); ev != object.UndefinedSingleton {
-		return ev
-	}
-	if res == nil || res == object.UndefinedSingleton {
-		// trap 结果 undefined: target 该属性不可配置或 target 不可扩展
-		// → TypeError。
-		if targetDesc != nil && !targetDesc.Configurable {
-			return object.NewTypeError("Proxy 'getOwnPropertyDescriptor': trap returned undefined for a non-configurable target property")
+		trapMissing := !found || trapVal == nil ||
+			trapVal == object.UndefinedSingleton || trapVal == object.NullSingleton
+		// GetMethod: 属性存在但不可调用 (且非 undefined/null) → TypeError
+		// (trap-is-not-callable)。
+		if found && !trapMissing && !object.IsCallable(trapVal) {
+			return object.NewTypeError("'getOwnPropertyDescriptor' trap must be callable")
 		}
-		if _, isSym := prop.(*object.Symbol); !isSym && !object.IsExtensible(pxy.Target) {
-			if _, exists := pxyTargetOwnKeysContains(pxy, toStr(prop)); exists {
-				return object.NewTypeError("Proxy 'getOwnPropertyDescriptor': trap returned undefined for a property of a non-extensible target")
+		// target 描述符 (供不变式校验)。原始值 target (String 包装等)
+		// 先 ToObject: 索引字符与 length 是真实自有属性
+		// (trap-is-missing/undefined-target-is-proxy 的 String 变体)。
+		var targetDesc *object.PropertyDescriptor
+		var targetStore object.OwnPropertyStore
+		if store, ok := pxy.Target.(object.OwnPropertyStore); ok {
+			targetStore = store
+		} else if wrapped, ok := toObjectValue(pxy.Target).(object.OwnPropertyStore); ok {
+			targetStore = wrapped
+		}
+		if targetStore != nil {
+			if d, exists := targetStore.OwnDescriptor(toStr(prop)); exists {
+				td := d
+				targetDesc = &td
 			}
 		}
-		return object.UndefinedSingleton
-	}
-	if !object.IsObjectValue(res) {
-		return object.NewTypeError("Proxy 'getOwnPropertyDescriptor' trap must return an Object or undefined")
-	}
-	if !resDescBool(res, "configurable") {
-		if targetDesc == nil || targetDesc.Configurable {
-			return object.NewTypeError("Proxy 'getOwnPropertyDescriptor': trap reported non-configurable for a configurable (or absent) target property")
+		if trapMissing {
+			// 无 trap → 转发 target; target 仍是 proxy → 深入内层
+			// (trap-is-undefined/null/missing-target-is-proxy 族)。
+			if tp, isProxy := pxy.Target.(*object.Proxy); isProxy {
+				pxy = tp
+				continue
+			}
+			if targetDesc != nil {
+				return describeProperty(*targetDesc)
+			}
+			return object.UndefinedSingleton
 		}
+		res := object.CallFunction(trapVal, pxy.Handler, pxy.Target, prop, pxy)
+		if ev := object.TakeCallbackErrorValue(); ev != object.UndefinedSingleton {
+			return ev
+		}
+		if res == nil || res == object.UndefinedSingleton {
+			// trap 结果 undefined: target 该属性不可配置或 target 不可扩展
+			// → TypeError。
+			if targetDesc != nil && !targetDesc.Configurable {
+				return object.NewTypeError("Proxy 'getOwnPropertyDescriptor': trap returned undefined for a non-configurable target property")
+			}
+			if _, isSym := prop.(*object.Symbol); !isSym && !object.IsExtensible(pxy.Target) {
+				if _, exists := pxyTargetOwnKeysContains(pxy, toStr(prop)); exists {
+					return object.NewTypeError("Proxy 'getOwnPropertyDescriptor': trap returned undefined for a property of a non-extensible target")
+				}
+			}
+			return object.UndefinedSingleton
+		}
+		if !object.IsObjectValue(res) {
+			return object.NewTypeError("Proxy 'getOwnPropertyDescriptor' trap must return an Object or undefined")
+		}
+		if !resDescBool(res, "configurable") {
+			if targetDesc == nil || targetDesc.Configurable {
+				return object.NewTypeError("Proxy 'getOwnPropertyDescriptor': trap reported non-configurable for a configurable (or absent) target property")
+			}
+		}
+		if targetDesc == nil && !object.IsExtensible(pxy.Target) {
+			return object.NewTypeError("Proxy 'getOwnPropertyDescriptor': trap reported a new property on a non-extensible target")
+		}
+		// 描述符字段直接透传 trap 结果 (value/get/set/enumerable/configurable)。
+		return res
 	}
-	if targetDesc == nil && !object.IsExtensible(pxy.Target) {
-		return object.NewTypeError("Proxy 'getOwnPropertyDescriptor': trap reported a new property on a non-extensible target")
-	}
-	// 描述符字段直接透传 trap 结果 (value/get/set/enumerable/configurable)。
-	return res
 }
 
 // pxyTargetOwnKeysContains 判断 target 自有字符串键是否包含给定键。
@@ -2068,6 +2280,22 @@ type parsedDesc struct {
 
 // isAccessor 报告描述符是否为访问器描述符 (有 get 或 set 字段)。
 func (p *parsedDesc) isAccessor() bool { return p.hasGet || p.hasSet }
+
+// taDescFromParsed 把解析后的描述符转成 TypedArray.DefineOwnIndexed 需要的
+// 字段视图 (保留 has 标记, exotic [[DefineOwnProperty]] 用它区分部分描述符)。
+func taDescFromParsed(p parsedDesc) object.TypedArrayDesc {
+	return object.TypedArrayDesc{
+		IsAccessor:      p.isAccessor(),
+		HasWritable:     p.hasWritable,
+		Writable:        p.desc.Writable,
+		HasEnumerable:   p.hasEnumerable,
+		Enumerable:      p.desc.Enumerable,
+		HasConfigurable: p.hasConfigurable,
+		Configurable:    p.desc.Configurable,
+		HasValue:        p.hasValue,
+		Value:           p.desc.Value,
+	}
+}
 
 // toPropertyDescriptor 实现 ToPropertyDescriptor (6.2.6.1) 的完整校验:
 //  1. 非对象 → TypeError;
@@ -2411,6 +2639,19 @@ func defineOneProperty(target object.Value, store object.OwnPropertyStore, key s
 	parsed, errVal := toPropertyDescriptor(descVal)
 	if errVal != nil {
 		return errVal
+	}
+	// TypedArray 规范数值索引键: exotic [[DefineOwnProperty]] (10.7.8.3) ——
+	// 无效索引 / 访问器描述符 / 收窄 writable-enumerable-configurable →
+	// 失败 (Object.defineProperty 转 TypeError, Reflect.defineProperty 转
+	// false); 这类键绝不落普通描述符存储。非规范索引键 ("1.0"/"+1"/"foo")
+	// 继续走下方普通流程。
+	if ta, ok := store.(*object.TypedArray); ok {
+		if f, isCanonical := object.CanonicalNumericIndexString(key); isCanonical {
+			if !ta.DefineOwnIndexed(f, taDescFromParsed(parsed)) {
+				return object.NewTypeError("Cannot define property %s: invalid descriptor for typed array element", key)
+			}
+			return nil
+		}
 	}
 	final, errVal := validateAndApplyDesc(target, store, key, parsed)
 	if errVal != nil {
