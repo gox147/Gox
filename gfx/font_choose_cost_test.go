@@ -55,15 +55,18 @@ func resetFontStateForTest(t *testing.T) {
 	fontMu.Lock()
 	baseFont = nil
 	faceBySize = map[int]font.Face{}
+	// 必须走统一入口: 以前这里只把 scannedFonts 清空、**没**把 fontCandsOnce 置零,
+	// 于是扫描结果永远补不回来 —— 后面所有用例都跑在一份没有扫描结果的候选表上
+	// (2026-11-18 gfx 连红的根因之一)。
+	resetFontCandidateScan(false)
 	fontMu.Unlock()
-	scannedFonts = nil
 	resetFontCaches()
 	t.Cleanup(func() {
 		fontMu.Lock()
 		baseFont = nil
 		faceBySize = map[int]font.Face{}
+		resetFontCandidateScan(false)
 		fontMu.Unlock()
-		scannedFonts = nil
 		resetFontCaches()
 		fontReadHook = nil
 	})

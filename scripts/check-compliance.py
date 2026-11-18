@@ -21,6 +21,15 @@
 百分点通常意味着**一整簇用例**回归（language 全量约 2.3 万例，0.5pp ≈ 115 例），
 值得当次就查，而不是等有人看徽章。
 
+## 套件对账（2026-11-18 补）
+
+判红之前先对账：基线自报的 `suite` 必须与本次结果的套件一致。两套件的
+**分母构成完全不同**，但 total 都在 2.38 万上下（差 <1%），用例集变动判据
+认不出来 —— 一旦传错基线（典型是忘了 `--baseline`，脚本退回 language 的默认
+基线），built-ins 的 80.5% 会被报成「从 86.9965% 跌了 6.5pp」，红得跟真回归
+一模一样。现在这种情况会单独报「基线串了套件」，并在自检里双向钉住：
+串门必须红且点名是配置错，套件相同时不许被这条判据洗白。
+
 ## 批次地板（C-5，2026-11-04 拍板口径）
 
 相对闸门只防「较上一次跑批倒退」，防不了「边涨边退」：一批攻坚涨 2pp、
@@ -84,6 +93,21 @@ def load(path):
         die("读不了 %s：%s" % (path, e))
 
 
+def infer_suite(cur, base_path=None):
+    """结果文件自报的套件名优先；没带就看基线文件名（*-builtins.json ⇒ built-ins）。
+
+    为什么需要这层兜底：`gox test262 -json` 的早期版本不带 suite 字段，而两套件
+    的 total 都在 2.38 万上下 —— 一旦退回写死的 "language"，闸门就会拿 language
+    的基线去判 built-ins 的结果，报出一条看起来像回归、其实是口径串门的红。
+    """
+    s = cur.get("suite")
+    if s:
+        return s
+    if base_path and "builtins" in os.path.basename(base_path).replace("-", ""):
+        return "built-ins"
+    return "language"
+
+
 def pp(delta):
     """百分点差值，避免浮点尾巴（78.400000000001 - 78.4）。"""
     return round(delta, 4)
@@ -96,8 +120,14 @@ def fmt(v):
     return str(v)
 
 
-def judge(cur, base):
-    """返回 ( regressions, notes, rows )。"""
+def judge(cur, base, suite=None):
+    """返回 ( regressions, notes, rows )。
+
+    suite 缺省取结果文件自报的套件名（cur["suite"]），用来跟基线自报的套件名
+    对账 —— 两个套件的分母构成不同，拿错基线出来的「跌幅」是纯粹的口径错误。
+    """
+    if suite is None:
+        suite = infer_suite(cur)
     c_rate = float(cur["rate_pct"])
     c_pass = int(cur["passed"])
     c_total = int(cur["total"])
@@ -115,6 +145,22 @@ def judge(cur, base):
         return regressions, notes, rows
 
     total_delta_pct = abs(c_total - b_total) / float(b_total) * 100.0
+
+    # 判据顺序：先认「用例集变没变」，再认「率掉没掉」。
+    # 2026-11-18 补的这层自检是因为一条线上真事：test262.yml 里 built-ins 的
+    # 「合规率批次地板闸门」步骤漏传 --baseline，脚本按默认值去读了 language 的
+    # 基线（docs/test262-baseline.json，86.9965%），于是拿 80.48% 的 built-ins
+    # 结果跟它比，报出「跌了 6.52pp」——两次红都不是回归，是基线串了套件。
+    # 单看这个数是对的（总用例两套件都在 2.38 万上下，差异 <1%，
+    # TOL_TOTAL_PCT 认不出来），所以必须显式对 suite 字段。
+    b_suite = base.get("suite")
+    if b_suite and b_suite != suite:
+        regressions.append(
+            "基线串了套件：%s 标的是 %r，本次跑的是 %r —— 这不是回归，是闸门/CI "
+            "配置错了（多半是没传 --baseline，脚本退回了 language 的默认基线）。"
+            "两个套件的分母构成完全不同，率不可比"
+            % (base.get("source", "基线文件"), b_suite, suite))
+        return regressions, notes, rows
 
     if total_delta_pct > TOL_TOTAL_PCT:
         # 用例集变了：率不可比，只提示；改看 passed 绝对数
@@ -323,7 +369,7 @@ def main():
         if k not in cur:
             die("%s 里缺字段 %s —— 跑批输出的格式变了？" % (cur_path, k))
 
-    suite = cur.get("suite", "language")
+    suite = infer_suite(cur, base_path)
 
     if raise_f:
         if not floors_path:
@@ -349,7 +395,9 @@ def main():
             "commit": os.environ.get("GITHUB_SHA", ""),
             # suite 取自跑批结果，不由脚本写死 —— language 与 built-ins 共用
             # 这一个脚本，各自一份基线文件（rnm4C5 起 built-ins 也要有下限闸门）。
-            "suite": cur.get("suite", "language"),
+            # 万一结果里没带 suite，退回按基线文件名推断（*-builtins.json），
+            # 直接写死 "language" 会把 built-ins 的基线标错套件。
+            "suite": infer_suite(cur, base_path),
             "rate_pct": float(cur["rate_pct"]),
             "passed": int(cur["passed"]),
             "total": int(cur["total"]),
@@ -371,7 +419,8 @@ def main():
         return 0  # 首次不算失败：没有"上一次"可比
 
     base = load(base_path)
-    regressions, notes, rows = judge(cur, base)
+    regressions, notes, rows = judge(dict(base, source=os.path.relpath(base_path, ROOT)),
+                                     cur, suite)
 
     print("test262 合规率闸门：%s" % os.path.relpath(cur_path, ROOT))
     print("  基线：%.4f%%（%d/%d）@ %s"
@@ -458,6 +507,33 @@ def self_test():
                   % (name, kw, "\n    ".join(regressions)))
             continue
         print("ok  %s" % name)
+
+    # 套件串门：基线标 language、结果却是 built-ins ⇒ 必须单独报「基线串了套件」。
+    # 这是 2026-11-18 CI 连红两次的元凶（built-ins 的地板步骤漏传 --baseline，
+    # 脚本退回 language 默认基线，86.9965% vs 80.48% 被报成 −6.52pp 回归）。
+    # 关键点：两套件 total 都在 2.38 万上下，用例集变动判据认不出来 —— 只有
+    # suite 字段能认。
+    wrong_suite_base = dict(base, suite="language")
+    regressions, _, _ = judge(dict(res(80.4808, 19196, 23963), suite="built-ins"),
+                              wrong_suite_base)
+    if not (regressions and "基线串了套件" in regressions[0]):
+        ok = False
+        print("FAIL [串门] 基线套件与本次结果不一致时必须报「基线串了套件」\n    %s"
+              % "\n    ".join(regressions))
+    else:
+        print("ok  [串门] 基线套件与本次结果不一致 ⇒ 红，且点名是配置错不是回归")
+
+    # 反例：suite 对得上时同样的数字就是真回归（不许因为加了串门判据而放过真回归）。
+    # 用 base 自身作基线（78.4% vs 80.48% 是上升），掉的是通过数 —— 所以另取一个
+    # 同套件的高基线。
+    high_base = dict(res(86.9965, 20735, 23832), suite="built-ins")
+    regressions, _, _ = judge(dict(res(80.4808, 19196, 23963), suite="built-ins"),
+                              high_base)
+    if not (regressions and "基线串了套件" not in regressions[0]):
+        ok = False
+        print("FAIL [串门] 套件相同时被误判成串门（真回归会被洗白）: %s" % regressions)
+    else:
+        print("ok  [串门] 套件相同 ⇒ 仍按回归判定，串门判据不洗白真回归")
 
     # 地板判据（C-5）：地板 85.0 @ 23832 例
     floor_entry = {"floor_pct": 85.0, "total": 23832, "basis": "自检"}

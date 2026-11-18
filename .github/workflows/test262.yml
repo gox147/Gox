@@ -205,6 +205,8 @@ jobs:
       - name: 闸门自检（负向样本必须真的红）
         run: |
           set -euo pipefail
+          # 负向样本全挂在 check-compliance.py --self-test 里（含 2026-11-18 那次
+          # built-ins 误吃 language 基线的「套件串门」样本），这里只当门闸用。
           if ! python3 scripts/check-compliance.py --self-test; then
             echo "::error::test262 合规率闸门自测未通过 —— 判据或负向样本失效，它可能已经不再拦任何东西"
             exit 1
@@ -226,12 +228,20 @@ jobs:
       # 绝对下限，防「边涨边退」——相对闸门防不了"一批涨 2pp、下批退 1.5pp"
       # 两次都绿的漂移。地板只升不降，批末手动勾 raise_floor 抬升，历史记录
       # 在 docs/test262-gate-floors.json 的 history 里可查。
+      #
+      # **必须带 --baseline**（2026-11-18 踩的坑）：check-compliance.py 不带
+      #   --baseline 时会退回默认的 language 基线，于是 built-ins 这一步拿
+      #   80.48% 去跟 language 的 86.9965% 比，报出「跌 6.52pp」；两套件 total
+      #   都是 2.38 万上下，用例集变动判据认不出来，红得跟真回归一模一样。
+      #   闸门本身也补了套件对账，这里照样显式传 —— 双保险，且日志里能看见
+      #   它比的是哪一份基线。
       - name: 合规率批次地板闸门
         if: ${{ !inputs.refresh_baseline }}
         run: |
           set -euo pipefail
           python3 scripts/check-compliance.py \
             --current "test262-results-${{ matrix.suite }}.json" \
+            --baseline "${{ matrix.baseline }}" \
             --floor-file docs/test262-gate-floors.json \
             --github
 

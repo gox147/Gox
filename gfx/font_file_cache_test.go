@@ -41,6 +41,8 @@ func TestFontFileReadOnceAcrossScanAndChoose(t *testing.T) {
 	fontMu.Unlock()
 	scannedFonts = nil
 	fontCandsOnce = sync.Once{}
+	fontCandsRan.Store(false)
+	fontCandsScannedGen.Store(^uint64(0))
 	resetFontCaches()
 	rebuildCandidatesLocked()
 	t.Cleanup(func() {
@@ -50,6 +52,8 @@ func TestFontFileReadOnceAcrossScanAndChoose(t *testing.T) {
 		fontMu.Unlock()
 		scannedFonts = nil
 		fontCandsOnce = sync.Once{}
+		fontCandsRan.Store(false)
+		fontCandsScannedGen.Store(^uint64(0))
 		rebuildCandidatesLocked()
 		resetFontCaches()
 	})

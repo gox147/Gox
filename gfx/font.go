@@ -182,6 +182,7 @@ func rebuildCandidatesLocked() {
 	// 随包字体永远排最后: 它是"前面全落空"时的保底, 不该抢系统字体的位置。
 	next = append(next, bundledFontCandidates()...)
 	fontCandidates = next
+	fontCandsGen.Add(1)
 }
 
 // SetFontPath 注入宿主自带的字体文件, 排在所有候选之前 (先试注入的, 再退到系统字体)。
@@ -230,6 +231,18 @@ func containsString(list []string, s string) bool {
 
 // fontCandsOnce 保证扫描型候选只收集一次 (扫描要真解析字体头, 不便宜)。
 var fontCandsOnce sync.Once
+
+// fontCandsRan 记录 fontCandsOnce 是否已经执行过。
+//
+// 为什么单开一个变量: sync.Once 不能按值快照/还原 (内嵌 noCopy), 而测试与
+// reset 路径都需要"把包级字体状态完整还原"。用"Once 是否跑过 + 当前这批候选
+// 是哪一代"来认状态, 比反推 Once 的内部布尔可靠。
+var fontCandsRan atomic.Bool
+
+// fontCandsGen 是候选表的代次: 每重建一次 +1。scannedFonts 属于某一代候选表,
+// 用 "fontCandsScannedGen == fontCandsGen" 判定"扫描结果对当前候选表还有效"。
+var fontCandsGen atomic.Uint64
+var fontCandsScannedGen atomic.Uint64
 
 // fontScanLimit 是递归扫描的**条目**数上限 (含目录)。深目录 + 大字体集合时
 // 无限递归会把首帧拖住, 宁可少找几个字体也不能卡住界面。
@@ -350,7 +363,45 @@ func initFontCandidates() {
 		// 扫描结果排在静态候选之前: 它们来自"这台机器上确实存在"的目录,
 		// 而静态路径在部分发行版/精简镜像里根本不存在。宿主注入的仍排最前。
 		rebuildCandidatesLocked()
+		fontCandsScannedGen.Store(fontCandsGen.Load())
+		fontCandsRan.Store(true)
 	})
+}
+
+// resetFontCandidateScan 把"扫描型候选"复位成"本次启动刚开始"的状态:
+// 清空 scannedFonts、让 Once 可以再跑一次、按当前 injectedFonts 重建候选表,
+// 并让 scannedFontsCurrent() 如实报 false。
+//
+// 为什么要一个统一入口: 这套状态有四个变量 (scannedFonts / Once / Ran / Gen),
+// 以前散在三个测试夹具里各复位一遍 —— 其中一处只清了 scannedFonts 而没置零
+// Once, 扫描结果就再也补不回来, 候选表永久钉在静态兜底上 (2026-11-18 gfx
+// 画廊连红几个批次的根因)。现在复位只有这一份实现。
+//
+// ownsFontMu=false 的调用方必须自己持有 fontMu (与 rebuildCandidatesLocked 同锁);
+// true 则由本函数自己加锁。
+func resetFontCandidateScan(ownsFontMu bool) {
+	if ownsFontMu {
+		fontMu.Lock()
+		defer fontMu.Unlock()
+	}
+	scannedFonts = nil
+	fontCandsOnce = sync.Once{}
+	fontCandsRan.Store(false)
+	rebuildCandidatesLocked() // 代次 +1
+	// 在 rebuild 之后写: 让"扫描结果属于当前代"的标记落在**重建后**的代次之外,
+	// 于是 scannedFontsCurrent() 如实报 false (确实还没扫)。
+	fontCandsScannedGen.Store(^uint64(0))
+}
+
+// scannedFontsCurrent 报告 scannedFonts 是否"对当前候选表仍然有效"。
+//
+// 什么时候会失效: 有代码把 fontCandsOnce 置零 (测试夹具要重建"冷启动刚开始"
+// 的状态) 却没有同时清 scannedFonts, 于是某个 rebuildCandidatesLocked 在没有
+// 扫描结果的情况下重建了候选表, 而 Once 又已经跑过 —— initFontCandidates 再也
+// 不会补扫, 候选表永久退化成静态兜底 (Linux 上兜底完全没有 CJK, 整屏中文不
+// 渲染)。这个状态曾经让 gfx 画廊断言连红几个批次, 而报错全指向组件注册表。
+func scannedFontsCurrent() bool {
+	return fontCandsRan.Load() && fontCandsScannedGen.Load() == fontCandsGen.Load()
 }
 
 // cjkFontHints 是"这个文件名看起来能覆盖中文"的线索。

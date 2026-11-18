@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"testing"
 
 	"golang.org/x/image/font/opentype"
@@ -154,6 +155,15 @@ func TestFontScanDirsSkipsWindows(t *testing.T) {
 	}
 }
 
+// firstOrEmpty 取切片首元素, 空切片返回 "" —— 只为让 t.Fatalf 的格式化不必
+// 先判断长度 (越界 panic 会把一条清晰的断言失败变成崩溃)。
+func firstOrEmpty(list []string) string {
+	if len(list) == 0 {
+		return ""
+	}
+	return list[0]
+}
+
 // firstUsableFontPath 返回一个当前机器上确实能解析的字体路径 (找不到则跳过)。
 // 用真实字体做样本, 是为了让"扫描能认出真字体"这件事有真凭据 —— 拿假数据
 // 只能证明"都没认出来"。
@@ -282,11 +292,6 @@ func TestFontLexiconHelpers(t *testing.T) {
 // 字体 —— 唯一可控的做法是随包带一份字体、由宿主把沙箱路径交进来。所以这里要
 // 断言的是**优先级与生效性**, 不是"某个文件在不在"。
 func TestSetFontPathInjectsHostFont(t *testing.T) {
-	host := firstUsableFontPath(t)
-	if host == "" {
-		t.Skip("本机没有可解析的字体文件")
-	}
-
 	// 测试会改包级字体状态 (候选表/基础字体/掩码缓存), 收尾必须还原 ——
 	// 否则后续用例会拿着被改过的候选表下结论。
 	//
@@ -296,11 +301,40 @@ func TestSetFontPathInjectsHostFont(t *testing.T) {
 	// CJK 字形), 于是**后面所有渲染中文的用例都看不见中文**。Windows/macOS 的静态
 	// 兜底本身就是 CJK 字体 (msyh / PingFang), 所以这个坑只在 Linux 上现形 ——
 	// gfx 画廊的非空白断言就是这么连续红了几个批次。
+	//
+	// 快照必须取在**第一条可能触发扫描的调用之前**, 也就是 host 的选取:
+	// firstUsableFontPath 内部就调 initFontCandidates()。取晚了只是把"扫出来的
+	// 结果"原样放回, 看似无害; 但本用例在扫描前抢跑、或同包别的用例把 Once 提前
+	// 用掉时, 存下的就是空快照 —— 收尾盖回去, 候选表就此退化。
+	// 2026-11-18 CI: 上一版在 firstUsableFontPath 之后才取快照, 且当时扫描结果
+	// 已经因夹具的"半复位"失效, 于是收尾把失效状态原样写回, 本用例首条断言报
+	// "注入后候选表从 338 掉到 9", 紧随其后的 TestFontScanNotSilentlyEmpty 报
+	// "扫描命中 0 条"。
+	//
+	// 所以: **先补齐扫描, 再取快照**。补齐这一步也让本用例的前置条件显式 ——
+	// 它断言的是"在一份有效的扫描结果之上注入字体", 不该随测试顺序翻转。
+	initFontCandidates()
 	savedInjected, savedScanned := injectedFonts, scannedFonts
+	// Once 不能按值拷贝 (内嵌 noCopy): 只记"跑过没有"与"扫描结果属于哪一代"。
+	// 没跑过才需要清 Once; 跑过且代次对不上, 说明这批扫描结果已经与候选表脱钩,
+	// 收尾要连 Once 一起复位, 让下次 initFontCandidates 补扫。
+	savedRan := fontCandsRan.Load()
+	savedScannedGen := fontCandsScannedGen.Load()
 	t.Cleanup(func() {
 		fontMu.Lock()
 		injectedFonts, scannedFonts = savedInjected, savedScanned
-		rebuildCandidatesLocked()
+		rebuildCandidatesLocked() // 代次 +1, 下面把 scannedFonts 重新挂到新代上
+		if savedRan && savedScannedGen == fontCandsScannedGen.Load() {
+			// 快照本身就是当前代扫出来的: 直接挂回去, 不需要重扫。
+		} else if savedRan {
+			// 快照来自旧代, 与重建后的候选表不匹配 —— 宁可让下次重扫一次
+			// (几毫秒), 也不能留一份对不上的扫描结果。
+			fontCandsOnce = sync.Once{}
+			fontCandsRan.Store(false)
+			fontCandsScannedGen.Store(^uint64(0))
+		} else {
+			fontCandsScannedGen.Store(^uint64(0))
+		}
 		baseFont = nil
 		// 就地清空, 免得为了写 map[int]font.Face{} 再引入一个 import
 		for k := range faceBySize {
@@ -310,18 +344,34 @@ func TestSetFontPathInjectsHostFont(t *testing.T) {
 		glyphLRU.reset()
 	})
 
+	host := firstUsableFontPath(t)
+	if host == "" {
+		t.Skip("本机没有可解析的字体文件")
+	}
+	host, _ = filepath.Abs(host)
+
 	before := len(fontCandidates)
 	SetFontPath(host)
-	if len(fontCandidates) != before+1 || fontCandidates[0] != host {
-		t.Fatalf("注入的字体应排在最前: len=%d first=%q", len(fontCandidates), fontCandidates[0])
+	// 断言口径: 注入路径**必须出现在候选表最前**, 但不能要求 len 恰好 +1 ——
+	// 注入的路径如果本来就在扫描结果里 (Windows 上 firstUsableFontPath 常常就
+	// 选中 C:\Windows\Fonts\msyh.ttc, 而它是扫描得到的), rebuildCandidatesLocked
+	// 会按路径去重, 于是 len 原地不动。原来写 len != before+1 是把"注入生效"
+	// 错等价成了"候选表长了一格"。
+	if got := len(fontCandidates); got != before+1 && got != before {
+		t.Fatalf("注入后候选表长度只该 +1 (新路径) 或不变 (该路径本就在扫描结果里): %d → %d",
+			before, got)
 	}
+	if len(fontCandidates) == 0 || fontCandidates[0] != host {
+		t.Fatalf("注入的字体应排在最前: len=%d first=%q", len(fontCandidates), firstOrEmpty(fontCandidates))
+	}
+	after := len(fontCandidates)
 	SetFontPath(host) // 重复注入同一个路径应幂等
-	if len(fontCandidates) != before+1 {
-		t.Fatalf("重复注入不该重复添加: len=%d want=%d", len(fontCandidates), before+1)
+	if len(fontCandidates) != after {
+		t.Fatalf("重复注入不该重复添加: len=%d want=%d", len(fontCandidates), after)
 	}
 	SetFontPath("") // 空路径忽略
-	if len(fontCandidates) != before+1 {
-		t.Fatalf("空路径应被忽略: len=%d", len(fontCandidates))
+	if len(fontCandidates) != after {
+		t.Fatalf("空路径应被忽略: len=%d want=%d", len(fontCandidates), after)
 	}
 
 	// 先让字体真的加载过 (缓存非空), 再注入**另一个**可解析的字体:
@@ -335,8 +385,8 @@ func TestSetFontPathInjectsHostFont(t *testing.T) {
 	}
 	second := ""
 	for _, p := range fontCandidates {
-		if p == host {
-			continue
+		if abs, _ := filepath.Abs(p); abs == host {
+			continue // 同一个文件 (候选表里可能同时有相对与绝对两种写法)
 		}
 		if _, err := os.Stat(p); err == nil {
 			if _, err := parseFontFile(p); err == nil {
@@ -394,10 +444,17 @@ func TestFontScanNotSilentlyEmpty(t *testing.T) {
 	}
 	if len(scannedFonts) == 0 {
 		t.Fatalf("字体目录 %v 存在, 但目录扫描命中 0 条 —— 候选表已退化为静态兜底 "+
-			"(fontCandidates=%v)。静态兜底若没有 CJK 字体, 整屏中文会静默不渲染; "+
-			"先查有没有用例把 scannedFonts 清空了, 再看 fontScanLimit(%d) 是不是被位图字体目录吃光。",
-			dirs, fontCandidates, fontScanLimit)
+			"(fontCandidates=%v, Once 已跑过=%v)。静态兜底若没有 CJK 字体, "+
+			"整屏中文会静默不渲染; 先查有没有用例把 scannedFonts 清空却没走 "+
+			"resetFontCandidateScanLocked, 再看 fontScanLimit(%d) 是不是被位图字体目录吃光。",
+			dirs, fontCandidates, fontCandsRan.Load(), fontScanLimit)
 	}
+	// 注意这里**不**断言 scannedFontsCurrent(): initFontCandidates 只在首次扫描
+	// 之后把扫描结果与当时那一代候选表挂上, 之后任何一次合法的 rebuild (宿主
+	// 注入字体 / 设置随包资源目录) 都会让代次 +1 而扫描结果照旧沿用 —— 那是正常
+	// 的, 不是坏状态。代次一致性是**复位路径**的护栏 (见 resetFontCandidateScanLocked
+	// 与三个夹具), 由那些复位点的用例各自钉住, 不该在这条"扫描别静默为空"的
+	// 断言里顺手判。
 }
 
 // TestBaseFontIsNotBoldFace 默认字体必须是**正体面**。

@@ -6,7 +6,6 @@ import (
 	"path/filepath"
 	"runtime"
 	"strconv"
-	"sync"
 	"testing"
 	"time"
 
@@ -52,9 +51,9 @@ func resetFontStageCaches() {
 	baseFont = nil
 	faceBySize = map[int]font.Face{}
 	fontMu.Unlock()
-	scannedFonts = nil
-	fontCandsOnce = sync.Once{}
-	rebuildCandidatesLocked()
+	// scannedFonts / Once / 代次必须一起复位, 且顺序不能错 —— 统一入口
+	// resetFontCandidateScan 已经把这件事只实现了一份 (这里它自己加锁)。
+	resetFontCandidateScan(true)
 	resetFontCaches()
 }
 
