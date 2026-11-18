@@ -132,8 +132,10 @@ func knownSFNTVersion(tag []byte) bool {
 
 // probeFaceAt 读出一个面的判面信息。
 //
-// 返回 ok=false 的条件与 col.Font(i) 失败对齐: 表目录坏、缺 name 表、缺
-// post 表 (post 是 x/image 的必需表, 缺了整份解析会失败)。
+// 返回 ok=false 的条件**必须比 "x/image 会失败" 更宽松**: 探针只能看到表目录,
+// 看不到 cmap 里的格式错误, 所以这里只做"必需表齐全吗"这一层粗筛 (x/image 的
+// initialize 缺任何一张都会失败)。真正的判据仍由整份解析给出 —— 探针只是
+// "要不要为这个候选付一次整份解析"的启发式, 见 chooseBaseFont。
 func probeFaceAt(f io.ReaderAt, off uint32) (probeFaceInfo, bool) {
 	var hdr [12]byte
 	if _, err := f.ReadAt(hdr[:], int64(off)); err != nil {
@@ -151,11 +153,15 @@ func probeFaceAt(f io.ReaderAt, off uint32) (probeFaceInfo, bool) {
 		return probeFaceInfo{}, false
 	}
 	var nameOff, nameLen, postOff, postLen, maxpOff, maxpLen uint32
+	have := map[string]bool{}
 	for i := 0; i < numTables; i++ {
 		e := dir[16*i : 16*i+16]
 		tag := string(e[0:4])
 		o := binary.BigEndian.Uint32(e[8:])
 		l := binary.BigEndian.Uint32(e[12:])
+		if l > 0 {
+			have[tag] = true
+		}
 		switch tag {
 		case "name":
 			nameOff, nameLen = o, l
@@ -165,21 +171,27 @@ func probeFaceAt(f io.ReaderAt, off uint32) (probeFaceInfo, bool) {
 			maxpOff, maxpLen = o, l
 		}
 	}
-	if nameLen == 0 || postLen == 0 {
+	// x/image 的必需表 (缺一张 initialize 就失败)。字形数据按版本走: TrueType
+	// 要 loca+glyf, CFF 要 CFF/CFF2。少了这些的面在整份解析里等于不存在,
+	// 探针若把它算进"最好的面", chooseBaseFont 就会先乐观、再被整份解析否掉。
+	if !hasRequiredTables(have, hdr[0:4]) {
 		return probeFaceInfo{}, false
 	}
 
 	info := probeFaceInfo{}
-	// name 表读失败**不是**整面失败: x/image 的 Font() 不碰 name 表, 失败只
+	// name 表解析失败**不是**整面失败: x/image 的 Font() 不碰 name 表, 失败只
 	// 发生在 f.Name(), 调用方拿到空串继续判面 (空子族名按"正体"算)。
-	if fam, err := probeNameString(f, nameOff, nameLen, 1); err == nil {
-		info.family = fam
-	}
-	if fam, err := probeNameString(f, nameOff, nameLen, 16); err == nil {
-		info.typoFamily = fam
-	}
-	if sub, err := probeNameString(f, nameOff, nameLen, 2); err == nil {
-		info.subfamily = sub
+	nt, nerr := openNameTable(f, nameOff, nameLen)
+	if nerr == nil {
+		if fam, err := nt.lookup(1); err == nil {
+			info.family = fam
+		}
+		if fam, err := nt.lookup(16); err == nil {
+			info.typoFamily = fam
+		}
+		if sub, err := nt.lookup(2); err == nil {
+			info.subfamily = sub
+		}
 	}
 
 	angle, fixed, ok := probePostHeader(f, postOff, postLen, maxpOff, maxpLen)
@@ -192,30 +204,63 @@ func probeFaceAt(f io.ReaderAt, off uint32) (probeFaceInfo, bool) {
 	return info, true
 }
 
-// probeNameString 读 name 表里第一个"可解码"的指定 ID 记录。
+// hasRequiredTables 检查 x/image initialize 需要的表是否齐全。
+func hasRequiredTables(have map[string]bool, version []byte) bool {
+	for _, t := range []string{"head", "maxp", "cmap", "hhea", "hmtx", "name", "post"} {
+		if !have[t] {
+			return false
+		}
+	}
+	if binary.BigEndian.Uint32(version) == sfntVersionCFF {
+		return have["CFF "] || have["CFF2"]
+	}
+	return have["loca"] && have["glyf"]
+}
+
+// probeNameTable 是一个已读入记录区的 name 表。
 //
-// 与 x/image 的 Font.Name 同序: 按记录顺序扫, 只认 (platform 1, MacRoman) 与
-// (platform 3, encoding 1 UCS-2) 两种编码; 其它平台的同名记录跳过 (x/image
-// 也是 continue, 不是报错)。取不到返回 error, 调用方视为空串。
-func probeNameString(f io.ReaderAt, off, length uint32, id uint16) (string, error) {
-	n := length
-	if n > sfntNameTableCap {
-		n = sfntNameTableCap
+// 分两次读 (6 字节表头 + count×12 字节记录) 而不是"整表一次读完": name 表的
+// length 字段在真实字体里并不总是可信 (截断、尾部填充都见过), 整表 ReadAt 会
+// 因为越过 EOF 直接失败, 而 x/image 只按需读表头/记录/字符串三段, 根本不碰
+// 中间那些字节。对齐它的读法才谈得上"同口径"。
+type probeNameTable struct {
+	f      io.ReaderAt
+	off    uint32
+	strOff int
+	recs   []byte
+	count  int
+}
+
+func openNameTable(f io.ReaderAt, off, length uint32) (*probeNameTable, error) {
+	if length < 6 {
+		return nil, fmt.Errorf("name table too short")
 	}
-	if n < 6 {
-		return "", fmt.Errorf("name table too short")
+	var hdr [6]byte
+	if _, err := f.ReadAt(hdr[:], int64(off)); err != nil {
+		return nil, err
 	}
-	buf := make([]byte, n)
-	if _, err := f.ReadAt(buf, int64(off)); err != nil {
-		return "", err
+	count := int(binary.BigEndian.Uint16(hdr[2:]))
+	if count > 4096 {
+		return nil, fmt.Errorf("name table: %d records", count)
 	}
-	count := int(binary.BigEndian.Uint16(buf[2:]))
-	strOff := int(binary.BigEndian.Uint16(buf[4:]))
-	if 6+12*count > len(buf) {
-		return "", fmt.Errorf("name table truncated")
+	recs := make([]byte, 12*count)
+	// 记录区被截断时只按读到的完整记录算数 (x/image 逐条读, 读到哪算到哪)。
+	n, err := f.ReadAt(recs, int64(off)+6)
+	if n < len(recs) && err != nil && err != io.EOF {
+		return nil, err
 	}
-	for i := 0; i < count; i++ {
-		e := buf[6+12*i : 6+12*i+12]
+	nrec := n / 12
+	return &probeNameTable{
+		f: f, off: off, strOff: int(binary.BigEndian.Uint16(hdr[4:])),
+		recs: recs[:nrec*12], count: nrec,
+	}, nil
+}
+
+// lookup 取第一个"可解码"的指定 ID 记录 (与 x/image 的 Font.Name 同序:
+// 只认 (1,0) MacRoman 与 (3,1) UCS-2, 其它平台跳过而不是报错)。
+func (t *probeNameTable) lookup(id uint16) (string, error) {
+	for i := 0; i < t.count; i++ {
+		e := t.recs[12*i : 12*i+12]
 		if binary.BigEndian.Uint16(e[6:]) != id {
 			continue
 		}
@@ -231,11 +276,15 @@ func probeNameString(f io.ReaderAt, off, length uint32, id uint16) (string, erro
 			continue
 		}
 		l := int(binary.BigEndian.Uint16(e[8:]))
-		start := strOff + int(binary.BigEndian.Uint16(e[10:]))
-		if start < 0 || l < 0 || start+l > len(buf) {
-			return "", fmt.Errorf("name record out of range")
+		start := t.strOff + int(binary.BigEndian.Uint16(e[10:]))
+		buf := make([]byte, l)
+		if n, err := t.f.ReadAt(buf, int64(t.off)+int64(start)); n < l {
+			if err == nil || err == io.EOF {
+				return "", fmt.Errorf("name record truncated")
+			}
+			return "", err
 		}
-		return decodeNameBytes(buf[start:start+l], ucs2)
+		return decodeNameBytes(buf, ucs2)
 	}
 	return "", fmt.Errorf("name id %d not found", id)
 }

@@ -685,11 +685,15 @@ func chooseBaseFont(paths []string) (*opentype.Font, error) {
 				lastErr = fmt.Errorf("%s: %w", filepath.Base(p), err)
 				continue
 			}
-			if baseFaceRank(f) != 0 {
-				// 探针与整份解析不同口径时报错而不是静默接受: 两者都以
-				// name 表为准, 出现分歧说明缓存层/解析层出了 bug。
-				lastErr = fmt.Errorf("%s: probe rank 0 but parsed rank %d",
-					filepath.Base(p), baseFaceRank(f))
+			if got := baseFaceRank(f); got != 0 {
+				// 探针说得比整份解析乐观 (macOS 上真有这种文件: 某个面的
+				// name 表可读、cmap 却解析不了, 整份解析里它等于不存在)。
+				// 以整份解析为准 —— 它才是"这个面能不能当正文"的判据。
+				// 不在这里报错: 报错会让整个候选被跳过, 而它至少是可用字体;
+				// 记成兜底, 后面没有更好的就还是它 (与"整机只有非正体面"同路)。
+				if fallback == "" {
+					fallback = p
+				}
 				continue
 			}
 			return f, nil

@@ -1,20 +1,20 @@
 {
-  "generated_at": "2026-11-18T14:17:28.198686+00:00",
+  "generated_at": "2026-11-18T14:31:19.010232+00:00",
   "benchmark": "coldstart-process",
   "runs": 9,
-  "first_frame_ms_median": 58,
+  "first_frame_ms_median": 56,
   "first_frame_ms_all": [
-    58,
-    58,
-    60,
-    57,
+    56,
+    56,
     59,
-    58,
-    59,
+    55,
     57,
-    55
+    56,
+    56,
+    57,
+    56
   ],
-  "rss_kb": 40500,
+  "rss_kb": 40612,
   "method": "外部 wall time (进程 exec → 脚本打印 FIRST_FRAME, 含 ≤2ms 探测/退出开销), 跑 9 次取中位数, 预热 2 次不计入; 首帧信号 = JS 侧 1ms 轮询 gx/dev 的 devSnapshot().frame.count (只在真实上屏出口计数)",
   "scope": "进程级冷启动到首帧: 含进程 exec/动态链接/Go runtime 启动/解释器初始化/脚本求值(含模块装载)/真实窗口创建/首次 Layout+Draw+上屏",
   "host": {

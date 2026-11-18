@@ -210,8 +210,19 @@ func TestProbeFileFaceRankMatchesFullParse(t *testing.T) {
 			continue
 		}
 		// 探针给的是文件里最好的一面; 整份解析给的是同一面 (regularFaceOf)。
-		if want := baseFaceRank(f); probeRank != want {
-			t.Errorf("%s: 探针 rank = %d, 整份解析 rank = %d (两条路必须同口径)",
+		//
+		// **只在一个方向上判红**: 探针比整份解析更悲观 (= 把真能用的正体面
+		// 判掉) 是危险的, 会让默认字体跳过这个族; 反过来探针乐观只会多付
+		// 一次整份解析, 由 chooseBaseFont 用解析结果否掉 (见那里的注释)。
+		// 这个不对称是实测逼出来的: macOS 的 HelveticaNeue.ttc 里存在
+		// "name 表可读、cmap 解析不了" 的面, 整份解析里它等于不存在, 探针
+		// 却看得到它的子族名 —— 严格相等在那种文件上必然假红。
+		want := baseFaceRank(f)
+		if probeRank > want {
+			t.Errorf("%s: 探针 rank = %d 比整份解析的 %d 更悲观 (会把可用的正体面判掉)",
+				filepath.Base(p), probeRank, want)
+		} else if probeRank < want {
+			t.Logf("探针乐观: %s 探针 rank = %d, 整份解析 rank = %d (只多付一次整份解析)",
 				filepath.Base(p), probeRank, want)
 		}
 		checked++

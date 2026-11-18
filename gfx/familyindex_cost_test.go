@@ -110,7 +110,10 @@ func TestFamilyIndexBuildCost(t *testing.T) {
 		t.Skipf("本机只认出 %d 个族 (字体库太小/为空), 成本闸门没有意义", fams)
 	}
 	if seq < 5*time.Millisecond {
-		t.Skipf("顺序建索引只用 %.1fms (字体库太小), 比值会被测量误差主导", msOf(seq))
+		// 第十一批之后每文件只剩 ~10KB 读盘, 顺序建索引已经掉到 5ms 量级 ——
+		// 这时比值闸门要么被噪声主导, 要么什么都挡不住。跳过而不是硬判,
+		// 但跳过本身会在输出里留一行 (闸门"悄悄失效"比"不设闸门"更糟)。
+		t.Skipf("顺序建索引只用 %.1fms (探针时代成本已很低), 比值会被测量误差主导", msOf(seq))
 	}
 	if speedup < familyBuildSpeedup {
 		t.Fatalf("族索引的并发只快了 %.2fx (顺序 %.1fms / 并发 %.1fms), 低于 %.2fx 的下限。\n"+
