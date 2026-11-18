@@ -228,7 +228,7 @@ func buildTypedArrayGlobals(env *runtime.Environment) {
 		v, _ := buf.GetProperty("detached")
 		return v
 	}), nil)
-	abFn.SetProperty("prototype", abProto)
+	setCtorPrototype(abFn, abProto)
 	env.Declare("ArrayBuffer", abFn, false)
 	// SharedArrayBuffer: Gox 是单线程运行时, 无真正共享内存 —— 以 ArrayBuffer
 	// 同构实现 (共享语义无从观测, 视图/拷贝逻辑与 ArrayBuffer 完全一致),
@@ -244,7 +244,7 @@ func buildTypedArrayGlobals(env *runtime.Environment) {
 		}
 		return object.NewArrayBuffer(n)
 	})
-	sabFn.SetProperty("prototype", abProto)
+	setCtorPrototype(sabFn, abProto)
 	env.Declare("SharedArrayBuffer", sabFn, false)
 
 	// ----- 十种 TypedArray 构造器 -----
@@ -308,7 +308,7 @@ func buildTypedArrayGlobals(env *runtime.Environment) {
 		// SpeciesConstructor 的默认构造器回退与  verifiyProperty 类用例失败。
 		proto.SetBuiltinProperty("constructor", ctor)
 		proto.SetBuiltinProperty("BYTES_PER_ELEMENT", object.NewInt(int64(kind.ElemSize)))
-		ctor.SetProperty("prototype", proto)
+		setCtorPrototype(ctor, proto)
 		object.SetTypedArrayProto(kind.Name, proto)
 		env.Declare(kind.Name, ctor, false)
 	}
@@ -401,7 +401,7 @@ func buildTypedArrayGlobals(env *runtime.Environment) {
 	for _, prop := range []string{"buffer", "byteLength", "byteOffset", "length"} {
 		taProto.DefineAccessor(prop, taAcc(prop), nil)
 	}
-	taFn.SetProperty("prototype", taProto)
+	setCtorPrototype(taFn, taProto)
 	env.Declare("TypedArray", taFn, false)
 	object.SetTypedArrayCtorProto(taFn)
 
@@ -610,7 +610,7 @@ func buildTypedArrayGlobals(env *runtime.Environment) {
 			return object.UndefinedSingleton
 		}), nil)
 	dvProto.SetBuiltinProperty("constructor", dvFn)
-	dvFn.SetProperty("prototype", dvProto)
+	setCtorPrototype(dvFn, dvProto)
 	object.SetDataViewProto(dvProto)
 	env.Declare("DataView", dvFn, false)
 }

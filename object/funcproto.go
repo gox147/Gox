@@ -394,3 +394,15 @@ func funcProtoLookupChain(v Value, name string) (Value, bool) {
 	}
 	return nil, false
 }
+
+// FuncProtoSharedMethod 返回 Function.prototype 共享方法 (call/apply/bind/
+// toString) 的实现。stdlib 装配 %Function.prototype% 的自有属性时用 (B5
+// rFsmHG): 规范要求这四个方法是 %Function.prototype% 的自有数据属性
+// ({writable:true, enumerable:false, configurable:true})，此前只存在于
+// 各可调用类型 GetProperty 的虚拟分发，gOPD(Function.prototype, "call")
+// 返回 undefined。
+// 物化后 funcProto 自身的 GetProperty 命中 PropDescs (优先于虚拟分发)，
+// 其余可调用类型仍走 funcProtoLookup 虚拟兜底 —— 运行时行为不变。
+func FuncProtoSharedMethod(name string) (Value, bool) {
+	return funcProtoLookup(nil, name)
+}

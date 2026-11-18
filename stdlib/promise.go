@@ -686,7 +686,7 @@ func setupPromise(env *runtime.Environment) {
 		return promiseKeyed(this, args, true)
 	}))
 
-	promiseFn.SetProperty("prototype", promiseProto)
+	setCtorPrototype(promiseFn, promiseProto)
 	promiseProto.SetBuiltinProperty("constructor", promiseFn)
 	promiseCtor = promiseFn
 

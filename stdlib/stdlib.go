@@ -81,7 +81,7 @@ func SetupGlobals() *runtime.Environment {
 
 	// ===== Array =====
 	arrayObj := setupArrayGlobal()
-	arrayObj.SetProperty("prototype", arrayProto)
+	setCtorPrototype(arrayObj, arrayProto)
 	arrayProto.SetBuiltinProperty("constructor", arrayObj)
 	env.Declare("Array", arrayObj, false)
 
@@ -215,7 +215,7 @@ func attachPrototype(env *runtime.Environment, name string, proto *object.Object
 	if !ok || v == nil {
 		return
 	}
-	v.SetProperty("prototype", proto)
+	setCtorPrototype(v, proto)
 	proto.SetBuiltinProperty("constructor", v)
 }
 

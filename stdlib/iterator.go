@@ -148,7 +148,7 @@ func setupIteratorGlobal() *object.BuiltinFunction {
 	setupZipMethods(fn)
 
 	proto := object.NewObject()
-	fn.SetProperty("prototype", proto)
+	setCtorPrototype(fn, proto)
 	proto.SetBuiltinProperty("constructor", fn)
 	object.SetIteratorProto(proto)
 
@@ -240,7 +240,7 @@ func setupWeakRefGlobals(env *runtime.Environment) {
 		}
 		return wr.Target
 	}))
-	weakRefFn.SetProperty("prototype", weakProto)
+	setCtorPrototype(weakRefFn, weakProto)
 	env.Declare("WeakRef", weakRefFn, false)
 
 	regFn := object.NewBuiltin("FinalizationRegistry", func(args ...object.Value) object.Value {
@@ -289,7 +289,7 @@ func setupWeakRefGlobals(env *runtime.Environment) {
 		}
 		return object.NewBoolean(reg.Unregister(args[0]))
 	}))
-	regFn.SetProperty("prototype", regProto)
+	setCtorPrototype(regFn, regProto)
 	env.Declare("FinalizationRegistry", regFn, false)
 }
 

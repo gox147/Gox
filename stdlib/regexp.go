@@ -42,7 +42,7 @@ func setupRegExp(env *runtime.Environment) {
 	// 只塞进了 object.RegExpProto (链式查找的事实来源), 却没写成构造器的
 	// prototype 属性, 于是 `typeof RegExp.prototype` 是 undefined,
 	// `RegExp.prototype.exec` 直接 TypeError (rEXjyz)。
-	regexpFn.SetProperty("prototype", regexpProto)
+	setCtorPrototype(regexpFn, regexpProto)
 	// constructor 反向引用 (/a/.constructor === RegExp)。
 	regexpProto.SetBuiltinProperty("constructor", regexpFn)
 	// %RegExp.prototype%[@@toStringTag] = "RegExp" —— 实例的

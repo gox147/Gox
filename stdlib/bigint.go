@@ -64,7 +64,7 @@ func setupBigInt(env *runtime.Environment) {
 	})
 	fn.SetProperty("name", object.NewString("BigInt"))
 	fn.SetFunctionLength(1)
-	fn.SetProperty("prototype", proto)
+	setCtorPrototype(fn, proto)
 	proto.SetBuiltinProperty("constructor", fn)
 
 	// ===== 静态方法 =====

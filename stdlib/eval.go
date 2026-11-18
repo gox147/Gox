@@ -151,7 +151,7 @@ func setupEvalAndMisc(env *runtime.Environment) {
 			aggProto.SetBuiltinProperty("toString", tv)
 		}
 	}
-	aggFn.SetProperty("prototype", aggProto)
+	setCtorPrototype(aggFn, aggProto)
 	aggProto.SetBuiltinProperty("constructor", aggFn)
 	env.Declare("AggregateError", aggFn, false)
 

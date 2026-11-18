@@ -130,7 +130,7 @@ func setupObjectPrototype(o *object.BuiltinFunction) {
 		return object.NewBoolean(isPrototypeOfImpl(this, args[0]))
 	}))
 
-	o.SetProperty("prototype", proto)
+	setCtorPrototype(o, proto)
 }
 
 // objectPrototypeStringOf 返回 Object.prototype.toString 的完整结果:

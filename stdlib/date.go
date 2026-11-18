@@ -35,7 +35,7 @@ func setupDate(env *runtime.Environment) {
 	})
 	fn.SetProperty("name", object.NewString("Date"))
 	fn.SetFunctionLength(7)
-	fn.SetProperty("prototype", proto)
+	setCtorPrototype(fn, proto)
 	proto.SetBuiltinProperty("constructor", fn)
 
 	// ===== 静态方法 =====
@@ -411,6 +411,12 @@ func setupPerformance(env *runtime.Environment) {
 // datePartsOf 把 time value 分解为 [year, month, day, hour, min, sec, milli]
 // 七分量 (utc=true 按 UTC, 否则按宿主本地时区)。
 func datePartsOf(ms float64, utc bool) [7]float64 {
+	// 规范 (YearFromTime/MonthFromTime/... 抽象操作): time value 是 NaN 时
+	// 全部分量为 NaN。此前 int64(NaN) 被 Go 转成平台相关值, 产生"垃圾日期"
+	// —— invalid date 的 set* 读到假分量 (B6 rBxRld)。
+	if math.IsNaN(ms) || math.IsInf(ms, 0) {
+		return [7]float64{math.NaN(), math.NaN(), math.NaN(), math.NaN(), math.NaN(), math.NaN(), math.NaN()}
+	}
 	t := time.UnixMilli(int64(ms))
 	if utc {
 		t = t.UTC()
@@ -427,15 +433,23 @@ func datePartsOf(ms float64, utc bool) [7]float64 {
 // dateSetArg 把 ToNumber(args[i]) 写入 parts[idx] (越界参数忽略, 与规范
 // 可选参数缺省语义一致 —— 缺省即"保留原分量")。
 // 返回值非 nil 表示用户 valueOf/toString 抛错, 必须原样传播 (规范 ? ToNumber)。
-func dateSetArg(parts *[7]float64, idx int, args []object.Value, i int) object.Value {
+// mask 记录哪些槽由实参提供, 供 setFullYear/setYear 族在 [[DateValue]] 为
+// NaN 时把未覆盖分量回填到 +0 的分量 (规范步骤 5: If t is NaN, set t to +0)。
+func dateSetArg(parts *[7]float64, mask *[7]bool, idx int, args []object.Value, i int) object.Value {
 	if i < len(args) {
 		n, errVal := toFloatE(args[i])
 		if errVal != nil {
 			return errVal
 		}
 		parts[idx] = n
+		mask[idx] = true
 	}
 	return nil
+}
+
+// datePartsOfInto 是 datePartsOf 的写入变体 (setter 路径语义一致)。
+func datePartsOfInto(ms float64, utc bool, out *[7]float64) {
+	*out = datePartsOf(ms, utc)
 }
 
 // datePartsNaN 检查任一分量是否 NaN (规范: MakeTime/MakeDay 传播 NaN)。
@@ -456,96 +470,99 @@ func installDateSetters(p *object.Object) {
 	type setterSpec struct {
 		name string
 		utc  bool
+		// fullYear: setFullYear / setYear 族 —— [[DateValue]] 为 NaN 时
+		// 步骤 5 把 t 置 +0 继续组合 (其余 setter 直接返回 NaN 不回写)。
+		fullYear bool
 		// set 把实参写进七分量槽 (槽序: y m d h mi s ms)。
 		// 返回非 nil 表示参数强转抛错, 调用方应立即返回该错误。
-		set func(parts *[7]float64, args []object.Value) object.Value
+		set func(parts *[7]float64, mask *[7]bool, args []object.Value) object.Value
 	}
-	setOne := func(parts *[7]float64, args []object.Value, idx, i int) object.Value {
-		return dateSetArg(parts, idx, args, i)
+	setOne := func(parts *[7]float64, mask *[7]bool, args []object.Value, idx, i int) object.Value {
+		return dateSetArg(parts, mask, idx, args, i)
 	}
 	specs := []setterSpec{
-		{"setMilliseconds", false, func(p *[7]float64, a []object.Value) object.Value { return setOne(p, a, 6, 0) }},
-		{"setUTCMilliseconds", true, func(p *[7]float64, a []object.Value) object.Value { return setOne(p, a, 6, 0) }},
-		{"setSeconds", false, func(p *[7]float64, a []object.Value) object.Value {
-			if e := setOne(p, a, 5, 0); e != nil {
+		{"setMilliseconds", false, false, func(p *[7]float64, m *[7]bool, a []object.Value) object.Value { return setOne(p, m, a, 6, 0) }},
+		{"setUTCMilliseconds", true, false, func(p *[7]float64, m *[7]bool, a []object.Value) object.Value { return setOne(p, m, a, 6, 0) }},
+		{"setSeconds", false, false, func(p *[7]float64, m *[7]bool, a []object.Value) object.Value {
+			if e := setOne(p, m, a, 5, 0); e != nil {
 				return e
 			}
-			return setOne(p, a, 6, 1)
+			return setOne(p, m, a, 6, 1)
 		}},
-		{"setUTCSeconds", true, func(p *[7]float64, a []object.Value) object.Value {
-			if e := setOne(p, a, 5, 0); e != nil {
+		{"setUTCSeconds", true, false, func(p *[7]float64, m *[7]bool, a []object.Value) object.Value {
+			if e := setOne(p, m, a, 5, 0); e != nil {
 				return e
 			}
-			return setOne(p, a, 6, 1)
+			return setOne(p, m, a, 6, 1)
 		}},
-		{"setMinutes", false, func(p *[7]float64, a []object.Value) object.Value {
+		{"setMinutes", false, false, func(p *[7]float64, m *[7]bool, a []object.Value) object.Value {
 			for j, idx := range []int{4, 5, 6} {
-				if e := setOne(p, a, idx, j); e != nil {
+				if e := setOne(p, m, a, idx, j); e != nil {
 					return e
 				}
 			}
 			return nil
 		}},
-		{"setUTCMinutes", true, func(p *[7]float64, a []object.Value) object.Value {
+		{"setUTCMinutes", true, false, func(p *[7]float64, m *[7]bool, a []object.Value) object.Value {
 			for j, idx := range []int{4, 5, 6} {
-				if e := setOne(p, a, idx, j); e != nil {
+				if e := setOne(p, m, a, idx, j); e != nil {
 					return e
 				}
 			}
 			return nil
 		}},
-		{"setHours", false, func(p *[7]float64, a []object.Value) object.Value {
+		{"setHours", false, false, func(p *[7]float64, m *[7]bool, a []object.Value) object.Value {
 			for j, idx := range []int{3, 4, 5, 6} {
-				if e := setOne(p, a, idx, j); e != nil {
+				if e := setOne(p, m, a, idx, j); e != nil {
 					return e
 				}
 			}
 			return nil
 		}},
-		{"setUTCHours", true, func(p *[7]float64, a []object.Value) object.Value {
+		{"setUTCHours", true, false, func(p *[7]float64, m *[7]bool, a []object.Value) object.Value {
 			for j, idx := range []int{3, 4, 5, 6} {
-				if e := setOne(p, a, idx, j); e != nil {
+				if e := setOne(p, m, a, idx, j); e != nil {
 					return e
 				}
 			}
 			return nil
 		}},
-		{"setDate", false, func(p *[7]float64, a []object.Value) object.Value { return setOne(p, a, 2, 0) }},
-		{"setUTCDate", true, func(p *[7]float64, a []object.Value) object.Value { return setOne(p, a, 2, 0) }},
-		{"setMonth", false, func(p *[7]float64, a []object.Value) object.Value {
-			if e := setOne(p, a, 1, 0); e != nil {
+		{"setDate", false, false, func(p *[7]float64, m *[7]bool, a []object.Value) object.Value { return setOne(p, m, a, 2, 0) }},
+		{"setUTCDate", true, false, func(p *[7]float64, m *[7]bool, a []object.Value) object.Value { return setOne(p, m, a, 2, 0) }},
+		{"setMonth", false, false, func(p *[7]float64, m *[7]bool, a []object.Value) object.Value {
+			if e := setOne(p, m, a, 1, 0); e != nil {
 				return e
 			}
-			return setOne(p, a, 2, 1)
+			return setOne(p, m, a, 2, 1)
 		}},
-		{"setUTCMonth", true, func(p *[7]float64, a []object.Value) object.Value {
-			if e := setOne(p, a, 1, 0); e != nil {
+		{"setUTCMonth", true, false, func(p *[7]float64, m *[7]bool, a []object.Value) object.Value {
+			if e := setOne(p, m, a, 1, 0); e != nil {
 				return e
 			}
-			return setOne(p, a, 2, 1)
+			return setOne(p, m, a, 2, 1)
 		}},
 		// setFullYear 族: 无 0..99 映射 (规范 MakeYear 直取整值)。
-		{"setFullYear", false, func(p *[7]float64, a []object.Value) object.Value {
-			if e := setOne(p, a, 0, 0); e != nil {
+		{"setFullYear", false, true, func(p *[7]float64, m *[7]bool, a []object.Value) object.Value {
+			if e := setOne(p, m, a, 0, 0); e != nil {
 				return e
 			}
-			if e := setOne(p, a, 1, 1); e != nil {
+			if e := setOne(p, m, a, 1, 1); e != nil {
 				return e
 			}
-			return setOne(p, a, 2, 2)
+			return setOne(p, m, a, 2, 2)
 		}},
-		{"setUTCFullYear", true, func(p *[7]float64, a []object.Value) object.Value {
-			if e := setOne(p, a, 0, 0); e != nil {
+		{"setUTCFullYear", true, true, func(p *[7]float64, m *[7]bool, a []object.Value) object.Value {
+			if e := setOne(p, m, a, 0, 0); e != nil {
 				return e
 			}
-			if e := setOne(p, a, 1, 1); e != nil {
+			if e := setOne(p, m, a, 1, 1); e != nil {
 				return e
 			}
-			return setOne(p, a, 2, 2)
+			return setOne(p, m, a, 2, 2)
 		}},
 		// setYear (Annex B): 0..99 → 1900+y; NaN → invalid date。
-		{"setYear", false, func(p *[7]float64, a []object.Value) object.Value {
-			if e := setOne(p, a, 0, 0); e != nil {
+		{"setYear", false, true, func(p *[7]float64, m *[7]bool, a []object.Value) object.Value {
+			if e := setOne(p, m, a, 0, 0); e != nil {
 				return e
 			}
 			y := p[0]
@@ -562,12 +579,32 @@ func installDateSetters(p *object.Object) {
 			if !ok {
 				return object.NewErrorWithName("TypeError", "Date.prototype."+sp.name+" requires that 'this' be a Date")
 			}
-			// 规范: 先读 thisTimeValue, 再逐参数 ? ToNumber (即使用户钩子
-			// 会改写日期、即使日期当前为 NaN, 钩子也必须被调用且抛错传播)。
+			// 规范 (2024 起, date-value-read-before-tonumber 族): 步骤 3 先读
+			// [[DateValue]], 步骤 4 逐参数 ? ToNumber —— 用户 valueOf/toString
+			// 钩子在此期间可能改写日期 (setTime) 且抛错传播; 步骤 5 的 NaN
+			// 分支判定其后, 且**不得回写** [[DateValue]] (保留钩子写入的值)。
 			tv := d.TimeValue()
-			parts := datePartsOf(tv, sp.utc)
-			if errVal := sp.set(&parts, args); errVal != nil {
+			var parts [7]float64
+			var mask [7]bool
+			datePartsOfInto(tv, sp.utc, &parts)
+			if errVal := sp.set(&parts, &mask, args); errVal != nil {
 				return errVal
+			}
+			if math.IsNaN(tv) {
+				if !sp.fullYear {
+					// setDate/setSeconds/... 族 (步骤 5): t 是 NaN ⇒ 返回 NaN,
+					// 不回写 —— valueOf 期间 setTime 的写入必须保留。
+					return object.NewNumber(math.NaN())
+				}
+				// setFullYear/setYear 族 (步骤 5): t 置 +0 —— 未由实参覆盖的
+				// 分量取自 +0 的分量 (本地族经 LocalTime, UTC 族直接 +0)。
+				var base [7]float64
+				datePartsOfInto(0, sp.utc, &base)
+				for i := range parts {
+					if !mask[i] {
+						parts[i] = base[i]
+					}
+				}
 			}
 			if datePartsNaN(&parts) {
 				*d = *object.NewDate(math.NaN())

@@ -29,7 +29,7 @@ func setupMapSet(env *runtime.Environment) {
 		}
 		return m
 	})
-	mapFn.SetProperty("prototype", mapProto)
+	setCtorPrototype(mapFn, mapProto)
 	env.Declare("Map", mapFn, false)
 
 	// Map.groupBy(items, callback) (ES2024): 键保持原始值
@@ -53,7 +53,7 @@ func setupMapSet(env *runtime.Environment) {
 		}
 		return s
 	})
-	setFn.SetProperty("prototype", setProto)
+	setCtorPrototype(setFn, setProto)
 	env.Declare("Set", setFn, false)
 
 	// ===== ES2025 Set 组合方法 =====
@@ -83,7 +83,7 @@ func setupMapSet(env *runtime.Environment) {
 		}
 		return m
 	})
-	weakMapFn.SetProperty("prototype", weakMapProto)
+	setCtorPrototype(weakMapFn, weakMapProto)
 	env.Declare("WeakMap", weakMapFn, false)
 
 	// ===== WeakSet =====
@@ -103,7 +103,7 @@ func setupMapSet(env *runtime.Environment) {
 		}
 		return s
 	})
-	weakSetFn.SetProperty("prototype", weakSetProto)
+	setCtorPrototype(weakSetFn, weakSetProto)
 	env.Declare("WeakSet", weakSetFn, false)
 }
 

@@ -1807,14 +1807,14 @@ func setupGlobalFunctions(env *runtime.Environment) {
 		return object.NewNumber(toFloat(args[0]))
 	})
 	numFn.SetProperty("name", object.NewString("Number"))
-	numFn.SetProperty("MAX_SAFE_INTEGER", object.NewNumber(9007199254740991))
-	numFn.SetProperty("MIN_SAFE_INTEGER", object.NewNumber(-9007199254740991))
-	numFn.SetProperty("MAX_VALUE", object.NewNumber(math.MaxFloat64))
-	numFn.SetProperty("MIN_VALUE", object.NewNumber(5e-324))
-	numFn.SetProperty("POSITIVE_INFINITY", object.NewNumber(math.Inf(1)))
-	numFn.SetProperty("NEGATIVE_INFINITY", object.NewNumber(math.Inf(-1)))
-	numFn.SetProperty("NaN", object.NewNumber(math.NaN()))
-	numFn.SetProperty("EPSILON", object.NewNumber(2.220446049250313e-16))
+	numFn.DefineOwn("MAX_SAFE_INTEGER", object.PropertyDescriptor{Value: object.NewNumber(9007199254740991), Writable: false, Enumerable: false, Configurable: false})
+	numFn.DefineOwn("MIN_SAFE_INTEGER", object.PropertyDescriptor{Value: object.NewNumber(-9007199254740991), Writable: false, Enumerable: false, Configurable: false})
+	numFn.DefineOwn("MAX_VALUE", object.PropertyDescriptor{Value: object.NewNumber(math.MaxFloat64), Writable: false, Enumerable: false, Configurable: false})
+	numFn.DefineOwn("MIN_VALUE", object.PropertyDescriptor{Value: object.NewNumber(5e-324), Writable: false, Enumerable: false, Configurable: false})
+	numFn.DefineOwn("POSITIVE_INFINITY", object.PropertyDescriptor{Value: object.NewNumber(math.Inf(1)), Writable: false, Enumerable: false, Configurable: false})
+	numFn.DefineOwn("NEGATIVE_INFINITY", object.PropertyDescriptor{Value: object.NewNumber(math.Inf(-1)), Writable: false, Enumerable: false, Configurable: false})
+	numFn.DefineOwn("NaN", object.PropertyDescriptor{Value: object.NewNumber(math.NaN()), Writable: false, Enumerable: false, Configurable: false})
+	numFn.DefineOwn("EPSILON", object.PropertyDescriptor{Value: object.NewNumber(2.220446049250313e-16), Writable: false, Enumerable: false, Configurable: false})
 	// 以下 isXxx 方法遵循规范: 非 Number 类型的参数一律返回 false
 	numFn.SetProperty("isInteger", object.NewBuiltin("isInteger", func(args ...object.Value) object.Value {
 		num, ok := args[0].(*object.Number)
@@ -1887,7 +1887,7 @@ func setupGlobalFunctions(env *runtime.Environment) {
 		}
 		return object.NewTypeError("Boolean.prototype.valueOf requires that 'this' be a Boolean")
 	}))
-	boolFn.SetProperty("prototype", boolProto)
+	setCtorPrototype(boolFn, boolProto)
 	object.SetBooleanProto(boolProto)
 	env.Declare("Boolean", boolFn, false)
 

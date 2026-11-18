@@ -273,3 +273,28 @@ func clampIndex(idx int64, n int) int {
 	}
 	return int(idx)
 }
+
+// ctorPrototypeDescriptor 构造器 .prototype 属性的规范描述符。
+// ES2015+ 所有内建构造器的 prototype 属性统一为
+// { [[Writable]]: false, [[Enumerable]]: false, [[Configurable]]: false }。
+//
+// 根因单 rFsmHG (B5): 此前各构造器用 SetProperty 挂 prototype (赋值语义,
+// writable/enumerable 全 true)，Object.getOwnPropertyDescriptor(SyntaxError,
+// "prototype") 等 15.2.3.3-4-182..222 一族 24 条失败。
+func ctorPrototypeDescriptor(proto object.Value) object.PropertyDescriptor {
+	return object.PropertyDescriptor{Value: proto, Writable: false, Enumerable: false, Configurable: false}
+}
+
+// setCtorPrototype 按规范口径把 .prototype 挂到内建构造器上。
+// 构造器统一是 *BuiltinFunction (object.NewBuiltin)；*Object 分支兜底
+// Math/JSON 这类命名空间对象上的场景。挂载后不可写 —— 后续再以
+// SetProperty/SetBuiltinProperty 覆写会被静默忽略 (注册点一次性完成)。
+func setCtorPrototype(ctor object.Value, proto object.Value) {
+	desc := ctorPrototypeDescriptor(proto)
+	switch c := ctor.(type) {
+	case *object.BuiltinFunction:
+		c.DefineOwn("prototype", desc)
+	case *object.Object:
+		c.DefineOwnProperty("prototype", desc)
+	}
+}

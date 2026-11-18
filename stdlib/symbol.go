@@ -135,7 +135,7 @@ func setupSymbolFunction(env *runtime.Environment) {
 		return object.NewTypeError("Symbol.prototype.valueOf requires that 'this' be a Symbol")
 	}))
 	setToStringTag(symbolProto, "Symbol")
-	symbolFn.SetProperty("prototype", symbolProto)
+	setCtorPrototype(symbolFn, symbolProto)
 	object.SetSymbolProto(symbolProto)
 
 	env.Declare("Symbol", symbolFn, false)

@@ -40,6 +40,20 @@ func setupFunctionIntrinsics(env *runtime.Environment) {
 	}
 	object.SetFunctionPrototype(funcProto)
 
+	// B5 (rFsmHG) 15.2.3.3-4-35..38: call/apply/bind/toString 必须是
+	// %Function.prototype% 的自有数据属性 ({writable:true, enumerable:false,
+	// configurable:true})。此前只存在于各可调用类型 GetProperty 的虚拟分发，
+	// gOPD(Function.prototype, "call") 返回 undefined。物化后 funcProto 自身
+	// 的 GetProperty 命中 PropDescs (优先于虚拟分发)；其余可调用类型仍走
+	// funcProtoLookup 虚拟兜底 —— 运行时行为不变。
+	for _, m := range []string{"call", "apply", "bind", "toString"} {
+		if impl, ok := object.FuncProtoSharedMethod(m); ok {
+			funcProto.DefineOwn(m, object.PropertyDescriptor{
+				Value: impl, Writable: true, Enumerable: false, Configurable: true,
+			})
+		}
+	}
+
 	// %Function% 构造器: new Function(...) / Function(...) 动态编译源码。
 	funcCtor := object.NewBuiltin("Function", func(args ...object.Value) object.Value {
 		return newDynamicFunction(env, args, dynFuncNormal)
@@ -47,8 +61,12 @@ func setupFunctionIntrinsics(env *runtime.Environment) {
 	funcCtor.SetProperty("name", object.NewString("Function"))
 	funcCtor.SetFunctionLength(1)
 	funcCtor.FuncPrototype = funcProto // %Function%.[[Prototype]] = %Function.prototype%
-	funcCtor.SetProperty("prototype", funcProto)
-	funcProto.SetProperty("constructor", funcCtor)
+	setCtorPrototype(funcCtor, funcProto)
+	// constructor: {writable:true, enumerable:false, configurable:true} (规范)。
+	// 此前 SetProperty 使其可枚举，Object.keys(Function.prototype) 多出一个键。
+	funcProto.DefineOwn("constructor", object.PropertyDescriptor{
+		Value: funcCtor, Writable: true, Enumerable: false, Configurable: true,
+	})
 	env.Declare("Function", funcCtor, false)
 
 	// %GeneratorFunction% + %GeneratorFunction.prototype% + %GeneratorPrototype%
@@ -67,7 +85,7 @@ func setupFunctionIntrinsics(env *runtime.Environment) {
 	if tagSym != nil {
 		genProto.SetBuiltinSymbolProperty(tagSym, object.NewString("Generator"))
 	}
-	genFunc.SetProperty("prototype", genFuncProto)
+	setCtorPrototype(genFunc, genFuncProto)
 	genFunc.FuncPrototype = funcCtor // %GeneratorFunction%.[[Prototype]] = %Function%
 	object.SetGeneratorFunctionPrototype(genFuncProto)
 	object.SetGeneratorPrototype(genProto)
@@ -137,7 +155,7 @@ func setupFunctionIntrinsics(env *runtime.Environment) {
 	if tagSym != nil {
 		asyncFuncProto.SetBuiltinSymbolProperty(tagSym, object.NewString("AsyncFunction"))
 	}
-	asyncFunc.SetProperty("prototype", asyncFuncProto)
+	setCtorPrototype(asyncFunc, asyncFuncProto)
 	asyncFunc.FuncPrototype = funcCtor // %AsyncFunction%.[[Prototype]] = %Function%
 	object.SetAsyncFunctionPrototype(asyncFuncProto)
 }
