@@ -231,8 +231,8 @@ func jsValueToJSONIndent(v object.Value, currentIndent, indent string, replacerA
 		if val.Value > 1e308 || val.Value < -1e308 { // Infinity
 			return "null", false, nil
 		}
-		b, _ := json.Marshal(val.Value)
-		return string(b), false, nil
+		// 规范 SerializeJSONProperty: 走 Number::toString —— ±0 → "0"
+		return object.NumberToString(val.Value), false, nil
 	case *object.String:
 		b, _ := json.Marshal(val.Value)
 		return string(b), false, nil
@@ -343,8 +343,12 @@ func jsValueToJSON(v object.Value) string {
 		if val.Value != val.Value { // NaN
 			return "null"
 		}
-		b, _ := json.Marshal(val.Value)
-		return string(b)
+		// 规范 SerializeJSONProperty: 走 Number::toString —— ±0 → "0"
+		// (json.Marshal 对 -0 会输出 "-0")。
+		if math.IsInf(val.Value, 0) {
+			return "null"
+		}
+		return object.NumberToString(val.Value)
 	case *object.String:
 		b, _ := json.Marshal(val.Value)
 		return string(b)

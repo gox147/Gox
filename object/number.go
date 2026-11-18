@@ -108,7 +108,10 @@ func isInf(f float64) bool {
 func NewNumber(v float64) *Number {
 	// 小整数缓存: 循环计数器/索引是最常见的装箱来源 ([-1, 256])。
 	// 命中时零分配, 显著降低解释循环的 GC 压力。
-	if v == float64(int64(v)) && v >= -1 && v <= 256 {
+	// 注意: -0 必须绕过缓存 —— int64(-0) 截断成 +0, 缓存命中会把 -0
+	// 归一化成 +0, 于是 Object.is(-0, 0) / defineProperty 的 ±0 SameValue
+	// 校验全线失效 (T6: 15.2.3.6-4-x ±0 族)。
+	if v == float64(int64(v)) && v >= -1 && v <= 256 && !(v == 0 && math.Signbit(v)) {
 		return &smallIntCache[int(v)+1]
 	}
 	return &Number{Value: v}

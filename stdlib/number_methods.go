@@ -77,6 +77,11 @@ func setupNumberProto() *object.Object {
 		if precision < 1 || precision > 100 {
 			return object.NewRangeError("toPrecision() precision argument must be between 1 and 100")
 		}
+		if num.Value == 0 {
+			// 规范 Number.prototype.toPrecision: ±0 → "0" (T6 回归修复:
+			// NewNumber -0 修复后 FormatFloat 会输出 "-0")
+			return object.NewString("0")
+		}
 		return object.NewString(strconv.FormatFloat(num.Value, 'g', int(precision), 64))
 	}))
 

@@ -158,6 +158,9 @@ func looseEqualsRef(a, b Value) bool {
 
 // isObjectValue 判断值是否为对象类型 (WeakRef/Registry 的目标检查用)。
 func IsObjectValue(v Value) bool {
+	if IsTemporalExotic(v) {
+		return true // Temporal 内建实例也是规范意义上的对象 (T6 回归修复)
+	}
 	switch v.(type) {
 	case *Object, *Array, *Map, *Set, *Error, *Closure, *BuiltinFunction,
 		*BuiltinMethod, *RegExp, *Promise, *Generator, *Proxy, *JSIterator,

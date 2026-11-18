@@ -96,10 +96,37 @@ func setupObjectGlobal() *object.BuiltinFunction {
 	// Object.assign(target, ...sources)
 	o.SetProperty("assign", object.NewBuiltin("assign", func(args ...object.Value) object.Value {
 		if len(args) == 0 {
-			return object.NewObject()
+			return object.NewTypeError("Object.assign: target cannot be undefined")
+		}
+		// RequireObjectCoercible(target): null/undefined → TypeError
+		// (19.1.2.1.1 Target-Null/Target-Undefined)。
+		if _, isUndef := args[0].(*object.Undefined); isUndef {
+			return object.NewTypeError("Object.assign called on non-object")
+		}
+		if _, isNull := args[0].(*object.Null); isNull {
+			return object.NewTypeError("Object.assign called on non-object")
 		}
 		target, ok := args[0].(*object.Object)
 		if !ok {
+			// 原始值 target: ToObject 后只有字符串包装带自有索引属性, 且
+			// 全部不可写 —— Set(key, value, true) → TypeError
+			// (assignment-to-readonly-property-of-target-*)。其余原始值包装
+			// 无自有属性, 属性全部写进包装对象 (丢弃, 不抛)。
+			if s, isStr := args[0].(*object.String); isStr && object.UTF16Len(s.Value) > 0 {
+				for i := 1; i < len(args); i++ {
+					src := args[i]
+					if src == object.UndefinedSingleton || src == object.NullSingleton {
+						continue
+					}
+					if store, ok2 := src.(object.OwnPropertyStore); ok2 && len(store.EnumerableOwnKeys()) > 0 {
+						for _, k := range store.EnumerableOwnKeys() {
+							if idx, err := strconv.Atoi(k); err == nil && idx >= 0 && idx < object.UTF16Len(s.Value) {
+								return object.NewTypeError("Cannot assign to read only property '%s' of string", k)
+							}
+						}
+					}
+				}
+			}
 			return args[0]
 		}
 		for i := 1; i < len(args); i++ {
@@ -109,7 +136,7 @@ func setupObjectGlobal() *object.BuiltinFunction {
 			if src == object.UndefinedSingleton || src == object.NullSingleton {
 				continue
 			}
-			if store, ok := src.(object.OwnPropertyStore); ok {
+			if store, ok2 := src.(object.OwnPropertyStore); ok2 {
 				for _, k := range store.EnumerableOwnKeys() {
 					// 规范 19.1.2.1: Get(from, nextKey) —— 必须经 GetProperty
 					// 调用访问器 (getter 抛错要向上传播, 见
@@ -117,7 +144,12 @@ func setupObjectGlobal() *object.BuiltinFunction {
 					val, _ := src.(interface {
 						GetProperty(string) (object.Value, bool)
 					}).GetProperty(k)
-					target.SetProperty(k, val)
+					// Set(to, nextKey, propValue, true): 写失败 → TypeError
+					// (target-set-not-writable / target-is-frozen-* /
+					// target-is-non-extensible-* / target-is-sealed-* 族)。
+					if errVal := setOrThrow(target, k, val); errVal != nil {
+						return errVal
+					}
 				}
 			}
 		}
@@ -128,11 +160,24 @@ func setupObjectGlobal() *object.BuiltinFunction {
 	// 经 object.FreezeProperties 统一处理 *Object 与 *Array —— 数组的索引
 	// 是隐式数据属性, 需要补写显式描述符才能真的变成只读 (否则 freeze 后
 	// arr.push(1) 仍写得进去)。
+	// proxy: freeze 走 [[PreventExtensions]] trap; trap 报 false → TypeError
+	// (freeze/throws-when-false)。
 	o.SetProperty("freeze", object.NewBuiltin("freeze", func(args ...object.Value) object.Value {
 		if len(args) == 0 {
 			return object.UndefinedSingleton
 		}
-		object.FreezeProperties(args[0], true)
+		if res, handled, errVal := proxyTrapDispatch(args[0], "preventExtensions"); errVal != nil {
+			return errVal
+		} else if handled {
+			if !object.IsTruthyValue(res) {
+				return object.NewTypeError("'preventExtensions' trap returned false")
+			}
+		}
+		freezeTarget := args[0]
+		if p, ok := args[0].(*object.Proxy); ok && p.Target != nil {
+			freezeTarget = p.Target
+		}
+		object.FreezeProperties(freezeTarget, true)
 		return args[0]
 	}))
 
@@ -148,11 +193,24 @@ func setupObjectGlobal() *object.BuiltinFunction {
 	}))
 
 	// Object.seal(obj): 不可扩展，所有自有属性不可配置 (但保持可写)。
+	// proxy: seal 走 [[PreventExtensions]] trap; trap 报 false → TypeError
+	// (seal/throws-when-false)。
 	o.SetProperty("seal", object.NewBuiltin("seal", func(args ...object.Value) object.Value {
 		if len(args) == 0 {
 			return object.UndefinedSingleton
 		}
-		object.FreezeProperties(args[0], false)
+		if res, handled, errVal := proxyTrapDispatch(args[0], "preventExtensions"); errVal != nil {
+			return errVal
+		} else if handled {
+			if !object.IsTruthyValue(res) {
+				return object.NewTypeError("'preventExtensions' trap returned false")
+			}
+		}
+		sealTarget := args[0]
+		if p, ok := args[0].(*object.Proxy); ok && p.Target != nil {
+			sealTarget = p.Target
+		}
+		object.FreezeProperties(sealTarget, false)
 		return args[0]
 	}))
 
@@ -186,23 +244,33 @@ func setupObjectGlobal() *object.BuiltinFunction {
 		obj := object.NewObjectWithProto(proto)
 		// properties 参数: ToObject(P) 后对每个自有可枚举键取描述符并
 		// CreateDataPropertyOrThrow (经 defineOneProperty, 与 defineProperties
-		// 同一收口)。P 为 undefined/null 时无属性; 原始值按空处理 (本运行时
-		// 无包装对象, 空描述符集与规范的可观测行为一致)。
+		// 同一收口)。规范 ObjectDefineProperties step 2: props = ToObject(P) ——
+		// null → TypeError (15.2.3.5-4-3); 非空字符串包装的每个码元都是
+		// 非对象 descObj → ToPropertyDescriptor TypeError
+		// (properties-arg-to-object-non-empty-string); 其余原始值包装无
+		// 自有可枚举属性, 按空处理 (可观测行为一致)。
 		if len(args) > 1 {
 			if _, isUndef := args[1].(*object.Undefined); !isUndef {
-				if _, isNull2 := args[1].(*object.Null); !isNull2 {
-					if props, ok := args[1].(*object.Object); ok {
-						for _, key := range props.EnumerableKeys() {
-							descVal, found := props.GetProperty(key)
-							if !found {
-								continue
-							}
-							if errVal := defineOneProperty(obj, key, descVal); errVal != nil {
-								return errVal
-							}
+				if _, isNull2 := args[1].(*object.Null); isNull2 {
+					return object.NewTypeError("Object.create: properties argument cannot be null")
+				}
+				if s, isStr := args[1].(*object.String); isStr {
+					if object.UTF16Len(s.Value) > 0 {
+						return object.NewTypeError("Property description must be an object")
+					}
+					// 空字符串: 包装对象无可枚举自有属性 → 空描述符集。
+				} else if store, ok := args[1].(object.OwnPropertyStore); ok {
+					for _, key := range store.EnumerableOwnKeys() {
+						descVal, found := args[1].GetProperty(key)
+						if !found {
+							continue
+						}
+						if errVal := defineOneProperty(obj, obj, key, descVal); errVal != nil {
+							return errVal
 						}
 					}
 				}
+				// 其余原始值 (number/boolean/symbol): ToObject 后无自有可枚举属性 → 空处理。
 			}
 		}
 		return obj
@@ -319,21 +387,122 @@ func setupObjectGlobal() *object.BuiltinFunction {
 
 	// Object.fromEntries(iterable)
 	o.SetProperty("fromEntries", object.NewBuiltin("fromEntries", func(args ...object.Value) object.Value {
+		// RequireObjectCoercible(iterable): 缺参/null/undefined → TypeError
+		// (requires-argument)。
 		if len(args) == 0 {
-			return object.NewObject()
+			return object.NewTypeError("Object.fromEntries requires an iterable")
 		}
+		if _, isUndef := args[0].(*object.Undefined); isUndef {
+			return object.NewTypeError("Object.fromEntries requires an iterable")
+		}
+		if _, isNull := args[0].(*object.Null); isNull {
+			return object.NewTypeError("Object.fromEntries requires an iterable")
+		}
+		obj := object.NewObject()
+		addEntry := func(entry object.Value) object.Value {
+			// AddEntriesFromIterable: entry = ToObject(value) —— null/
+			// undefined/原始值一律 TypeError (iterator-closed-for-null-entry /
+			// string-entry-primitive-throws); key 走 ToPropertyKey —— Symbol
+			// 键合法 (supports-symbols), 落符号键槽。
+			if !object.IsObjectValue(entry) {
+				return object.NewTypeError("Object.fromEntries: entry is not an object")
+			}
+			keyVal, _ := entry.GetProperty("0")
+			if sym, isSym := keyVal.(*object.Symbol); isSym {
+				obj.DefineOwnSymbolProperty(sym, object.PropertyDescriptor{
+					Value: func() object.Value {
+						if v, _ := entry.GetProperty("1"); v != nil {
+							return v
+						}
+						return object.UndefinedSingleton
+					}(),
+					Writable:     true,
+					Enumerable:   true,
+					Configurable: true,
+				})
+				return nil
+			}
+			key, errVal := toPropertyKey(keyVal)
+			if errVal != nil {
+				return errVal
+			}
+			val, _ := entry.GetProperty("1")
+			obj.SetProperty(key, val)
+			return nil
+		}
+		closeIterator := func(iterator object.Value) {
+			retFn, found := iterator.GetProperty("return")
+			if found && retFn != nil && object.IsCallable(retFn) {
+				object.CallFunction(retFn, iterator)
+				object.TakeCallbackErrorValue() // 关闭期错误按规范吞掉
+			}
+		}
+		runIterator := func(iterator object.Value) object.Value {
+			for {
+				nextFn, found := iterator.GetProperty("next")
+				if !found || nextFn == nil || !object.IsCallable(nextFn) {
+					// next 不可调用: 直接 TypeError, 不关闭迭代器
+					// (iterator-not-closed-for-uncallable-next)。
+					return object.NewTypeError("Object.fromEntries: iterator has no callable next")
+				}
+				result := object.CallFunction(nextFn, iterator)
+				if ev := object.TakeCallbackErrorValue(); ev != object.UndefinedSingleton {
+					return ev // next 抛错: 按规范不关闭, 原样上抛
+				}
+				if !object.IsObjectValue(result) {
+					// next 返回非对象: TypeError 且不关闭
+					// (iterator-not-closed-for-next-returning-non-object)。
+					return object.NewTypeError("Object.fromEntries: iterator result is not an object")
+				}
+				if doneVal, _ := result.GetProperty("done"); doneVal != nil && object.IsTruthyValue(doneVal) {
+					return nil // done → 正常结束, 不调用 return
+				}
+				entry, _ := result.GetProperty("value")
+				if errVal := addEntry(entry); errVal != nil {
+					// 体内失败: 关闭迭代器后上抛 (iterator-closed-for-*-entry)。
+					closeIterator(iterator)
+					return errVal
+				}
+			}
+		}
+		// 数组快路径: 元素逐个走同一 addEntry 校验 (['ab'] 字符串项 → TypeError)。
 		if arr, ok := args[0].(*object.Array); ok {
-			obj := object.NewObject()
 			for _, entry := range arr.Elements {
-				if entryArr, ok := entry.(*object.Array); ok && len(entryArr.Elements) >= 2 {
-					key := toStr(entryArr.Elements[0])
-					val := entryArr.Elements[1]
-					obj.SetProperty(key, val)
+				if errVal := addEntry(entry); errVal != nil {
+					return errVal
 				}
 			}
 			return obj
 		}
-		return object.NewObject()
+		// GetIterator: @@iterator 缺失/nullish → TypeError "not iterable";
+		// 存在但不可调用 → TypeError; 调用结果非对象 → TypeError。
+		sym := object.GetGlobalSymbol("Symbol.iterator")
+		var iterFn object.Value
+		if sym != nil {
+			if sp, ok := args[0].(object.SymbolPropertyStore); ok {
+				if v, found := sp.GetSymbolProperty(sym); found && v != nil &&
+					v != object.UndefinedSingleton && v != object.NullSingleton {
+					iterFn = v
+				}
+			}
+		}
+		if iterFn == nil {
+			return object.NewTypeError("Object.fromEntries: argument is not iterable")
+		}
+		if !object.IsCallable(iterFn) {
+			return object.NewTypeError("Object.fromEntries: [Symbol.iterator] is not a function")
+		}
+		iterator := object.CallFunction(iterFn, args[0])
+		if ev := object.TakeCallbackErrorValue(); ev != object.UndefinedSingleton {
+			return ev
+		}
+		if !object.IsObjectValue(iterator) {
+			return object.NewTypeError("Object.fromEntries: iterator is not an object")
+		}
+		if errVal := runIterator(iterator); errVal != nil {
+			return errVal
+		}
+		return obj
 	}))
 
 	// Object.is(a, b): 同值相等比较
@@ -349,7 +518,27 @@ func setupObjectGlobal() *object.BuiltinFunction {
 		if len(args) < 2 {
 			return object.NewBoolean(false)
 		}
-		key := toStr(args[1])
+		// RequireObjectCoercible(O) 先于 ToPropertyKey(P): undefined/null
+		// 抛 TypeError 且不得触发 key 的 toString/valueOf
+		// (toobject_null / toobject_before_topropertykey)。
+		if _, isUndef := args[0].(*object.Undefined); isUndef {
+			return object.NewTypeError("Object.hasOwn called on non-object")
+		}
+		if _, isNull := args[0].(*object.Null); isNull {
+			return object.NewTypeError("Object.hasOwn called on non-object")
+		}
+		key, keyErr := toPropertyKey(args[1])
+		if keyErr != nil {
+			return keyErr
+		}
+		// Symbol 键: 查 SymbolPropertyStore 的符号键槽 (字符串键查询不覆盖)。
+		if sym, isSym := args[1].(*object.Symbol); isSym {
+			if sp, ok := args[0].(object.SymbolPropertyStore); ok {
+				_, found := sp.GetSymbolPropertyDescriptor(sym)
+				return object.NewBoolean(found)
+			}
+			return object.NewBoolean(false)
+		}
 		// 统一自有属性接口: 普通对象 / globalThis / 数组 / 函数类一视同仁
 		// (数组索引与 length、函数的 name/length/prototype 都是自有属性)。
 		if store, ok := args[0].(object.OwnPropertyStore); ok {
@@ -365,18 +554,37 @@ func setupObjectGlobal() *object.BuiltinFunction {
 
 	// Object.defineProperty(obj, prop, descriptor)
 	o.SetProperty("defineProperty", object.NewBuiltin("defineProperty", func(args ...object.Value) object.Value {
+		// 规范: O/P/Attributes 缺一不可 —— 缺参 → ToObject/ToPropertyKey/
+		// ToPropertyDescriptor 链上必然 TypeError (15.2.3.6 族)。
 		if len(args) < 3 {
-			return object.UndefinedSingleton
+			return object.NewTypeError("Object.defineProperty called on non-object")
+		}
+		// Type(O) 不是 Object → TypeError (ES5 15.2.3.6 step 1 至今保留;
+		// 15.2.3.6-1-x 族: undefined/null/number/string/boolean 全抛)。
+		if !object.IsObjectValue(args[0]) {
+			return object.NewTypeError("Object.defineProperty called on non-object")
+		}
+		// ToPropertyKey 先于描述符解析 (15.2.3.6-2-47: P 是既无 toString
+		// 又无有效 valueOf 的对象 → TypeError)。
+		if _, isSym := args[1].(*object.Symbol); !isSym {
+			if key, errVal := toPropertyKey(args[1]); errVal != nil {
+				return errVal
+			} else {
+				args[1] = object.NewString(key)
+			}
+		}
+		// ToPropertyDescriptor: 非对象/混用访问器与数据字段/访问器不可调用
+		// → TypeError (15.2.3.6-3-x, 在 trap 分发与 target 落点之前)。
+		parsed, errVal := toPropertyDescriptor(args[2])
+		if errVal != nil {
+			return errVal
 		}
 		// globalThis: 在全局环境上定义自有属性 (var/函数声明之外的新绑定)。
 		if g, ok := args[0].(*object.GlobalObject); ok {
 			if _, isSym := args[1].(*object.Symbol); isSym {
 				return args[0] // 全局环境无符号键绑定，静默忽略
 			}
-			desc, errVal := descriptorFromJS(args[2])
-			if errVal != nil {
-				return errVal
-			}
+			desc := parsedToDesc(parsed)
 			g.DefineGlobal(toStr(args[1]), desc)
 			return args[0]
 		}
@@ -387,11 +595,26 @@ func setupObjectGlobal() *object.BuiltinFunction {
 			if !object.IsTruthyValue(res) {
 				return object.NewTypeError("'defineProperty' trap returned false")
 			}
-			return args[0]
+			// [[DefineOwnProperty]] 不变式 (Proxy/defineProperty targetdesc-*):
+			// trap 报 true 后仍须对 target 描述符做兼容性校验。
+			return proxyDefinePropertyInvariant(args[0], args[1], parsed)
 		}
 		// 无 trap: 解包 target 走下方 OwnPropertyStore 通道 (此前 *Proxy 非
 		// OwnPropertyStore, 静默 no-op —— trap-is-undefined 转发族)。
-		if p, ok := args[0].(*object.Proxy); ok && p.Target != nil {
+		// target 仍是 proxy (trap-is-null-target-is-proxy 族) 时逐层试 trap。
+		for {
+			p, isProxy := args[0].(*object.Proxy)
+			if !isProxy || p.Target == nil {
+				break
+			}
+			if res, handled, errVal := proxyTrapDispatch(args[0], "defineProperty", args[1], args[2]); errVal != nil {
+				return errVal
+			} else if handled {
+				if !object.IsTruthyValue(res) {
+					return object.NewTypeError("'defineProperty' trap returned false")
+				}
+				return proxyDefinePropertyInvariant(args[0], args[1], parsed)
+			}
 			args[0] = p.Target
 		}
 		// 统一自有属性接口: 普通对象 / 数组 / 函数类都经 OwnPropertyStore
@@ -403,19 +626,19 @@ func setupObjectGlobal() *object.BuiltinFunction {
 				// 经 SymbolPropertyStore 亦有符号键槽。其余实现
 				// OwnPropertyStore 的类型 (函数类等) 无符号键属性, 静默忽略。
 				if sp, ok := args[0].(object.SymbolPropertyStore); ok {
-					if errVal := defineOneSymbolProperty(sp, sym, args[2]); errVal != nil {
+					if errVal := defineOneSymbolProperty(sp, sym, args[2], args[0]); errVal != nil {
 						return errVal
 					}
 				}
 				return args[0]
 			}
-			if errVal := defineOneProperty(store, toStr(args[1]), args[2]); errVal != nil {
+			if errVal := defineOneProperty(args[0], store, toStr(args[1]), args[2]); errVal != nil {
 				return errVal
 			}
 			return args[0]
 		}
-		// 原始值等: 本运行时不实现包装对象, 保持 no-op (规范里对基本值
-		// 应先 ToObject; Gox 的 new Number(5) 得到的也是 number)。
+		// Date/Map/Set 等无属性槽位的对象类型: 保持 no-op (Gox 对象模型
+		// 残余 —— 与赋值语义 d.foo=1 的现状一致, 待独立开单)。
 		return args[0]
 	}))
 
@@ -503,8 +726,22 @@ func setupObjectGlobal() *object.BuiltinFunction {
 
 	// Object.setPrototypeOf(obj, proto)
 	o.SetProperty("setPrototypeOf", object.NewBuiltin("setPrototypeOf", func(args ...object.Value) object.Value {
-		if len(args) < 2 {
-			return object.UndefinedSingleton
+		// RequireObjectCoercible(O): undefined/null → TypeError
+		// (o-not-obj-coercible)。
+		if len(args) == 0 {
+			return object.NewTypeError("Object.setPrototypeOf called on null or undefined")
+		}
+		if _, isUndef := args[0].(*object.Undefined); isUndef {
+			return object.NewTypeError("Object.setPrototypeOf called on null or undefined")
+		}
+		if _, isNull := args[0].(*object.Null); isNull {
+			return object.NewTypeError("Object.setPrototypeOf called on null or undefined")
+		}
+		// Type(proto) ∈ {Object, Null} 先校验 (proto-not-obj)。
+		if args[1] != nil {
+			if _, isNullP := args[1].(*object.Null); !isNullP && !object.IsObjectValue(args[1]) {
+				return object.NewTypeError("Object.setPrototypeOf: proto must be an object or null")
+			}
 		}
 		// proxy: setPrototypeOf trap 分发 (T5); falsy → TypeError, 成功返回 obj
 		if res, handled, errVal := proxyTrapDispatch(args[0], "setPrototypeOf", args[1]); errVal != nil {
@@ -519,24 +756,70 @@ func setupObjectGlobal() *object.BuiltinFunction {
 		if !ok {
 			return args[0]
 		}
-		if _, isNull := args[1].(*object.Null); isNull {
-			obj.Proto = nil
+		// OrdinarySetPrototypeOf (9.1.2.1): 同原型直接成功; 不可扩展 → 失败;
+		// 环检测 (proto 链中含 O) → 失败 —— 此前无环检测,
+		// Object.setPrototypeOf(Object.prototype, Array.prototype) 直接造成
+		// 全局属性查找栈溢出崩溃。
+		var newProto object.Value
+		if _, isNullP := args[1].(*object.Null); isNullP || args[1] == nil {
+			newProto = nil
 		} else {
-			obj.Proto = args[1]
+			newProto = args[1]
+		}
+		if !sameProto(obj.Proto, newProto) {
+			if !obj.Extensible {
+				return object.NewTypeError("Object.setPrototypeOf: object is not extensible")
+			}
+			if newProto != nil {
+				cur := newProto
+				for {
+					if cur == args[0] {
+						return object.NewTypeError("Object.setPrototypeOf: prototype chain cycle detected")
+					}
+					next, ok2 := cur.(*object.Object)
+					if !ok2 || next.Proto == nil {
+						break
+					}
+					cur = next.Proto
+				}
+			}
+			obj.Proto = newProto
 		}
 		return args[0]
 	}))
 
 	// Object.getOwnPropertyNames(obj)
 	o.SetProperty("getOwnPropertyNames", object.NewBuiltin("getOwnPropertyNames", func(args ...object.Value) object.Value {
+		// RequireObjectCoercible: undefined/null → TypeError
+		// (15.2.3.4-1-2 / -1-3)。
 		if len(args) == 0 {
-			return object.NewArray([]object.Value{})
+			return object.NewTypeError("Cannot convert undefined or null to object")
+		}
+		if _, isUndef := args[0].(*object.Undefined); isUndef {
+			return object.NewTypeError("Object.getOwnPropertyNames called on non-object")
+		}
+		if _, isNull := args[0].(*object.Null); isNull {
+			return object.NewTypeError("Object.getOwnPropertyNames called on non-object")
 		}
 		if g, ok := args[0].(*object.GlobalObject); ok {
 			ks := g.OwnKeys()
 			result := make([]object.Value, len(ks))
 			for i, k := range ks {
 				result[i] = object.NewString(k)
+			}
+			return object.NewArray(result)
+		}
+		// proxy: ownKeys trap 分发 + 不变式校验 (T6), 按键类型过滤字符串键。
+		if p, ok := args[0].(*object.Proxy); ok {
+			keys, errVal := proxyOwnKeysInvariant(p)
+			if errVal != nil {
+				return errVal
+			}
+			result := make([]object.Value, 0, len(keys))
+			for _, k := range keys {
+				if _, isSym := k.(*object.Symbol); !isSym {
+					result = append(result, k)
+				}
 			}
 			return object.NewArray(result)
 		}
@@ -555,8 +838,16 @@ func setupObjectGlobal() *object.BuiltinFunction {
 
 	// Object.getOwnPropertyDescriptors(obj)
 	o.SetProperty("getOwnPropertyDescriptors", object.NewBuiltin("getOwnPropertyDescriptors", func(args ...object.Value) object.Value {
+		// RequireObjectCoercible: undefined/null → TypeError
+		// (exception-not-object-coercible)。
 		if len(args) == 0 {
-			return object.NewObject()
+			return object.NewTypeError("Cannot convert undefined or null to object")
+		}
+		if _, isUndef := args[0].(*object.Undefined); isUndef {
+			return object.NewTypeError("Object.getOwnPropertyDescriptors called on non-object")
+		}
+		if _, isNull := args[0].(*object.Null); isNull {
+			return object.NewTypeError("Object.getOwnPropertyDescriptors called on non-object")
 		}
 		if g, ok := args[0].(*object.GlobalObject); ok {
 			result := object.NewObject()
@@ -661,25 +952,42 @@ func setupObjectGlobal() *object.BuiltinFunction {
 	// 批量 defineProperty: descriptors 的每个自有属性 {value, get, set...}
 	// 都定义到 obj 上，返回 obj。
 	o.SetProperty("defineProperties", object.NewBuiltin("defineProperties", func(args ...object.Value) object.Value {
-		if len(args) < 2 {
-			return object.UndefinedSingleton
+		// 规范: Type(O) 非 Object → TypeError (15.2.3.7 step 1); 属性不足
+		// 一样过不了校验链。
+		if len(args) < 2 || !object.IsObjectValue(args[0]) {
+			return object.NewTypeError("Object.defineProperties called on non-object")
+		}
+		// Properties = ToObject(props): null/undefined → TypeError
+		// (15.2.3.7-2-1/-2-2); 非空字符串包装的每个码元都是非对象 descObj →
+		// ToPropertyDescriptor TypeError; 其余原始值包装无可枚举自有属性 → 空处理。
+		if _, isUndef := args[1].(*object.Undefined); isUndef {
+			return object.NewTypeError("Object.defineProperties: properties cannot be undefined")
+		}
+		if _, isNull := args[1].(*object.Null); isNull {
+			return object.NewTypeError("Object.defineProperties: properties cannot be null")
+		}
+		var propsStore object.OwnPropertyStore
+		if s, isStr := args[1].(*object.String); isStr {
+			if object.UTF16Len(s.Value) > 0 {
+				return object.NewTypeError("Property description must be an object")
+			}
+			return args[0] // 空字符串: 无可枚举自有属性
+		} else if store, ok := args[1].(object.OwnPropertyStore); ok {
+			propsStore = store
+		} else {
+			return args[0] // number/boolean/symbol 等原始值: 包装无自有可枚举属性
 		}
 		// 统一自有属性接口: 普通对象 / 数组 / 函数类都可作 target。
-		// 原始值等非对象仍抛 TypeError (规范 ToObject 前的目标校验)。
 		store, ok := args[0].(object.OwnPropertyStore)
 		if !ok {
 			return object.NewTypeError("Object.defineProperties: target must be an object")
 		}
-		props, ok := args[1].(*object.Object)
-		if !ok {
-			return args[0] // 非对象描述符: 规范按 ToObject 处理，简化为无属性
-		}
-		for _, key := range props.EnumerableKeys() {
-			descVal, found := props.GetProperty(key)
+		for _, key := range propsStore.EnumerableOwnKeys() {
+			descVal, found := args[1].GetProperty(key)
 			if !found {
 				continue
 			}
-			if errVal := defineOneProperty(store, key, descVal); errVal != nil {
+			if errVal := defineOneProperty(args[0], store, key, descVal); errVal != nil {
 				return errVal
 			}
 		}
@@ -688,12 +996,34 @@ func setupObjectGlobal() *object.BuiltinFunction {
 
 	// Object.getOwnPropertySymbols(obj) (ES6): 返回 Symbol 自有键
 	o.SetProperty("getOwnPropertySymbols", object.NewBuiltin("getOwnPropertySymbols", func(args ...object.Value) object.Value {
+		// RequireObjectCoercible: undefined/null → TypeError
+		// (non-object-argument-invalid)。
+		if len(args) == 0 {
+			return object.NewTypeError("Object.getOwnPropertySymbols called on non-object")
+		}
+		if _, isUndef := args[0].(*object.Undefined); isUndef {
+			return object.NewTypeError("Object.getOwnPropertySymbols called on non-object")
+		}
+		if _, isNull := args[0].(*object.Null); isNull {
+			return object.NewTypeError("Object.getOwnPropertySymbols called on non-object")
+		}
 		result := []object.Value{}
-		if len(args) > 0 {
-			if obj, ok := args[0].(object.SymbolPropertyStore); ok {
-				for _, sym := range obj.SymbolKeys() {
+		// proxy: ownKeys trap 分发 + 不变式校验 (T6), 按键类型过滤符号键。
+		if p, ok := args[0].(*object.Proxy); ok {
+			keys, errVal := proxyOwnKeysInvariant(p)
+			if errVal != nil {
+				return errVal
+			}
+			for _, k := range keys {
+				if sym, isSym := k.(*object.Symbol); isSym {
 					result = append(result, sym)
 				}
+			}
+			return object.NewArray(result)
+		}
+		if obj, ok := args[0].(object.SymbolPropertyStore); ok {
+			for _, sym := range obj.SymbolKeys() {
+				result = append(result, sym)
 			}
 		}
 		return object.NewArray(result)
@@ -738,6 +1068,47 @@ func signbit(f float64) bool {
 	return f < 0 || (f == 0 && 1/f < 0)
 }
 
+// setOrThrow 实现 Set(O, P, V, true): 写失败 (只读数据属性/访问器无 setter
+// 拒绝的不可扩展新属性) → TypeError —— Object.assign 的规范落点
+// (target-set-not-writable / target-is-frozen-* / target-is-sealed-* 族)。
+func setOrThrow(target *object.Object, key string, val object.Value) object.Value {
+	desc, exists := target.OwnDescriptor(key)
+	if exists {
+		if acc, isAcc := desc.Value.(*object.Accessor); isAcc {
+			if acc.Setter != nil && object.IsCallable(acc.Setter) {
+				object.CallFunction(acc.Setter, target, val)
+				if ev := object.TakeCallbackErrorValue(); ev != object.UndefinedSingleton {
+					return ev
+				}
+			}
+			return nil // 有访问器: setter 缺失/未定义按规范静默成功
+		}
+		if !desc.Writable {
+			return object.NewTypeError("Cannot assign to read only property '%s' of object", key)
+		}
+		nd := desc
+		nd.Value = val
+		target.DefineOwn(key, nd)
+		return nil
+	}
+	if !target.Extensible {
+		return object.NewTypeError("Cannot add property '%s', object is not extensible", key)
+	}
+	target.DefineOwn(key, object.PropertyDescriptor{Value: val, Writable: true, Enumerable: true, Configurable: true})
+	return nil
+}
+
+// sameProto 比较 [[Prototype]] 槽位 (nil 与 nil 算同值)。
+func sameProto(a, b object.Value) bool {
+	if a == nil && b == nil {
+		return true
+	}
+	if a == nil || b == nil {
+		return false
+	}
+	return a == b
+}
+
 // ownKeysArg 解析 Object.keys/values/entries 的参数并返回键列表。
 // 参数为 undefined/null 时抛 TypeError (规范要求)。
 func ownKeysArg(args []object.Value, api string) ([]string, object.Value) {
@@ -745,6 +1116,114 @@ func ownKeysArg(args []object.Value, api string) ([]string, object.Value) {
 		return nil, object.NewTypeError("%s: undefined cannot be converted to an object", api)
 	}
 	return ownKeys(args[0])
+}
+
+// proxyOwnKeysInvariant 实现 Proxy [[OwnPropertyKeys]] (10.5.8):
+// trap 分发 + 规范不变式校验 (keys/names/symbols 的 proxy-invariant-* 族):
+//   - trap 结果必须是数组, 元素必须是 string/symbol, 不得重复;
+//   - target 每个"不可配置"的自有键 (字符串与符号) 都必须出现在 trap 结果里;
+//   - target 不可扩展时, trap 结果必须与 target 自有键集合完全一致。
+//
+// 无 trap → 转发 target 的 OwnPropertyStore。
+func proxyOwnKeysInvariant(p *object.Proxy) ([]object.Value, object.Value) {
+	if p.IsRevoked {
+		return nil, object.NewTypeError("Cannot perform 'ownKeys' on a proxy that has been revoked")
+	}
+	type keyInfo struct {
+		val          object.Value
+		configurable bool
+	}
+	targetKeys := map[string]keyInfo{}
+	targetSyms := map[*object.Symbol]keyInfo{}
+	if store, ok := p.Target.(object.OwnPropertyStore); ok {
+		for _, k := range store.OwnKeys() {
+			d, found := store.OwnDescriptor(k)
+			targetKeys[k] = keyInfo{val: object.NewString(k), configurable: found && d.Configurable}
+		}
+	}
+	if sp, ok := p.Target.(object.SymbolPropertyStore); ok {
+		for _, sym := range sp.SymbolKeys() {
+			d, found := sp.GetSymbolPropertyDescriptor(sym)
+			targetSyms[sym] = keyInfo{val: sym, configurable: found && d.Configurable}
+		}
+	}
+	res, handled, errVal := proxyTrapDispatch(p, "ownKeys")
+	if errVal != nil {
+		return nil, errVal
+	}
+	if !handled {
+		var out []object.Value
+		if store, ok := p.Target.(object.OwnPropertyStore); ok {
+			for _, k := range store.OwnKeys() {
+				out = append(out, object.NewString(k))
+			}
+		}
+		if sp, ok := p.Target.(object.SymbolPropertyStore); ok {
+			for _, sym := range sp.SymbolKeys() {
+				out = append(out, sym)
+			}
+		}
+		if out == nil {
+			out = []object.Value{}
+		}
+		return out, nil
+	}
+	arr, ok := res.(*object.Array)
+	if !ok {
+		return nil, object.NewTypeError("'ownKeys' trap must return an array")
+	}
+	seen := map[string]bool{}
+	seenSym := map[*object.Symbol]bool{}
+	result := make([]object.Value, 0, len(arr.Elements))
+	for _, el := range arr.Elements {
+		switch k := el.(type) {
+		case *object.String:
+			if seen[k.Value] {
+				return nil, object.NewTypeError("'ownKeys' trap returned duplicate entries")
+			}
+			seen[k.Value] = true
+			result = append(result, k)
+		case *object.Symbol:
+			if seenSym[k] {
+				return nil, object.NewTypeError("'ownKeys' trap returned duplicate entries")
+			}
+			seenSym[k] = true
+			result = append(result, k)
+		default:
+			return nil, object.NewTypeError("'ownKeys' trap must return string or symbol entries")
+		}
+	}
+	// 不变式 1: 不可配置 target 键必须出现。
+	for _, info := range targetKeys {
+		if !info.configurable {
+			s := toStr(info.val)
+			if !seen[s] {
+				return nil, object.NewTypeError("'ownKeys' trap must include the non-configurable target key '%s'", s)
+			}
+		}
+	}
+	for _, info := range targetSyms {
+		if !info.configurable && !seenSym[info.val.(*object.Symbol)] {
+			return nil, object.NewTypeError("'ownKeys' trap must include the non-configurable target symbol key")
+		}
+	}
+	// 不变式 2: target 不可扩展 → 结果与 target 键集合一致。
+	if !object.IsExtensible(p.Target) {
+		if len(result) != len(targetKeys)+len(targetSyms) {
+			return nil, object.NewTypeError("'ownKeys' trap returned keys that do not match the non-extensible target")
+		}
+		for _, info := range targetKeys {
+			if !seen[toStr(info.val)] {
+				return nil, object.NewTypeError("'ownKeys' trap returned keys that do not match the non-extensible target")
+			}
+		}
+		for _, info := range targetSyms {
+			if !seenSym[info.val.(*object.Symbol)] {
+				return nil, object.NewTypeError("'ownKeys' trap returned keys that do not match the non-extensible target")
+			}
+		}
+	}
+	return result, nil
 }
 
 // ownKeys 返回值的自有可枚举键列表，顺序遵循 OrdinaryOwnPropertyKeys。
@@ -765,6 +1244,29 @@ func ownKeys(v object.Value) ([]string, object.Value) {
 			keys[i] = strconv.Itoa(i)
 		}
 		return keys, nil
+	}
+	// proxy: ownKeys trap 分发 + 不变式校验; Object.keys 语义是"自有键 ∩
+	// 可枚举", 故经 [[GetOwnProperty]] (proxyGetOwnPropertyDescriptor)
+	// 逐键过滤 (keys/proxy-non-enumerable-prop-invariant-* 族)。
+	if p, ok := v.(*object.Proxy); ok {
+		keys, errVal := proxyOwnKeysInvariant(p)
+		if errVal != nil {
+			return nil, errVal
+		}
+		var out []string
+		for _, k := range keys {
+			if _, isSym := k.(*object.Symbol); isSym {
+				continue
+			}
+			descVal := proxyGetOwnPropertyDescriptor(p, k)
+			if descVal == nil || descVal == object.UndefinedSingleton || !object.IsObjectValue(descVal) {
+				continue
+			}
+			if resDescBool(descVal, "enumerable") {
+				out = append(out, toStr(k))
+			}
+		}
+		return out, nil
 	}
 	// 统一接口: 普通对象 / 数组 / 函数类 / globalThis 都实现 OwnPropertyStore。
 	if store, ok := v.(object.OwnPropertyStore); ok {
@@ -1537,49 +2039,267 @@ func describeProperty(desc object.PropertyDescriptor) object.Value {
 // 与 defineOneProperty 同一套 ToPropertyDescriptor 语义, 但落点在持有者的符号
 // 键存储 (*Object.SymbolProperties 或 *Array/*TypedArray 同构槽), 与字符串键
 // 空间隔离。
-func defineOneSymbolProperty(obj object.SymbolPropertyStore, sym *object.Symbol, descVal object.Value) object.Value {
-	if !object.IsObjectValue(descVal) {
-		return object.NewTypeError("Property description must be an object")
+// toPropertyKey 实现 ToPropertyKey: Symbol 直接 TypeError, 对象先
+// ToPrimitive (toString/valueOf, 两者都不产出原始值 → TypeError,
+// 15.2.3.6-2-47 族), 其余 ToString。
+func toPropertyKey(v object.Value) (string, object.Value) {
+	if _, isSym := v.(*object.Symbol); isSym {
+		return "", object.NewTypeError("Cannot convert a Symbol value to a property key")
 	}
-	get := func(n string) (object.Value, bool) {
-		return descVal.GetProperty(n)
+	if object.IsObjectValue(v) {
+		return toStringViaPrimitive(v)
 	}
-	accField := func(v object.Value) object.Value {
-		if v == nil || isUndefinedValue(v) {
-			return object.UndefinedSingleton
-		}
-		return v
-	}
+	return object.ToString(v), nil
+}
 
+// parsedDesc 是 ToPropertyDescriptor 的解析结果: 描述符 + 各字段是否
+// 显式存在。ValidateAndApply 的合并与兼容性校验都需要"存在"标记 ——
+// 裸 PropertyDescriptor 无法区分"显式 false"与"缺省"。
+type parsedDesc struct {
+	desc            object.PropertyDescriptor
+	hasEnumerable   bool
+	hasConfigurable bool
+	hasValue        bool
+	hasWritable     bool
+	hasGet          bool
+	hasSet          bool
+	getter, setter  object.Value // 访问器字段原始值 (已过 callable 校验)
+}
+
+// isAccessor 报告描述符是否为访问器描述符 (有 get 或 set 字段)。
+func (p *parsedDesc) isAccessor() bool { return p.hasGet || p.hasSet }
+
+// toPropertyDescriptor 实现 ToPropertyDescriptor (6.2.6.1) 的完整校验:
+//  1. 非对象 → TypeError;
+//  2. enumerable/configurable → ToBoolean;
+//  3. value/writable → 数据字段;
+//  4. get/set → 访问器字段: undefined 合法 (空访问器), 不可调用 → TypeError;
+//  5. 访问器字段与数据字段混用 → TypeError (step 9.a —— 15.2.3.6-3-x /
+//     defineProperties -5-b-26x / create -4-30x 族的根因)。
+func toPropertyDescriptor(descVal object.Value) (parsedDesc, object.Value) {
+	if !object.IsObjectValue(descVal) {
+		return parsedDesc{}, object.NewTypeError("Property description must be an object")
+	}
+	get := func(n string) (object.Value, bool) { return descVal.GetProperty(n) }
+	p := parsedDesc{}
+	if v, found := get("enumerable"); found {
+		p.desc.Enumerable = toBool(v)
+		p.hasEnumerable = true
+	}
+	if v, found := get("configurable"); found {
+		p.desc.Configurable = toBool(v)
+		p.hasConfigurable = true
+	}
+	if v, found := get("value"); found {
+		p.desc.Value = v
+		p.hasValue = true
+	}
+	if v, found := get("writable"); found {
+		p.desc.Writable = toBool(v)
+		p.hasWritable = true
+	}
+	if v, found := get("get"); found {
+		p.hasGet = true
+		p.getter = v
+		if v != nil && !isUndefinedValue(v) && !object.IsCallable(v) {
+			return p, object.NewTypeError("Getter must be a function")
+		}
+	}
+	if v, found := get("set"); found {
+		p.hasSet = true
+		p.setter = v
+		if v != nil && !isUndefinedValue(v) && !object.IsCallable(v) {
+			return p, object.NewTypeError("Setter must be a function")
+		}
+	}
+	if p.isAccessor() && (p.hasValue || p.hasWritable) {
+		return p, object.NewTypeError("Invalid property descriptor. Cannot both specify accessors and a value or writable attribute")
+	}
+	return p, nil
+}
+
+// accField 归一化访问器字段: nil/undefined 统一为 undefined 单例。
+func accField(v object.Value) object.Value {
+	if v == nil || isUndefinedValue(v) {
+		return object.UndefinedSingleton
+	}
+	return v
+}
+
+// validateAndApplyDesc 实现 ValidateAndApplyPropertyDescriptor (6.2.6.3):
+//   - 属性不存在: target 不可扩展 → TypeError; 否则按缺省值 (false/undefined)
+//     落最终描述符 (规范 step 3);
+//   - 属性存在且不可配置: 逐条兼容性校验 (step 2.a.i-vi), 任一违反 → TypeError;
+//   - 合并 (step 3): Desc 缺省的字段保留 current 原值 —— 访问器部分重定义
+//     不再丢掉另一个访问器 (此前 NewAccessor(nil, s) 的实现缺陷)。
+func validateAndApplyDesc(target object.Value, store object.OwnPropertyStore, key string, parsed parsedDesc) (object.PropertyDescriptor, object.Value) {
+	existing, exists := store.OwnDescriptor(key)
+	reject := object.NewTypeError("Cannot redefine property: %s", key)
+	if !exists {
+		if !object.IsExtensible(target) {
+			return object.PropertyDescriptor{}, object.NewTypeError("Cannot define property %s: object is not extensible", key)
+		}
+		final := object.PropertyDescriptor{}
+		if parsed.isAccessor() {
+			final.Value = object.NewAccessor(accField(parsed.getter), accField(parsed.setter))
+			final.Writable = false
+		} else {
+			if parsed.hasValue {
+				final.Value = parsed.desc.Value
+			} else {
+				final.Value = object.UndefinedSingleton
+			}
+			final.Writable = parsed.desc.Writable
+		}
+		final.Enumerable = parsed.desc.Enumerable
+		final.Configurable = parsed.desc.Configurable
+		return final, nil
+	}
+	current := existing
+	curAcc, curIsAcc := current.Value.(*object.Accessor)
+	if !current.Configurable {
+		if parsed.hasConfigurable && parsed.desc.Configurable {
+			return current, reject
+		}
+		if parsed.hasEnumerable && parsed.desc.Enumerable != current.Enumerable {
+			return current, reject
+		}
+		descIsAccessor := parsed.isAccessor()
+		descIsGeneric := !descIsAccessor && !parsed.hasValue && !parsed.hasWritable
+		if !descIsGeneric && curIsAcc != descIsAccessor {
+			return current, reject
+		}
+		if !curIsAcc {
+			if !current.Writable {
+				if parsed.hasWritable && parsed.desc.Writable {
+					return current, reject
+				}
+				if parsed.hasValue && !objectIs(parsed.desc.Value, current.Value) {
+					return current, reject
+				}
+			}
+		} else {
+			// current 是访问器: get/set 只在 Desc 显式给出时才比较。
+			if parsed.hasGet && !objectIs(accField(parsed.getter), accField(curAcc.Getter)) {
+				return current, reject
+			}
+			if parsed.hasSet && !objectIs(accField(parsed.setter), accField(curAcc.Setter)) {
+				return current, reject
+			}
+		}
+	}
+	// step 3: 以 current 为底, Desc 显式字段覆盖。
+	final := current
+	if parsed.isAccessor() {
+		var g, s object.Value
+		if curIsAcc {
+			g, s = accField(curAcc.Getter), accField(curAcc.Setter)
+		} else {
+			g, s = object.UndefinedSingleton, object.UndefinedSingleton
+		}
+		if parsed.hasGet {
+			g = accField(parsed.getter)
+		}
+		if parsed.hasSet {
+			s = accField(parsed.setter)
+		}
+		final.Value = object.NewAccessor(g, s)
+		final.Writable = false
+	} else {
+		if parsed.hasValue {
+			final.Value = parsed.desc.Value
+		}
+		if parsed.hasWritable {
+			final.Writable = parsed.desc.Writable
+		}
+	}
+	if parsed.hasEnumerable {
+		final.Enumerable = parsed.desc.Enumerable
+	}
+	if parsed.hasConfigurable {
+		final.Configurable = parsed.desc.Configurable
+	}
+	return final, nil
+}
+
+// defineOneSymbolProperty 在符号键槽上按描述符定义一个属性。与字符串键
+// 同一套 ToPropertyDescriptor / ValidateAndApply 校验 (T6)。
+func defineOneSymbolProperty(obj object.SymbolPropertyStore, sym *object.Symbol, descVal object.Value, target object.Value) object.Value {
+	parsed, errVal := toPropertyDescriptor(descVal)
+	if errVal != nil {
+		return errVal
+	}
 	existing, exists := obj.GetSymbolPropertyDescriptor(sym)
 	nd := existing
 	if !exists {
 		nd = object.PropertyDescriptor{}
+		if !object.IsExtensible(target) {
+			return object.NewTypeError("Cannot define property: object is not extensible")
+		}
 	}
-
-	_, hasGet := get("get")
-	_, hasSet := get("set")
-	if hasGet || hasSet {
-		g, _ := get("get")
-		s, _ := get("set")
-		nd.Value = &object.Accessor{Getter: accField(g), Setter: accField(s)}
+	reject := object.NewTypeError("Cannot redefine property: %s", sym.Description)
+	existingAcc, existingIsAcc := nd.Value.(*object.Accessor)
+	parsedAcc := parsed.isAccessor()
+	if exists && !nd.Configurable {
+		if parsed.hasConfigurable && parsed.desc.Configurable {
+			return reject
+		}
+		if parsed.hasEnumerable && parsed.desc.Enumerable != nd.Enumerable {
+			return reject
+		}
+		descIsGeneric := !parsedAcc && !parsed.hasValue && !parsed.hasWritable
+		if !descIsGeneric && existingIsAcc != parsedAcc {
+			return reject
+		}
+		if !existingIsAcc {
+			if !nd.Writable {
+				if parsed.hasWritable && parsed.desc.Writable {
+					return reject
+				}
+				if parsed.hasValue && !objectIs(parsed.desc.Value, nd.Value) {
+					return reject
+				}
+			}
+		} else {
+			if parsed.hasGet && !objectIs(accField(parsed.getter), accField(existingAcc.Getter)) {
+				return reject
+			}
+			if parsed.hasSet && !objectIs(accField(parsed.setter), accField(existingAcc.Setter)) {
+				return reject
+			}
+		}
+	}
+	if parsed.isAccessor() {
+		var g, s object.Value
+		if existingIsAcc {
+			g, s = accField(existingAcc.Getter), accField(existingAcc.Setter)
+		} else {
+			g, s = object.UndefinedSingleton, object.UndefinedSingleton
+		}
+		if parsed.hasGet {
+			g = accField(parsed.getter)
+		}
+		if parsed.hasSet {
+			s = accField(parsed.setter)
+		}
+		nd.Value = object.NewAccessor(g, s)
+		nd.Writable = false
 	} else {
-		if v, found := get("value"); found {
-			nd.Value = v
+		if parsed.hasValue {
+			nd.Value = parsed.desc.Value
 		} else if !exists {
 			nd.Value = object.UndefinedSingleton
 		}
-		if v, found := get("writable"); found {
-			nd.Writable = toBool(v)
+		if parsed.hasWritable {
+			nd.Writable = parsed.desc.Writable
 		}
 	}
-	if v, found := get("enumerable"); found {
-		nd.Enumerable = toBool(v)
+	if parsed.hasEnumerable {
+		nd.Enumerable = parsed.desc.Enumerable
 	}
-	if v, found := get("configurable"); found {
-		nd.Configurable = toBool(v)
+	if parsed.hasConfigurable {
+		nd.Configurable = parsed.desc.Configurable
 	}
-
 	obj.DefineOwnSymbolProperty(sym, nd)
 	return nil
 }
@@ -1588,56 +2308,73 @@ func defineOneSymbolProperty(obj object.SymbolPropertyStore, sym *object.Symbol,
 // 访问器描述符 (get/set) 注册为访问器；数据描述符 (value/writable)
 // 注册为数据属性。供 defineProperty / defineProperties 共用。
 // descriptorFromJS 把 JS 描述符对象解析为内部 PropertyDescriptor
-// (Object.defineProperty(globalThis, ...) 用)。非对象描述符抛 TypeError。
-// 缺省字段的默认值与规范 ToPropertyDescriptor 一致 (均为 false/undefined)。
+// (Object.defineProperty(globalThis, ...) 与 Reflect.defineProperty 用)。
+// 非对象描述符抛 TypeError; 字段校验与混用拒绝统一走 toPropertyDescriptor。
 func descriptorFromJS(descVal object.Value) (object.PropertyDescriptor, object.Value) {
-	if !object.IsObjectValue(descVal) {
-		return object.PropertyDescriptor{}, object.NewTypeError("Property description must be an object")
+	parsed, errVal := toPropertyDescriptor(descVal)
+	if errVal != nil {
+		return object.PropertyDescriptor{}, errVal
 	}
-	get := func(n string) (object.Value, bool) { return descVal.GetProperty(n) }
-	nd := object.PropertyDescriptor{}
-	_, hasGet := get("get")
-	_, hasSet := get("set")
-	if hasGet || hasSet {
-		var g, s object.Value
-		if v, found := get("get"); found && !isUndefinedValue(v) {
-			if !object.IsCallable(v) {
-				return nd, object.NewTypeError("Getter must be a function")
+	return parsedToDesc(parsed), nil
+}
+
+// parsedToDesc 把解析结果落成内部 PropertyDescriptor: 访问器描述符把
+// getter/setter 打包进 Value; 数据描述符缺省 value 补 undefined。
+func parsedToDesc(parsed parsedDesc) object.PropertyDescriptor {
+	desc := parsed.desc
+	if parsed.isAccessor() {
+		desc.Value = object.NewAccessor(accField(parsed.getter), accField(parsed.setter))
+		desc.Writable = false
+	} else if !parsed.hasValue {
+		desc.Value = object.UndefinedSingleton
+	}
+	return desc
+}
+
+// proxyDefinePropertyInvariant 校验 [[DefineOwnProperty]] trap 报 true 后
+// 的 target 兼容性不变式 (10.5.7 step 25-29, targetdesc-* 族):
+//   - target 无该属性且不可扩展 → TypeError;
+//   - target 属性存在: 对 targetDesc 跑 ValidateAndApply (不落地),
+//     任一违反 (不可配置属性报 configurable true / 值或访问器字段不兼容)
+//     → TypeError。
+func proxyDefinePropertyInvariant(p object.Value, key object.Value, parsed parsedDesc) object.Value {
+	pxy, ok := p.(*object.Proxy)
+	if !ok || pxy.Target == nil {
+		return p
+	}
+	if sym, isSym := key.(*object.Symbol); isSym {
+		if sp, ok2 := pxy.Target.(object.SymbolPropertyStore); ok2 {
+			if _, exists := sp.GetSymbolPropertyDescriptor(sym); !exists {
+				if !object.IsExtensible(pxy.Target) {
+					return object.NewTypeError("Proxy 'defineProperty': trap reported a new property on a non-extensible target")
+				}
+				return p
 			}
-			g = v
-		}
-		if v, found := get("set"); found && !isUndefinedValue(v) {
-			if !object.IsCallable(v) {
-				return nd, object.NewTypeError("Setter must be a function")
+			// 符号键 target 描述符兼容性: 与字符串键同一校验逻辑,
+			// 经字符串化路径不可用 —— 这里只校验"不可配置 → 报 true"。
+			if td, exists2 := sp.GetSymbolPropertyDescriptor(sym); exists2 && !td.Configurable {
+				if parsed.hasConfigurable && parsed.desc.Configurable {
+					return object.NewTypeError("Proxy 'defineProperty': trap reported configurable true for a non-configurable target property")
+				}
 			}
-			s = v
 		}
-		nd.Value = object.NewAccessor(g, s)
-		nd.Writable = false
-		if v, found := get("enumerable"); found {
-			nd.Enumerable = toBool(v)
+		return p
+	}
+	keyStr := toStr(key)
+	store, ok2 := pxy.Target.(object.OwnPropertyStore)
+	if !ok2 {
+		return p
+	}
+	if _, exists := store.OwnDescriptor(keyStr); !exists {
+		if !object.IsExtensible(pxy.Target) {
+			return object.NewTypeError("Proxy 'defineProperty': trap reported a new property on a non-extensible target")
 		}
-		if v, found := get("configurable"); found {
-			nd.Configurable = toBool(v)
-		}
-		return nd, nil
+		return p
 	}
-	if v, found := get("value"); found {
-		nd.Value = v
+	if _, errVal := validateAndApplyDesc(pxy.Target, store, keyStr, parsed); errVal != nil {
+		return object.NewTypeError("Proxy 'defineProperty': trap result is incompatible with the target property descriptor")
 	}
-	if v, found := get("writable"); found {
-		nd.Writable = toBool(v)
-	}
-	if v, found := get("enumerable"); found {
-		nd.Enumerable = toBool(v)
-	}
-	if v, found := get("configurable"); found {
-		nd.Configurable = toBool(v)
-	}
-	if nd.Value == nil {
-		nd.Value = object.UndefinedSingleton
-	}
-	return nd, nil
+	return p
 }
 
 // defineOneProperty 按 property descriptor 在任意 OwnPropertyStore 上定义
@@ -1645,7 +2382,10 @@ func descriptorFromJS(descVal object.Value) (object.PropertyDescriptor, object.V
 // (value/writable) 注册为数据属性。供 defineProperty / defineProperties
 // 共用 (普通对象 / 数组 / 函数类一视同仁 —— 各类型的描述符落点由
 // OwnPropertyStore.DefineOwn 负责)。
-func defineOneProperty(store object.OwnPropertyStore, key string, descVal object.Value) object.Value {
+// 完整走 ToPropertyDescriptor (字段校验/混用拒绝) + ValidateAndApply
+// (不可配置兼容性、±0 SameValue、不可扩展新属性) —— T6 的两处规范收口。
+// target 用于可扩展性判定 (store 自身可能不带该状态)。
+func defineOneProperty(target object.Value, store object.OwnPropertyStore, key string, descVal object.Value) object.Value {
 	// 数组专属: "length" 走 ArraySetLength (规范 10.4.2.1); 越界索引要求
 	// 数组可扩展且 length 可写 (rFXXbq: defineProperty length/索引族)。
 	if arr, ok := store.(*object.Array); ok {
@@ -1668,119 +2408,19 @@ func defineOneProperty(store object.OwnPropertyStore, key string, descVal object
 		// 规范: ToPropertyDescriptor 对非对象 (原始值) 抛 TypeError。
 		return object.NewTypeError("Property description must be an object")
 	}
-	// ToPropertyDescriptor 读写描述符字段用 HasProperty + Get 语义:
-	// 沿原型链查找并调用访问器。描述符可以是普通对象，也可以是函数
-	// (函数对象可在 Function.prototype 上挂 get/enumerable 等字段)。
-	get := func(n string) (object.Value, bool) {
-		return descVal.GetProperty(n)
+	parsed, errVal := toPropertyDescriptor(descVal)
+	if errVal != nil {
+		return errVal
 	}
-	_, hasGet := get("get")
-	_, hasSet := get("set")
-	isAccessorDesc := hasGet || hasSet
-
-	// accField 归一化访问器字段: 缺失/undefined 统一为 undefined。
-	accField := func(v object.Value) object.Value {
-		if v == nil || isUndefinedValue(v) {
-			return object.UndefinedSingleton
-		}
-		return v
+	final, errVal := validateAndApplyDesc(target, store, key, parsed)
+	if errVal != nil {
+		return errVal
 	}
-
-	existing, exists := store.OwnDescriptor(key)
-	// 已存在属性: 缺省字段保持原值 (从 existing 起步)。
-	nd := existing
-	if !exists {
-		nd = object.PropertyDescriptor{}
+	if !store.DefineOwn(key, final) {
+		// 实现了 OwnPropertyStore 却拒绝该键: 函数类内部字段等 —— 规范的
+		// [[DefineOwnProperty]] 对普通对象不会失败, 这里如实上抛。
+		return object.NewTypeError("Cannot redefine property: %s", key)
 	}
-
-	// 非可配置属性的兼容性校验 (规范 ValidateAndApplyPropertyDescriptor 的核心)。
-	if exists && !existing.Configurable {
-		if v, found := get("configurable"); found && toBool(v) {
-			return object.NewTypeError("Cannot redefine property: %s", key)
-		}
-		if v, found := get("enumerable"); found && toBool(v) != existing.Enumerable {
-			return object.NewTypeError("Cannot redefine property: %s", key)
-		}
-		oldAcc, wasAcc := existing.Value.(*object.Accessor)
-		if wasAcc != isAccessorDesc {
-			return object.NewTypeError("Cannot redefine property: %s", key)
-		}
-		if !wasAcc {
-			if v, found := get("writable"); found && toBool(v) && !existing.Writable {
-				return object.NewTypeError("Cannot redefine property: %s", key)
-			}
-			// 不可写的数据属性: 只允许写成同值。
-			if !existing.Writable {
-				if v, found := get("value"); found && !objectIs(v, existing.Value) {
-					return object.NewTypeError("Cannot redefine property: %s", key)
-				}
-			}
-		} else {
-			// 不可配置的访问器属性: get/set 只允许写成相同函数 (同值)。
-			if v, found := get("get"); found && !objectIs(accField(v), accField(oldAcc.Getter)) {
-				return object.NewTypeError("Cannot redefine property: %s", key)
-			}
-			if v, found := get("set"); found && !objectIs(accField(v), accField(oldAcc.Setter)) {
-				return object.NewTypeError("Cannot redefine property: %s", key)
-			}
-		}
-	}
-
-	if isAccessorDesc {
-		// 数据 → 访问器切换需可配置。
-		if exists {
-			if _, wasAcc := existing.Value.(*object.Accessor); !wasAcc && !existing.Configurable {
-				return object.NewTypeError("Cannot redefine property: %s", key)
-			}
-		}
-		var g, s object.Value
-		if v, found := get("get"); found && !isUndefinedValue(v) {
-			if !object.IsCallable(v) {
-				return object.NewTypeError("Getter must be a function")
-			}
-			g = v
-		}
-		if v, found := get("set"); found && !isUndefinedValue(v) {
-			if !object.IsCallable(v) {
-				return object.NewTypeError("Setter must be a function")
-			}
-			s = v
-		}
-		nd.Value = object.NewAccessor(g, s)
-		nd.Writable = false
-		if v, found := get("enumerable"); found {
-			nd.Enumerable = toBool(v)
-		}
-		if v, found := get("configurable"); found {
-			nd.Configurable = toBool(v)
-		}
-		store.DefineOwn(key, nd)
-		return nil
-	}
-
-	// 访问器 → 数据切换需可配置。
-	if exists {
-		if _, wasAcc := existing.Value.(*object.Accessor); wasAcc && !existing.Configurable {
-			return object.NewTypeError("Cannot redefine property: %s", key)
-		}
-	}
-	if v, found := get("value"); found {
-		nd.Value = v
-	} else if !exists {
-		nd.Value = object.UndefinedSingleton
-	}
-	if v, found := get("writable"); found {
-		nd.Writable = toBool(v)
-	} else if !exists {
-		nd.Writable = false
-	}
-	if v, found := get("enumerable"); found {
-		nd.Enumerable = toBool(v)
-	}
-	if v, found := get("configurable"); found {
-		nd.Configurable = toBool(v)
-	}
-	store.DefineOwn(key, nd)
 	return nil
 }
 
@@ -1870,19 +2510,27 @@ func defineArrayLengthDesc(arr *object.Array, descVal object.Value) object.Value
 		return nil
 	}
 	// 收缩: 现存 length 不可写 → TypeError (规范 15.2.3.6-4-164);
-	// 从高位向低位逐个 [[Delete]]; 遇到不可配置元素停在 j+1。
+	// 从高位向低位逐个 [[Delete]]; 遇到不可配置元素停在 j+1 ——
+	// 规范 OrdinaryDefineOwnProperty (数组 length 派生) 的 newLenFail:
+	// 删除失败一律 reject (TypeError), 且不得把 length 写成不可写
+	// (15.2.3.6-4-116 / -4-168 族: 此前静默部分截断且强写 NonWritableLength)。
 	if arr.NonWritableLength {
 		return object.NewTypeError("Cannot redefine property: length")
 	}
 	limit := newLen
+	newLenFail := false
 	for j := oldLen - 1; j >= newLen; j-- {
 		if !arr.DeleteOwn(strconv.Itoa(j)) {
 			limit = j + 1
+			newLenFail = true
 			break
 		}
 	}
 	arr.TruncateTo(limit)
 	arr.DropDescsFrom(limit)
+	if newLenFail {
+		return object.NewTypeError("Cannot redefine property: length")
+	}
 	arr.NonWritableLength = !newWritable
 	return nil
 }
