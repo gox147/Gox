@@ -1,0 +1,319 @@
+package gfx
+
+// 极小的 sfnt 读取器: 只读表目录 + name 表 + post 表头 (T3-5 第十一批)。
+//
+// 为什么需要它: 判面 (这个文件里最好的面是正体还是粗体/斜体) 与族索引登记
+// 只需要 name 表的三个名字 (family / typographic family / subfamily) 和 post
+// 表头的两个字段 (italicAngle / isFixedPitch)。但 x/image 的 col.Font(i) 会把
+// maxp/cmap/hhea/hmtx/post 全部解析完 —— CJK 集合字体 10 个面, 每个面连
+// cmap、loca 都要建表, 实测 **6~7ms**, 而这 6~7ms 里没有一个字节参与判面。
+//
+// 这里只做三件事: 按 TTC/单面表头找到每个面的表目录, 读 name 表, 读 post 头。
+// 每个面读盘 ≈ 8KB (name 表 3~8KB, 其余都是表头), 10 个面也就 80KB ——
+// 比整份解析少 3 个数量级。
+//
+// **口径必须与 x/image 一致** (判面错档 = 默认字体选成粗体, 整屏变粗且
+// fontWeight 看起来失效), 所以下面每个取舍都注明对应的 x/image 行为, 并由
+// TestProbeNamesMatchFullParse / TestProbeFileFaceRankMatchesFullParse 用
+// 整机字体做等价性兜底。
+
+import (
+	"encoding/binary"
+	"fmt"
+	"io"
+	"os"
+	"strings"
+)
+
+// sfntNameTableCap 是 name 表的读盘上限。真实 name 表 3~8KB (CJK 全集也不到
+// 20KB), 1MB 纯粹是"损坏文件别把内存撑爆"的护栏。
+const sfntNameTableCap = 1 << 20
+
+// probeFaceInfo 是一个面的判面所需信息 (全部来自 name 表 + post 表头)。
+type probeFaceInfo struct {
+	family      string // name ID 1, 已 TrimSpace
+	typoFamily  string // name ID 16 (没有则空)
+	subfamily   string // name ID 2, 已 TrimSpace
+	italicAngle float64
+	fixedPitch  bool
+}
+
+// probeFontFaces 读取一个字体文件里**所有可解析面**的信息。
+//
+// 返回 nil 表示文件打不开、不是可识别的 sfnt/TTC、或一个面都读不出来 —— 与
+// parseFontFile 的失败口径一致。坏的单个面 (缺 name/post 表) 会被跳过, 与
+// col.Font(i) 返回 error 时调用方 continue 的行为一致。
+func probeFontFaces(path string) ([]probeFaceInfo, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	r := &countingReaderAt{r: f}
+
+	offsets, err := probeFaceOffsets(r)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]probeFaceInfo, 0, len(offsets))
+	for _, off := range offsets {
+		info, ok := probeFaceAt(r, off)
+		if !ok {
+			continue
+		}
+		out = append(out, info)
+	}
+	fireFontProbeBytesHook(path, r.n)
+	if len(out) == 0 {
+		return nil, fmt.Errorf("%s: no readable face", path)
+	}
+	return out, nil
+}
+
+// countingReaderAt 记录探针一共向文件要了多少字节。
+//
+// 这是"探针退化成整份解析"唯一可断言的事实: 读盘字节数是确定的, 而毫秒
+// 在 CI 上不是 (页缓存会让整份读也显得便宜)。钩子在生产路径上是空操作。
+type countingReaderAt struct {
+	r io.ReaderAt
+	n int
+}
+
+func (c *countingReaderAt) ReadAt(p []byte, off int64) (int, error) {
+	n, err := c.r.ReadAt(p, off)
+	c.n += n
+	return n, err
+}
+
+// probeFaceOffsets 返回文件里每个面的 sfnt 表目录偏移。
+//
+// TTC 头: tag "ttcf" + version + numFonts + offsets[numFonts]; 单面文件就是
+// 偏移 0。dfont (Mac 资源叉) 不支持 —— x/image 支持它, 但 Linux/Windows 上
+// 不存在, 真遇到时探针会返回 false, 走整份解析的兜底路径。
+func probeFaceOffsets(f io.ReaderAt) ([]uint32, error) {
+	var head [12]byte
+	if _, err := f.ReadAt(head[:], 0); err != nil {
+		return nil, err
+	}
+	if string(head[0:4]) == "ttcf" {
+		n := binary.BigEndian.Uint32(head[8:])
+		if n == 0 || n > 1024 {
+			return nil, fmt.Errorf("ttc: bad font count %d", n)
+		}
+		buf := make([]byte, 4*n)
+		if _, err := f.ReadAt(buf, 12); err != nil {
+			return nil, err
+		}
+		offsets := make([]uint32, n)
+		for i := range offsets {
+			offsets[i] = binary.BigEndian.Uint32(buf[4*i:])
+		}
+		return offsets, nil
+	}
+	if !knownSFNTVersion(head[0:4]) {
+		return nil, fmt.Errorf("not an sfnt file")
+	}
+	return []uint32{0}, nil
+}
+
+// knownSFNTVersion 与 x/image 接受的 sfnt 版本一致。
+const (
+	sfntVersionTrueType = 0x00010000
+	sfntVersionCFF      = 0x4F54544F // "OTTO"
+	sfntVersionTrue     = 0x74727565 // "true"
+	sfntVersionTyp1     = 0x74797031 // "typ1"
+)
+
+func knownSFNTVersion(tag []byte) bool {
+	v := binary.BigEndian.Uint32(tag)
+	return v == sfntVersionTrueType || v == sfntVersionCFF ||
+		v == sfntVersionTrue || v == sfntVersionTyp1
+}
+
+// probeFaceAt 读出一个面的判面信息。
+//
+// 返回 ok=false 的条件与 col.Font(i) 失败对齐: 表目录坏、缺 name 表、缺
+// post 表 (post 是 x/image 的必需表, 缺了整份解析会失败)。
+func probeFaceAt(f io.ReaderAt, off uint32) (probeFaceInfo, bool) {
+	var hdr [12]byte
+	if _, err := f.ReadAt(hdr[:], int64(off)); err != nil {
+		return probeFaceInfo{}, false
+	}
+	if !knownSFNTVersion(hdr[0:4]) {
+		return probeFaceInfo{}, false
+	}
+	numTables := int(binary.BigEndian.Uint16(hdr[4:]))
+	if numTables == 0 || numTables > 4096 {
+		return probeFaceInfo{}, false
+	}
+	dir := make([]byte, 16*numTables)
+	if _, err := f.ReadAt(dir, int64(off)+12); err != nil {
+		return probeFaceInfo{}, false
+	}
+	var nameOff, nameLen, postOff, postLen, maxpOff, maxpLen uint32
+	for i := 0; i < numTables; i++ {
+		e := dir[16*i : 16*i+16]
+		tag := string(e[0:4])
+		o := binary.BigEndian.Uint32(e[8:])
+		l := binary.BigEndian.Uint32(e[12:])
+		switch tag {
+		case "name":
+			nameOff, nameLen = o, l
+		case "post":
+			postOff, postLen = o, l
+		case "maxp":
+			maxpOff, maxpLen = o, l
+		}
+	}
+	if nameLen == 0 || postLen == 0 {
+		return probeFaceInfo{}, false
+	}
+
+	info := probeFaceInfo{}
+	// name 表读失败**不是**整面失败: x/image 的 Font() 不碰 name 表, 失败只
+	// 发生在 f.Name(), 调用方拿到空串继续判面 (空子族名按"正体"算)。
+	if fam, err := probeNameString(f, nameOff, nameLen, 1); err == nil {
+		info.family = fam
+	}
+	if fam, err := probeNameString(f, nameOff, nameLen, 16); err == nil {
+		info.typoFamily = fam
+	}
+	if sub, err := probeNameString(f, nameOff, nameLen, 2); err == nil {
+		info.subfamily = sub
+	}
+
+	angle, fixed, ok := probePostHeader(f, postOff, postLen, maxpOff, maxpLen)
+	if !ok {
+		// post 表坏 ⇒ x/image 的 parsePost 会返回 error ⇒ 整个面不可用。
+		return probeFaceInfo{}, false
+	}
+	info.italicAngle = angle
+	info.fixedPitch = fixed
+	return info, true
+}
+
+// probeNameString 读 name 表里第一个"可解码"的指定 ID 记录。
+//
+// 与 x/image 的 Font.Name 同序: 按记录顺序扫, 只认 (platform 1, MacRoman) 与
+// (platform 3, encoding 1 UCS-2) 两种编码; 其它平台的同名记录跳过 (x/image
+// 也是 continue, 不是报错)。取不到返回 error, 调用方视为空串。
+func probeNameString(f io.ReaderAt, off, length uint32, id uint16) (string, error) {
+	n := length
+	if n > sfntNameTableCap {
+		n = sfntNameTableCap
+	}
+	if n < 6 {
+		return "", fmt.Errorf("name table too short")
+	}
+	buf := make([]byte, n)
+	if _, err := f.ReadAt(buf, int64(off)); err != nil {
+		return "", err
+	}
+	count := int(binary.BigEndian.Uint16(buf[2:]))
+	strOff := int(binary.BigEndian.Uint16(buf[4:]))
+	if 6+12*count > len(buf) {
+		return "", fmt.Errorf("name table truncated")
+	}
+	for i := 0; i < count; i++ {
+		e := buf[6+12*i : 6+12*i+12]
+		if binary.BigEndian.Uint16(e[6:]) != id {
+			continue
+		}
+		pid := binary.BigEndian.Uint16(e[0:])
+		eid := binary.BigEndian.Uint16(e[2:])
+		var ucs2 bool
+		switch {
+		case pid == 3 && eid == 1:
+			ucs2 = true
+		case pid == 1 && eid == 0:
+			ucs2 = false
+		default:
+			continue
+		}
+		l := int(binary.BigEndian.Uint16(e[8:]))
+		start := strOff + int(binary.BigEndian.Uint16(e[10:]))
+		if start < 0 || l < 0 || start+l > len(buf) {
+			return "", fmt.Errorf("name record out of range")
+		}
+		return decodeNameBytes(buf[start:start+l], ucs2)
+	}
+	return "", fmt.Errorf("name id %d not found", id)
+}
+
+// decodeNameBytes 解码一条 name 记录。
+//
+// UCS-2 逐 2 字节取一个 rune, 奇数长度报错 —— 与 x/image 的 stringifyUCS2
+// 完全一致 (它也不处理代理对)。MacRoman 只处理 ASCII: 判面用的关键词
+// (Bold/Italic/Regular/Negreta/fett…) 全是 ASCII, 高位字节替换成 U+FFFD 不会
+// 制造也不会破坏任何一次子串命中, 因此不必为它引入 x/text/charmap。
+func decodeNameBytes(b []byte, ucs2 bool) (string, error) {
+	if ucs2 {
+		if len(b)&1 != 0 {
+			return "", fmt.Errorf("odd UCS-2 length")
+		}
+		r := make([]rune, len(b)/2)
+		for i := range r {
+			r[i] = rune(binary.BigEndian.Uint16(b[2*i:]))
+		}
+		return strings.TrimSpace(string(r)), nil
+	}
+	r := make([]rune, len(b))
+	for i, c := range b {
+		if c < 0x80 {
+			r[i] = rune(c)
+		} else {
+			r[i] = 0xFFFD
+		}
+	}
+	return strings.TrimSpace(string(r)), nil
+}
+
+// probePostHeader 读 post 表头的 italicAngle 与 isFixedPitch。
+//
+// 与 x/image 的 parsePost 对齐: 版本只认 0x10000 / 0x20000 / 0x30000, 表长
+// 至少 32 字节; 版本 2.0 还要 2 + 2*numGlyphs 字节 (numGlyphs 来自 maxp)。
+// 任一不满足 ⇒ ok=false (整面不可用), 因为 post 是 x/image 的必需表。
+func probePostHeader(f io.ReaderAt, off, length, maxpOff, maxpLen uint32) (angle float64, fixed bool, ok bool) {
+	const headerSize = 32
+	if length < headerSize {
+		return 0, false, false
+	}
+	var buf [headerSize]byte
+	if _, err := f.ReadAt(buf[:], int64(off)); err != nil {
+		return 0, false, false
+	}
+	switch binary.BigEndian.Uint32(buf[0:]) {
+	case 0x10000, 0x30000:
+	case 0x20000:
+		// 版本 2.0 后面跟 glyphNameIndex[] —— 截断的表 x/image 会拒绝。
+		if maxpLen < 6 {
+			return 0, false, false
+		}
+		var m [6]byte
+		if _, err := f.ReadAt(m[:], int64(maxpOff)); err != nil {
+			return 0, false, false
+		}
+		numGlyphs := uint32(binary.BigEndian.Uint16(m[4:]))
+		if length < headerSize+2+2*numGlyphs {
+			return 0, false, false
+		}
+	default:
+		return 0, false, false
+	}
+	angle = float64(int32(binary.BigEndian.Uint32(buf[4:]))) / 0x10000
+	return angle, binary.BigEndian.Uint32(buf[12:]) != 0, true
+}
+
+// fontProbeBytesHook 是"探针这次一共读了多少字节"的测试钩子 (仅测试期非 nil)。
+//
+// 与 fontProbeHook (打开过哪个文件) 分开: 前者守"试过哪个候选", 这条守
+// "试它的代价"。T3-5 第十一批把判面从 col.Font(i) 换成手读 name/post 表头,
+// 一旦有人在探针里加回整份解析, 字节数会从 ~80KB 跳到 19MB —— 毫秒断言在
+// CI 上看不出来 (页缓存), 字节数看得出来。
+var fontProbeBytesHook func(path string, n int)
+
+func fireFontProbeBytesHook(path string, n int) {
+	if h := fontProbeBytesHook; h != nil {
+		h(path, n)
+	}
+}

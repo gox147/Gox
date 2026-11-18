@@ -564,11 +564,21 @@ func regularFaceOf(col *opentype.Collection) (*opentype.Font, error) {
 // 只排除粗体的话默认字体会落到 DemiLight (它确实不粗, 但也不该当正文)。
 // 判据与 axisFromFont 同一口径 (子族名), 所以索引认得的粗/斜这里也认得。
 func baseFaceRank(f *opentype.Font) int {
-	a := fontAxisOf(f)
+	sub := subfamilyOf(f)
+	return faceRank(sub, fontAxisOf(f))
+}
+
+// faceRank 是判面的**唯一**档位函数: 0 = 正体, 越大越不合适当默认字体。
+//
+// 抽出来是因为现在有两条路要判同一个面: 整份解析 (baseFaceRank, 拿着
+// *opentype.Font) 与极小探针 (probeFileFaceRank, 只有 name 表 + post 头)。
+// 两条路各写一遍档位逻辑就等于给"默认字体选成粗体"留了两份可能不同步的
+// 判据 —— 而这正是 TestProbeFileFaceRankMatchesFullParse 要守的东西。
+func faceRank(sub string, a styleAxis) int {
 	rank := 0
 	if a.bold {
 		rank += 2
-	} else if !subIsPlain(subfamilyOf(f)) {
+	} else if !subIsPlain(sub) {
 		rank++ // Light / Medium / DemiLight …: 不粗, 但也不是正体
 	}
 	if a.italic {
@@ -702,32 +712,26 @@ func chooseBaseFont(paths []string) (*opentype.Font, error) {
 		len(paths), lastErr)
 }
 
-// probeFileFaceRank 只用文件表头与 name 表判断"这个文件里最好的面是几档",
-// 判据与 baseFaceRank/regularFaceOf 完全一致 (同一个函数, 同一份 name 表),
-// 但不把整份字节读进堆。
+// probeFileFaceRank 只用表目录 + name 表 + post 头判断"这个文件里最好的面是
+// 几档", 判据与 baseFaceRank 完全一致 (同一个 faceRank / axisFromSubfamily),
+// 但不解析 maxp/cmap/hhea/hmtx, 也不读字形数据。
 //
 // 返回 ok=false 表示文件打不开或一个面都读不出来 (exe 改名的 .ttf / 损坏文件)，
 // 与 parseFontFile 的失败口径一致。
+//
+// T3-5 第十一批: 上一批已经把"整份读盘"降级成"x/image 的表头探针", 但
+// col.Font(i) 仍会把 10 个面的 cmap/loca 全建出来 —— 对 NotoSansCJK-Bold.ttc
+// 实测 6~7ms, 而判面只用到 name 表里的一行子族名。现在改走 probeFontFaces:
+// 每个面读盘 ~8KB, 整份文件 10 个面 ~80KB。
 func probeFileFaceRank(path string) (rank int, ok bool) {
 	fireFontProbeHook(path)
-	f, err := os.Open(path)
-	if err != nil {
-		return 0, false
-	}
-	// 探针只读表目录与 name 表, 读完就关 —— 面在关闭后失效, 但这里不需要面
-	// 活下来 (真正要渲染时走 parseFontFile 的整份解析)。
-	defer f.Close()
-	col, err := opentype.ParseCollectionReaderAt(f)
+	faces, err := probeFontFaces(path)
 	if err != nil {
 		return 0, false
 	}
 	best := -1
-	for i, n := 0, col.NumFonts(); i < n; i++ {
-		ft, ferr := col.Font(i)
-		if ferr != nil {
-			continue
-		}
-		r := baseFaceRank(ft)
+	for _, fc := range faces {
+		r := faceRank(fc.subfamily, axisFromSubfamily(fc.subfamily, fc.italicAngle))
 		if best < 0 || r < best {
 			best = r
 			if r == 0 {

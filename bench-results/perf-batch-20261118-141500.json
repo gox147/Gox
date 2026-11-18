@@ -1,0 +1,231 @@
+{
+ "generated_at": "2026-11-18T14:16:44.659467+00:00",
+ "benchmark": "T3-5-11/coldstart-font-probe-v2",
+ "note": "夜批 A/B 原始数据。base = origin/main@684da26 (干净, 从本地 clone 构建以获得 vcs stamping), new = 本批 (工作树 dirty)。两个二进制随机交错 20 轮/组, 外部 wall time, 同一 Xvfb :55 显示。",
+ "platform": {
+  "cpu": "AMD EPYC 9K65 192-Core Processor",
+  "cpus": 32,
+  "os": "linux/amd64",
+  "go": "go1.26.2",
+  "display": ":55 (Xvfb 1024x768x24, 软渲染, 无 WM)",
+  "fonts": "330 个文件 / 156MB (/usr/share/fonts)"
+ },
+ "binaries": {
+  "base": {
+   "path": "/tmp/gox-A2",
+   "version": "gox 0.26.0 commit  684da26f37ebd9c43fa5250aea4d70b6bad8c9a1 commit-time 2026-11-18T13:41:17Z built   2026-11-18T14:16:27Z toolchain go1.26.2 linux/amd64"
+  },
+  "new": {
+   "path": "/tmp/gox-B",
+   "version": "gox 0.26.0 commit  684da26f37ebd9c43fa5250aea4d70b6bad8c9a1 (dirty) commit-time 2026-11-18T13:41:17Z built   2026-11-18T14:07:10Z toolchain go1.26.2 linux/amd64"
+  }
+ },
+ "metrics": {
+  "first_frame_default_font": {
+   "script": "scripts/bench/coldstart_gui.js (3 行 text, 默认字体, 320x200)",
+   "metric": "进程级冷启动到首帧 (ms), 外部 wall time",
+   "base": {
+    "median": 35.66,
+    "min": 34.25,
+    "p10": 34.71,
+    "p90": 37.99,
+    "max": 38.04,
+    "samples": [
+     34.56,
+     35.55,
+     37.99,
+     35.44,
+     38.04,
+     35.44,
+     36.22,
+     36.66,
+     36.43,
+     35.83,
+     35.99,
+     37.82,
+     36.52,
+     34.25,
+     35.3,
+     34.99,
+     35.34,
+     35.72,
+     35.6,
+     34.71
+    ]
+   },
+   "new": {
+    "median": 29.46,
+    "min": 28.43,
+    "p10": 28.58,
+    "p90": 30.54,
+    "max": 30.67,
+    "samples": [
+     28.71,
+     28.48,
+     28.58,
+     29.37,
+     29.74,
+     29.98,
+     29.38,
+     28.93,
+     30.06,
+     30.54,
+     30.03,
+     28.7,
+     29.22,
+     28.88,
+     29.82,
+     28.43,
+     29.54,
+     30.67,
+     30.19,
+     30.42
+    ]
+   },
+   "delta": {
+    "median_ms": 6.2,
+    "median_pct": 17.4,
+    "rounds_new_faster": 20,
+    "rounds": 20
+   }
+  },
+  "first_frame_family_first_use": {
+   "script": "/tmp/family.js (1 行 text, fontFamily=\"Noto Sans CJK SC\", 320x200, 首次使用触发族索引)",
+   "metric": "进程级冷启动到首帧 (ms), 外部 wall time",
+   "base": {
+    "median": 49.85,
+    "min": 48.08,
+    "p10": 48.8,
+    "p90": 51.93,
+    "max": 55.16,
+    "samples": [
+     49.03,
+     48.45,
+     50.26,
+     48.08,
+     49.11,
+     50.25,
+     50.92,
+     51.09,
+     51.84,
+     48.95,
+     49.98,
+     49.25,
+     51.16,
+     51.76,
+     49.56,
+     55.16,
+     48.8,
+     49.73,
+     51.93,
+     49.36
+    ]
+   },
+   "new": {
+    "median": 37.69,
+    "min": 35.46,
+    "p10": 36.15,
+    "p90": 39.98,
+    "max": 40.72,
+    "samples": [
+     35.46,
+     37.2,
+     38.87,
+     37.9,
+     40.72,
+     37.41,
+     36.41,
+     37.96,
+     36.66,
+     37.72,
+     35.96,
+     37.67,
+     38.1,
+     37.71,
+     39.98,
+     36.72,
+     36.37,
+     36.15,
+     37.91,
+     38.19
+    ]
+   },
+   "delta": {
+    "median_ms": 12.16,
+    "median_pct": 24.4,
+    "rounds_new_faster": 20,
+    "rounds": 20
+   }
+  }
+ },
+ "in_process_stage_ms": {
+  "note": "go test ./gfx/ -run TestColdstartFontStage -v (每组 5 次取中位; base/new 交替各 3 组取中位)",
+  "base": {
+   "scan_ms": 0.57,
+   "choose_ms": 10.32,
+   "total_ms": 10.89,
+   "choose_full_reads": 1,
+   "runs": [
+    10.32,
+    9.63,
+    12.73
+   ]
+  },
+  "new": {
+   "scan_ms": 0.57,
+   "choose_ms": 4.38,
+   "total_ms": 4.95,
+   "choose_full_reads": 1,
+   "runs": [
+    3.18,
+    4.49,
+    4.38
+   ]
+  },
+  "delta_pct": -54.5,
+  "why": "选默认字体里剩下的 4.4ms 是**对命中者的整份解析** (19MB 读盘 + sfnt 解析), 本批没动它; 被否掉的 Bold 集合那 6~7ms 降到 ~0.2ms。"
+ },
+ "in_process_family_index_ms": {
+  "note": "go test ./gfx/ -run XXX -bench BenchmarkFamilyIndexBuild -benchtime 6x -count=3 (清空索引与文件缓存后重建, 自动并发)",
+  "base": {
+   "ns_per_op": [
+    29866776,
+    21898260,
+    26449446
+   ],
+   "median_ms": 26.45
+  },
+  "new": {
+   "ns_per_op": [
+    4592877,
+    4740543,
+    8450357
+   ],
+   "median_ms": 4.74
+  },
+  "delta_pct": -82.1
+ },
+ "probe_bytes": {
+  "note": "gfx/TestProbeReadsOnlyNameAndPost: 探针读最大字体文件 (NotoSerifCJK-Bold.ttc) 的字节数",
+  "file_bytes": 27294356,
+  "probe_bytes": 36872,
+  "ratio_pct": 0.135,
+  "old_path": "x/image ParseCollectionReaderAt + col.Font(i) × 10 面 (cmap/loca/hmtx 全建)"
+ },
+ "peak_rss_kb": {
+  "base": [
+   43248,
+   43004,
+   43616,
+   44116
+  ],
+  "new": [
+   40412,
+   41516,
+   40612,
+   40868
+  ],
+  "note": "/usr/bin/time -v Maximum resident set size, 每次一个独立进程, base/new 各 4 次; 中位 43.4MB → 40.7MB (-6.2%), 主因是 10 个面的 cmap/loca/hmtx 不再建表"
+ },
+ "caveat": "绝对值不可与 §12.1 的 84ms、§3.3 的 245ms 相减 (机器与显示栈不同); 只有本表内的 base↔new 比值可引用。族索引那组比值里, 顺序/并发两个口径也都变快了, 见 §12.10。"
+}

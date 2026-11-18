@@ -213,42 +213,35 @@ type familyFaceEntry struct {
 	mono  bool
 }
 
+// scanFamilyFaceEntries 读出一个文件里每个面的族名 / 轴 / 等宽标记。
+//
+// T3-5 第十一批: 改走 probeFontFaces (表目录 + name + post 头), 不再为
+// 330 个字体文件各建一次 Collection。这里要的四样东西 (family、typographic
+// family、subfamily、isFixedPitch) 全在 name/post 表里 —— 组织成族的成本
+// 本来就不该等于"把整机字体解析一遍"。
+//
+// 跳过规则与旧实现一致: 整份解析失败的面、一个名字都没有的面都不进索引。
 func scanFamilyFaceEntries(path string) []familyFaceEntry {
-	f, err := os.Open(path)
+	faces, err := probeFontFaces(path)
 	if err != nil {
 		return nil
 	}
-	defer f.Close()
-	col, err := opentype.ParseCollectionReaderAt(f)
-	if err != nil {
-		return nil
-	}
-	var buf sfnt.Buffer
-	n := col.NumFonts()
-	out := make([]familyFaceEntry, 0, 4)
-	for i := 0; i < n; i++ {
-		ft, err := col.Font(i)
-		if err != nil {
-			continue
-		}
+	out := make([]familyFaceEntry, 0, len(faces))
+	for i, fc := range faces {
 		names := make([]string, 0, 3)
-		for _, id := range []sfnt.NameID{sfnt.NameIDFamily, sfnt.NameIDTypographicFamily} {
-			if key := normalizeFamilyKey(fontNameOf(ft, &buf, id)); key != "" {
+		for _, n := range []string{fc.family, fc.typoFamily} {
+			if key := normalizeFamilyKey(n); key != "" {
 				names = append(names, key)
 			}
 		}
 		if len(names) == 0 {
 			continue
 		}
-		mono := false
-		if pt := ft.PostTable(); pt != nil {
-			mono = pt.IsFixedPitch
-		}
 		out = append(out, familyFaceEntry{
 			index: i,
 			names: names,
-			axis:  axisFromFont(ft, i, fontNameOf(ft, &buf, sfnt.NameIDSubfamily)),
-			mono:  mono,
+			axis:  axisFromSubfamily(fc.subfamily, fc.italicAngle),
+			mono:  fc.fixedPitch,
 		})
 	}
 	return out
@@ -469,6 +462,27 @@ func fontAxisOf(f *opentype.Font) styleAxis {
 // 写着 "Bold", 内容却是个等宽 CJK 面 (字形与 Regular 面 0 逐字节相同)。那种
 // 情况靠"默认字体跳过粗体面"来挡 (见 loadBaseFontLocked), 不靠面序号猜。
 func axisFromFont(f *opentype.Font, faceIndex int, subfamily string) styleAxis {
+	// faceIndex **不参与字重判定**。曾经试过"面 0 算正体、其余面算粗体",
+	// 实测是错的: 集合字体的每个面都有自己的族名与子族名,
+	//   simsun.ttc 面0 族=SimSun 子族=Regular; 面1 族=NSimSun 子族=Regular
+	//   msyh.ttc   面0 族=Microsoft YaHei;     面1 族=Microsoft YaHei UI
+	// 即 NSimSun 是"另一个族", 不是 SimSun 的粗体面。按面序号硬判粗体的直接
+	// 后果: nsimsun 只有 {b=1} 这一格, 而 genericMono 兜底 (firstMonoLocked)
+	// 恰好返回它 ⇒ lookup("monospace") 查不到正体轴、整个泛型等宽族失效。
+	_ = faceIndex // 保留参数: 判据将来若要按面细分, 唯一入口在这里
+	angle := 0.0
+	if pt := f.PostTable(); pt != nil {
+		angle = pt.ItalicAngle
+	}
+	return axisFromSubfamily(subfamily, angle)
+}
+
+// axisFromSubfamily 是轴判定的**唯一**实现: 输入子族名与 post 表的
+// italicAngle, 输出 (bold, italic)。
+//
+// 与 faceRank 同理抽出来 —— 极小探针只读得到"子族名 + italicAngle 这个数",
+// 拿不到 *opentype.Font; 若为它另写一份判据, 探针与整份解析迟早分叉。
+func axisFromSubfamily(subfamily string, italicAngle float64) styleAxis {
 	s := strings.ToLower(subfamily)
 	bold := strings.Contains(s, "bold") || strings.Contains(s, "heavy") || strings.Contains(s, "black")
 	if !bold {
@@ -480,19 +494,9 @@ func axisFromFont(f *opentype.Font, faceIndex int, subfamily string) styleAxis {
 	if !bold {
 		bold = localizedBoldNames[s]
 	}
-	// faceIndex **不参与字重判定**。曾经试过"面 0 算正体、其余面算粗体",
-	// 实测是错的: 集合字体的每个面都有自己的族名与子族名,
-	//   simsun.ttc 面0 族=SimSun 子族=Regular; 面1 族=NSimSun 子族=Regular
-	//   msyh.ttc   面0 族=Microsoft YaHei;     面1 族=Microsoft YaHei UI
-	// 即 NSimSun 是"另一个族", 不是 SimSun 的粗体面。按面序号硬判粗体的直接
-	// 后果: nsimsun 只有 {b=1} 这一格, 而 genericMono 兜底 (firstMonoLocked)
-	// 恰好返回它 ⇒ lookup("monospace") 查不到正体轴、整个泛型等宽族失效。
-	_ = faceIndex // 保留参数: 判据将来若要按面细分, 唯一入口在这里
 	italic := strings.Contains(s, "italic") || strings.Contains(s, "oblique")
-	if !italic {
-		if pt := f.PostTable(); pt != nil && pt.ItalicAngle != 0 {
-			italic = true
-		}
+	if !italic && italicAngle != 0 {
+		italic = true
 	}
 	return styleAxis{bold: bold, italic: italic}
 }

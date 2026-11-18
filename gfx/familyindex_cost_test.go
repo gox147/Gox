@@ -34,10 +34,17 @@ const buildCostRuns = 5
 // 随邻居变), 而"并发化到底省了多少"是自校准的 —— 同一个进程、同一份页缓存、
 // 同一批文件, 唯一变量就是 parallelFor 的 workers。
 //
-// 实测 (32 核): 顺序 41.3ms / 并发 13.8ms = 2.99x。要求 ≥ 1.33x 是留足余量:
-// 低核机器上并发收益本来就小 (2 核理论上限 2x), 但绝不该出现"并发更慢"或
-// "并发等于顺序"——那说明并发没接上 (退回单线程) 或者被自己加的锁串行化了。
-const familyBuildSpeedup = 1.33
+// 实测轨迹 (32 核, 同一台机器):
+//
+//	第九批 (逐文件整份解析): 顺序 41.3ms / 并发 13.8ms = 2.99x  → 下限 1.33x
+//	第十一批 (逐文件只读 name/post 表头): 顺序 5.5ms / 并发 3.9ms = 1.30~1.57x
+//
+// 下限从 1.33 降到 1.15 是**跟着绝对成本走的**, 不是给回归留后门: 第十一批
+// 把每个文件的成本砍掉 5.6 倍之后, 剩下的 5.5ms 里并发能拿到的只有调度重叠
+// (读盘不再是瓶颈), 8 次取样落在 1.30~1.57 —— 1.33 正好卡在噪声带里, 会
+// 假红 (实测 8 次中红 2 次)。1.15 仍然挡得住这条闸门真正要挡的两件事:
+// "并发没接上"(=1.00) 与"新加的共享锁把并行串行化"(<1.15)。
+const familyBuildSpeedup = 1.15
 
 // measureFamilyIndexBuild 清空索引与字体文件缓存后重跑一次 build。
 //
@@ -244,4 +251,17 @@ func medianDuration(xs []time.Duration) time.Duration {
 		return c[n/2]
 	}
 	return (c[n/2-1] + c[n/2]) / 2
+}
+
+// BenchmarkFamilyIndexBuild 量"第一次用 fontFamily"要付多少 (清缓存后重建)。
+//
+// T3-5 第十一批把逐文件解析换成 name/post 表头探针, 这条基准留作该改动的
+// 长期盯梢: 族索引不在任何启动打点里, 它退化了没有曲线会红。
+func BenchmarkFamilyIndexBuild(b *testing.B) {
+	if testing.Short() {
+		b.Skip("-short 下跳过 (要遍历整机字体目录)")
+	}
+	for i := 0; i < b.N; i++ {
+		measureFamilyIndexBuild(0)
+	}
 }
