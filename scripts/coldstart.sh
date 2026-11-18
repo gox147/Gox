@@ -16,7 +16,17 @@
 # 跑法:
 #   ./scripts/coldstart.sh                # 默认 7 次取中位数
 #   ./scripts/coldstart.sh --runs 15      # 加密重复
+#   ./scripts/coldstart.sh --interval 0.3 # 样本间隔秒数 (默认 0.25, 见下)
 #   ./scripts/coldstart.sh --xvfb         # 无 DISPLAY 时强制用 Xvfb 虚拟显示
+#
+# --- 样本间隔 (T3-5 第十二批, 2026-11-19) ---
+#
+# 旧版背靠背连跑, 每个样本都被"上一个 gox 刚断开 X 连接"的服务器侧清理
+# 推迟 ~15ms: 实测同一个纯 xgb 连接程序 (只 dial + 握手, 不建窗口) 连跑三次
+# 是 0.25ms / 19.3ms / 19.2ms, 间隔 0.3s 后恢复到 0.2ms 量级。也就是说旧口径
+# 测到的"38ms"里约 14ms 是 Xvfb 的 accept 延迟伪影, 不是 gox 的成本。
+# 现在样本之间默认等 0.25s, 并把 interval_ms 写进结果 JSON。
+# **这是测量口径修正, 不是性能优化**: 新旧数字不可相减, 引用时必须带口径。
 #
 # 显示环境: 有 DISPLAY 直接用; 没有 xvfb-run 时跳过 (不失败, 与
 # bench-compare.sh 的"缺栈跳过"纪律一致)。
@@ -29,6 +39,8 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 RUNS=7
 OUT="$ROOT/bench-results"
 WANT_XVFB=0
+# 样本间隔 (秒)。0 表示旧口径 (背靠背), 仅供复现历史数字。
+INTERVAL=0.25
 
 GREP=/usr/bin/grep
 [[ -x "$GREP" ]] || GREP=$(command -v grep)
@@ -37,6 +49,7 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --runs) RUNS="$2"; shift 2 ;;
     --out)  OUT="$2"; shift 2 ;;
+    --interval) INTERVAL="$2"; shift 2 ;;
     --xvfb) WANT_XVFB=1; shift ;;
     -h|--help) "$GREP" '^#' "$0" | sed 's/^# \{0,1\}//' | head -40; exit 0 ;;
     *) echo "未知参数 $1 (见 --help)"; exit 1 ;;
@@ -98,13 +111,15 @@ run_rss_kb() {
 median() { printf '%s\n' "$@" | sort -n | awk '{a[NR]=$1} END {print (NR%2) ? a[(NR+1)/2] : int((a[NR/2]+a[NR/2+1])/2)}'; }
 
 # 预热 2 次: 二进制页缓存 / 字体栅格化缓存 / X 连接建立, 消除首个进程的冷启动偏置。
-for _ in 1 2; do "${RUNNER[@]}" "$GOX_BIN" "$SCRIPT" >/dev/null 2>&1 || true; done
+for _ in 1 2; do "${RUNNER[@]}" "$GOX_BIN" "$SCRIPT" >/dev/null 2>&1 || true; sleep "$INTERVAL"; done
 
 SAMPLES=()
 for i in $(seq 1 "$RUNS"); do
   ms=$(run_once_ms)
   SAMPLES+=("$ms")
   echo "[coldstart] 第 $i/$RUNS 次: ${ms}ms" >&2
+  # 间隔见文件头 "样本间隔": 不等的话每个样本都会被 X server 的断开清理推迟。
+  sleep "$INTERVAL"
 done
 MED=$(median "${SAMPLES[@]}")
 RSS=$(run_rss_kb)
@@ -112,10 +127,11 @@ RSS=$(run_rss_kb)
 # -------- JSON + 表 --------
 STAMP=$(date -u +%Y%m%d-%H%M%S)
 JSON="$OUT/coldstart-process-$STAMP.json"
-python3 - "$JSON" "$MED" "$RSS" "$RUNS" "${SAMPLES[*]}" <<'PYEOF'
+python3 - "$JSON" "$MED" "$RSS" "$RUNS" "${SAMPLES[*]}" "$INTERVAL" <<'PYEOF'
 import sys, json, datetime, os, platform, subprocess
 
 json_path, med, rss, runs, samples = sys.argv[1], int(sys.argv[2]), int(sys.argv[3]), int(sys.argv[4]), [int(x) for x in sys.argv[5].split()]
+interval_ms = int(round(float(sys.argv[6]) * 1000))
 
 def sh(cmd):
     try:
@@ -140,7 +156,8 @@ doc = {
     "first_frame_ms_median": med,
     "first_frame_ms_all": samples,
     "rss_kb": rss,
-    "method": "外部 wall time (进程 exec → 脚本打印 FIRST_FRAME, 含 ≤2ms 探测/退出开销), 跑 %d 次取中位数, 预热 2 次不计入; 首帧信号 = JS 侧 1ms 轮询 gx/dev 的 devSnapshot().frame.count (只在真实上屏出口计数)" % runs,
+    "interval_ms": interval_ms,
+    "method": "外部 wall time (进程 exec → 脚本打印 FIRST_FRAME, 含 ≤2ms 探测/退出开销), 跑 %d 次取中位数, 预热 2 次不计入, 样本间隔 %dms (避开 X server 断开清理造成的 accept 延迟, 见脚本头); 首帧信号 = JS 侧 1ms 轮询 gx/dev 的 devSnapshot().frame.count (只在真实上屏出口计数)" % (runs, interval_ms),
     "scope": "进程级冷启动到首帧: 含进程 exec/动态链接/Go runtime 启动/解释器初始化/脚本求值(含模块装载)/真实窗口创建/首次 Layout+Draw+上屏",
     "host": {
         "platform": platform.platform(),

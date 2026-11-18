@@ -852,7 +852,16 @@ func resetFontCaches() {
 	// 文件级解析缓存也必须清: 它按 (路径, mtime, size) 做键, 覆盖同名文件的
 	// 替换; 但 resetFontCaches 的语义是"宿主换字体后全部重来", 清干净比
 	// 依赖身份校验更不会留坑 (它只是冷启动期的去重缓存, 重建代价可接受)。
+	//
+	// T3-5 第十二批起 entry 里还挂着一个保持打开的字体文件 (按需 ReaderAt
+	// 的源)。这里是**唯一**该关它的地方: 同一把锁里清掉全部派生缓存
+	// (faceCache / facesByPath / glyphLRU), 此后不可能再有人从旧 fd 取字形。
 	fontFileMu.Lock()
+	for _, ent := range fontFileCache {
+		if ent != nil && ent.file != nil {
+			_ = ent.file.Close()
+		}
+	}
 	fontFileCache = map[string]*fontFileEntry{}
 	fontFileMu.Unlock()
 

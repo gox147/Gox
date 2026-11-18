@@ -9,6 +9,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"golang.org/x/image/font"
@@ -105,10 +106,18 @@ var scannedFonts []string
 // 却让"按族名取面"不必把同一个文件再读一遍盘 (那正是 2026-11-17 夜批没能
 // 消掉的那 17ms)。真正的内存收益来自扫描不再解析 (见 scanSystemFonts):
 // 一次启动只留下真正用到的那个文件的字节。
+//
+// T3-5 第十二批: `col` 的来源从"整份 []byte"换成**保持打开的文件句柄 +
+// sfnt 的按需 ReaderAt**。理由是实测: 本机 NotoSansCJK-Regular.ttc 19MB,
+// os.ReadFile 10.3~11.5ms 占了首帧预算里最大的一项, 而首帧只用到二十多个
+// 拉丁字形 —— 整份读盘换来的 19MB 字节里, 首帧碰到的可能不到 0.1%。
+// 同口径 A/B: 11.76ms → 1.21ms (10.7x), 常驻内存也不再钉 19MB 字体字节。
+// 代价是每次取新字形多一次 pread (页缓存命中时 ~2µs), 由 glyphLRU 摊掉。
 type fontFileEntry struct {
 	mtime time.Time
 	size  int64
-	// col 是整份文件的解析结果; 面 (含 reg) 都从它派生, 共享同一份字节。
+	// col 是文件的解析结果 (按需读表); 面 (含 reg) 都从它派生, 共享同一个
+	// ReaderAt。
 	col *opentype.Collection
 	// reg 是最适合当默认正文的那个面 (parseFontFile 的口径, 见 baseFaceRank);
 	// nil 表示这个文件解析不出任何面 (exe 改名的 .ttf / 损坏文件)。
@@ -117,6 +126,35 @@ type fontFileEntry struct {
 	// 按需要取 —— 扫描阶段只需要 reg, 把每个文件的全部面都建出来是 fontFamily
 	// 的账。
 	all []*opentype.Font
+
+	// file 是保持打开的字体文件, 供 col 的 ReaderAt 按需读表。
+	//
+	// **除 resetFontCaches 外不主动关闭**: col / reg / all 里每个 *sfnt.Font
+	// 都持有指向它的 ReaderAt, 提前 Close 会让后续取字形变成 EOF (表现为
+	// "首帧正常, 之后某次重绘文字消失")。一个应用真正用到的字体文件是个位数,
+	// FD 成本可控, 进程退出由 OS 回收。
+	file *os.File
+
+	// readBytes 是本 entry 建起来之后累计被读走的字节数 (原子)。
+	//
+	// 闸门用它断言"建默认字体不再整份读盘": 毫秒在 CI 上不可断言 (页缓存
+	// 会让整份读也显得便宜), 字节数可以 —— 与 probeFontFaces 的
+	// countingReaderAt 同一口径。
+	readBytes atomic.Int64
+}
+
+// fontFileReaderAt 把 entry 的 *os.File 包成 io.ReaderAt, 顺带累计读盘字节。
+//
+// 用值类型: sfnt 会把 ReaderAt 存进 source 结构, 里面再指回 entry —— entry
+// 由 fontFileCache 长期持有, 不会因为包装对象没有引用而被回收。
+type fontFileReaderAt struct{ e *fontFileEntry }
+
+func (r fontFileReaderAt) ReadAt(p []byte, off int64) (int, error) {
+	n, err := r.e.file.ReadAt(p, off)
+	if n > 0 {
+		r.e.readBytes.Add(int64(n))
+	}
+	return n, err
 }
 
 var (
@@ -442,19 +480,33 @@ func loadFontFileEntry(path string) (*fontFileEntry, error) {
 	fontFileMu.Unlock()
 
 	fireFontReadHook(path)
-	data, err := os.ReadFile(path)
+	f, err := os.Open(path)
 	if err != nil {
 		return nil, err
 	}
-	col, err := opentype.ParseCollection(data)
+	// 身份用**已打开 fd 的** stat 认, 不用上面那次 os.Stat 的:
+	// 两次调用之间文件可能被替换 (fontconfig 缓存刷新 / 包管理器升级),
+	// 那时解析的是新文件而缓存记的是旧身份, 之后会一直命中错的那一份。
+	if fst, serr := f.Stat(); serr == nil {
+		st = fst
+	}
+	ent := &fontFileEntry{mtime: st.ModTime(), size: st.Size(), file: f}
+	col, err := opentype.ParseCollectionReaderAt(fontFileReaderAt{ent})
 	if err != nil {
+		// 解析失败 (exe 改名的 .ttf / 损坏文件 / 截断): 立刻关掉这一份,
+		// 别让"候选表里有几十个坏文件"变成几十个长期占用的 FD。
+		_ = f.Close()
 		return nil, err
 	}
-	ent := &fontFileEntry{mtime: st.ModTime(), size: st.Size(), col: col}
+	ent.col = col
 	if reg, rerr := regularFaceOf(col); rerr == nil {
 		ent.reg = reg
 	}
 	fontFileMu.Lock()
+	// 命中过但身份不符 (文件被换掉): 旧 entry 仍可能被某个 Face/Collection
+	// 引用着, 这里**只替换不关闭** —— 关掉会让仍在用旧字体的窗口下一次取
+	// 字形时读到 EOF, 而泄漏一个 FD 只是进程级的一次性成本。真正该关的
+	// 时机是 resetFontCaches (那里所有派生缓存同时失效)。
 	fontFileCache[path] = ent
 	fontFileMu.Unlock()
 	return ent, nil

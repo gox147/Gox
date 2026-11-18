@@ -1399,3 +1399,152 @@ go1.26.2 / Xvfb `:55` 1024×768×24 软渲染 / 330 个字体文件 156MB / 2026
   全量四栈那一次）。本批只给同机 A/B，按 §3.3 的纪律要换对外数字必须整批重跑
   `bench-all.sh` + `coldstart.sh` 再 `./scripts/perf-numbers.sh`，不在本批混做。
   也就是说：**29.38ms 只在本节内可比，现在还不能当对外口径引用。**
+
+### 12.12 T3-5 第十二批：字体按需读表（19MB → 2.8%）+ 冷启动采样口径修正（2026-11-19 凌晨批）
+
+#### 12.12.0 先修口径：背靠背连跑给每个样本加了 ~14ms 的假成本
+
+在动代码之前先做了一件更基础的事：**证明旧口径的数字本身不干净**。
+
+用一个只做 `dial` + 握手的 xgb 程序（不建窗口、不碰字体），在同一台机器上
+连跑三次：**0.25ms / 19.3ms / 19.2ms**；每次之间等 0.3s 再跑：**0.25 / 0.21 /
+0.23ms**。三次结果一致。即：上一个客户端断开连接后，X server（这里是 Xvfb）
+的清理会让下一条连接的 accept 晚 ~15ms。
+
+`scripts/coldstart.sh` 旧版是**背靠背连跑**（`for i in $(seq 1 $RUNS)`，无间隔），
+于是这个伪影被算进了每一轮。同一台机器、同一天、同一份脚本的对照：
+
+| 采样口径 | base `0415008` | 本批 |
+|---|---|---|
+| 背靠背（旧口径，`--interval 0`） | 38ms | 26ms |
+| 间隔 250ms（新口径，默认） | 24ms | **14ms** |
+
+- 口径修正的幅度（~14ms）与优化收益（10ms）**同量级**。两者混在一起报，优化
+  会被伪影吞掉或放大 —— 所以本节把两件事分开写，两套数字都给。
+- 脚本改动：新增 `--interval <秒>`（默认 **0.25**），每样本后 `sleep`，并把
+  `interval_ms` 写进结果 JSON 的 `method` 字段。`--interval 0` 可复现旧数字。
+- **这是测量口径修正，不是性能优化**：24ms 与 38ms 描述的是同一份代码，
+  不可相减、不可拿来说"省了 14ms"。
+
+#### 12.12.1 靶子：首帧里 10.3ms 在读一份 19MB 的字体
+
+用一次性的 env 开关（测完即撤，未入库）在 `mount → create-window →
+layout → draw → present` 上打点，又在字体链路上按函数累加，单次进程 3 组一致：
+
+| 阶段 | 耗时 |
+|---|---|
+| 建窗（xgb 连接 + CreateWindow + CreateGC + 属性 + 键盘映射 + Map + Sync） | **0.4 ~ 1.0ms** |
+| Layout 合计 | 13.6 ~ 14.3ms |
+| ├ `initFontCandidates`（330 个文件的目录扫描） | 1.4 ~ 1.6ms |
+| ├ `chooseBaseFont` 探针（2 个候选：粗体被否、正体命中） | 0.55ms |
+| ├ `parseFontFile`（`NotoSansCJK-Regular.ttc`，19,484,784 字节） | **11.0 ~ 12.2ms** |
+| │　├ `os.ReadFile` | **10.3 ~ 11.5ms** |
+| │　└ `opentype.ParseCollection` | 0.003ms |
+| └ 字形栅格化（23 个，`face.Glyph`） | 0.12ms |
+| Draw | 0.24ms |
+| Present（XPutImage） | 0.6ms |
+
+两个反直觉的结论：
+
+1. **整份读盘的 10.3ms 里没有"解析"**。`opentype.ParseCollection` 只花 3µs ——
+   sfnt 是惰性的，建 Collection 只读 TTC 头与每个面的表目录。钱全部花在
+   `os.ReadFile` 把 19MB 拷进堆（`make([]byte, 19MB)` 清零 + 从页缓存 copy）。
+2. **建窗不是 12ms，是 1ms**。§12.11 的归因表把建窗记成 11.4–13.2ms —— 那张表
+   的插桩同样是背靠背连跑，量到的正是 12.12.0 里的 accept 延迟。所以 §12.11
+   文末"下一批该打建窗"那条遗留**不成立**，真实建窗成本已经很低。
+
+#### 12.12.2 改法：打开文件 + sfnt 按需 ReaderAt
+
+`gfx/font.go` 的 `loadFontFileEntry` 从"整份读进堆"改成"保持文件打开 + 按需读表"：
+
+| 旧 | 新 |
+|---|---|
+| `os.ReadFile(path)` → `[]byte` | `os.Open(path)`，句柄留在 entry 上 |
+| `opentype.ParseCollection(data)` | `opentype.ParseCollectionReaderAt(fontFileReaderAt{ent})` |
+
+配套的四个细节（都是踩过或想清楚了的）：
+
+- **句柄不主动关**。`col` / `reg` / `all` 里每个 `*sfnt.Font` 都持有指向该句柄的
+  ReaderAt，提前 Close 的形态是"首帧正常、后面某次重绘文字消失"（读到 EOF）。
+  唯一该关的地点是 `resetFontCaches` —— 那里同时清掉 faceCache / facesByPath /
+  glyphLRU，此后不可能再有人从旧 fd 取字形。
+- **身份用已打开 fd 的 `Stat()`**，不用进入函数时那次 `os.Stat`：两次调用之间
+  文件可能被换掉（fontconfig 刷新 / 包管理器升级），那时解析的是新文件而缓存
+  记的是旧身份，之后会一直命中错的那一份。
+- **替换旧 entry 时不关旧 fd**（文件被换掉的路径）。旧 Collection 可能还有 Face
+  在用，泄漏一个 fd 比渲染报 EOF 好；真要清就等 `resetFontCaches`。
+- **打开/解析失败立刻 Close**：候选表里有几十个坏文件（exe 改名的 .ttf），不能
+  让它们变成几十个长期占用的 FD。
+
+顺带给 entry 加了 `readBytes atomic.Int64`，由 `fontFileReaderAt.ReadAt` 累加 ——
+这是闸门唯一能断言的事实（见 12.12.4）。
+
+#### 12.12.3 A/B 数字
+
+**单文件口径**（进程内，同一台机器，`NotoSansCJK-Regular.ttc` 19MB，建面 + 42 个
+字形，两版各跑 2 次取中位）：
+
+| 口径 | base | 本批 | 变化 |
+|---|---|---|---|
+| 建 Collection + 建 face + 42 字形 | 11.76 ms | **1.21 ms** | **−89.7%（9.7x）** |
+| ├ 读盘 | 10.98 ms（整份 19MB） | 0.02 ms（open）+ 按需读表 | — |
+| ├ 解析 | 0.63 ms | 0.90 ms | 略升（按需读表把 IO 挪到这里） |
+| └ 42 字形 | 0.15 ms | 0.30 ms | 每字形多一次 pread（页缓存命中） |
+
+**进程级首帧**（Xvfb `:55` 1024×768×24，A/B 交替 20 对、奇偶轮换序消除漂移，
+每样本间隔 250ms，预热各 1 次；base = `0415008` 干净克隆构建带 vcs stamping，
+new = 本批 `dirty`）：
+
+| 口径 | base | 本批 | 变化 |
+|---|---|---|---|
+| 首帧（默认字体，3 行 text） | 24 ms | **14 ms** | **−41.7%（−10 ms）** |
+| 逐轮胜负 | — | **20/20 轮更快** | — |
+| 峰值 RSS（`/usr/bin/time -v`，各 5 次） | 40.8 MB | **21.5 MB** | **−19.3 MB（−47%）** |
+
+RSS 的降幅几乎正好是一份 19MB 字体文件 —— 那 19MB 现在只以页缓存形式存在，
+进程堆里不再常驻。本批没做任何内存优化，这条不作为收益对外引用，但它是同一个
+改动的直接后果。
+
+**同批旧口径对照**（背靠背，`--interval 0`）：38ms → 26ms。两套数字都在
+`bench-results/perf-batch-20261118-162050.json` 里（逐轮样本、RSS 采样、
+两个二进制的 `version` 输出）。
+
+**fib28 无退化**（确认没碰 vm/compiler）：base 200ms vs 本批 201ms
+（+0.5%，20 轮里 10 轮更快）—— 在噪声带内。
+
+**条件**（引用时必须一并给出）：AMD EPYC 9754 / 32 核 / Linux 6.6.117 /
+go1.26.2 / Xvfb `:55` 1024×768×24 软渲染 / 330 个字体文件 156MB /
+2026-11-19 00:00–00:25 北京时间。
+
+#### 12.12.4 闸门（先建闸门再优化）
+
+| 断言 | 判据 | 守的形态 |
+|---|---|---|
+| `TestBaseFaceLoadReadsOnlyNeededTables` | 建面 + 42 字形读盘 ≤ min(文件大小 5%, 1MB)；实测 19,484,784 字节的文件读 **559,813 字节 = 2.87%** | 有人把 `os.ReadFile` 加回来 |
+| `TestChooseBaseFontReadsOnlyChosenFile`（既有） | 被否掉的粗体候选整份解析 0 次 | 选字体退回"每个候选都整份读" |
+| `TestProbeReadsOnlyNameAndPost`（既有） | 探针读盘 ≤ 512KB | 判面退回 `col.Font(i)` |
+
+**为什么用字节而不是毫秒**：页缓存让"整份读 19MB"在 CI 上也只要几毫秒，毫秒
+断言在 runner 上必是噪声（§12.11 已经因为同一理由把 `TestFamilyIndexBuildCost`
+从 1.33 降到 1.15）。字节数是确定量，负向形态也很干脆：退回 `os.ReadFile`
+时读盘量立刻等于文件大小，必红。
+
+剩下的 559,813 字节主要是 **cmap 表**（CJK 集合字体的 cmap 有几百 KB，要覆盖
+几万个码位）。再往下抠就得按码位区间只读 cmap 子表 —— 那要绕开 x/image 的
+解析路径自己实现，收益约 0.5ms，不值得，记在遗留里。
+
+#### 12.12.5 遗留（下一批的入口）
+
+- **14ms 的构成要重新量一遍**（旧的归因表已被 12.12.0 推翻）：目录扫描
+  1.4~1.6ms、探针 0.55ms、按需读表 ~1.2ms、layout/draw/present ~1ms、
+  JS 侧探测与退出 ≤2ms，差额（约 7~8ms）应当是进程 exec + Go runtime 启动 +
+  解释器初始化 + ES 模块装载 —— 这一段**本轮没有单独量过**，下一批的第一个
+  动作应该是把它拆开，而不是继续在字体里抠。
+- **探针仍开一次文件**（`probeFontFaces` 自己 `os.Open`）：可以复用 entry 的
+  ReaderAt 省一次 open（实测 0.02ms），收益可忽略。
+- **macOS / Windows 未实机验证**：ReaderAt 走纯 Go 的 `os.File.ReadAt`，三端
+  语义一致；关 fd 的路径由 `resetFontCaches` 覆盖，CI 三平台全绿即视为通过。
+- **对外数字未刷新**：README / 官网仍指向 §3.3 的 245ms（Xeon、四栈全量那次）。
+  按 §3.3 的纪律要整批重跑 `bench-all.sh` + `coldstart.sh` 再
+  `./scripts/perf-numbers.sh`。**14ms 只在本节内可比**，且必须连带说明 12.12.0
+  的口径变更，否则会被读成"比上一版快 2.7 倍"。

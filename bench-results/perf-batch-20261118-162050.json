@@ -1,0 +1,83 @@
+{
+  "generated_at": "2026-11-18T16:21:04.365792+00:00",
+  "benchmark": "coldstart-process-ab",
+  "batch": "T3-5 batch12: 字体按需读表 + 样本间隔口径修正",
+  "pairs": 20,
+  "interval_ms": 250,
+  "method": "外部 wall time (进程 exec → FIRST_FRAME), A/B 交替 (奇偶轮换序), 每样本间隔以避开 X server 断开清理造成的 accept 延迟; RSS = /usr/bin/time -v Maximum resident",
+  "host": {
+    "platform": "Linux-6.6.117-45.11.4.tl4.x86_64-x86_64-with-glibc2.39",
+    "cpu": "AMD EPYC 9754 128-Core Processor",
+    "cores": 32,
+    "display": ":55"
+  },
+  "base": {
+    "binary": "/tmp/gox-A",
+    "version": "gox 0.26.0\ncommit  0415008c07f9cb9de6837ce0906372acf7638182\ncommit-time 2026-11-18T15:17:40Z\nbuilt   2026-11-18T16:18:05Z\ntoolchain go1.26.2 linux/amd64",
+    "first_frame_ms": [
+      25,
+      25,
+      25,
+      25,
+      24,
+      23,
+      25,
+      25,
+      24,
+      24,
+      25,
+      25,
+      24,
+      25,
+      24,
+      24,
+      24,
+      24,
+      24,
+      23
+    ],
+    "median_ms": 24,
+    "rss_kb": [
+      40836,
+      40808,
+      40480,
+      40900,
+      41064
+    ]
+  },
+  "new": {
+    "binary": "/tmp/gox-B",
+    "version": "gox 0.26.0\ncommit  0415008c07f9cb9de6837ce0906372acf7638182 (dirty)\ncommit-time 2026-11-18T15:17:40Z\nbuilt   2026-11-18T16:18:10Z\ntoolchain go1.26.2 linux/amd64",
+    "first_frame_ms": [
+      14,
+      13,
+      14,
+      13,
+      14,
+      14,
+      14,
+      14,
+      14,
+      14,
+      14,
+      14,
+      14,
+      14,
+      14,
+      14,
+      14,
+      13,
+      14,
+      15
+    ],
+    "median_ms": 14,
+    "rss_kb": [
+      22268,
+      21464,
+      21412,
+      21828,
+      20976
+    ]
+  },
+  "wins_new": 20
+}
