@@ -205,8 +205,17 @@ func probeFaceAt(f io.ReaderAt, off uint32) (probeFaceInfo, bool) {
 }
 
 // hasRequiredTables 检查 x/image initialize 需要的表是否齐全。
+//
+// 字形来源三种, 与 sfnt.parseGlyphData 的分支一一对应:
+//   - CFF/CFF2 (OTTO)
+//   - loca + glyf (普通 TrueType)
+//   - CBLC (彩色位图字体: NotoColorEmoji 这类只有 CBDT/CBLC, glyf 是空的,
+//     x/image 走"位图分支"、字形集合为空但整份解析**成功**)
+//
+// name 表**不在**必需之列: x/image 的 Font() 根本不碰它, 缺了照样能用
+// (f.Name 报错 ⇒ 子族名空 ⇒ 按正体算)。把它列进来会凭空拒绝可用字体。
 func hasRequiredTables(have map[string]bool, version []byte) bool {
-	for _, t := range []string{"head", "maxp", "cmap", "hhea", "hmtx", "name", "post"} {
+	for _, t := range []string{"head", "maxp", "cmap", "hhea", "hmtx", "post"} {
 		if !have[t] {
 			return false
 		}
@@ -214,7 +223,7 @@ func hasRequiredTables(have map[string]bool, version []byte) bool {
 	if binary.BigEndian.Uint32(version) == sfntVersionCFF {
 		return have["CFF "] || have["CFF2"]
 	}
-	return have["loca"] && have["glyf"]
+	return have["loca"] && have["glyf"] || have["CBLC"]
 }
 
 // probeNameTable 是一个已读入记录区的 name 表。

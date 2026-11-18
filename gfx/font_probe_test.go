@@ -184,3 +184,45 @@ func BenchmarkProbeFileFaceRank(b *testing.B) {
 		}
 	}
 }
+
+// TestHasRequiredTables 钉住"哪些面在整份解析里算存在"。
+//
+// 这条是被 CI 逼出来的: 第一版把 loca+glyf 写成 TrueType 的唯一字形来源,
+// ubuntu runner 上的 NotoColorEmoji.ttf (只有 CBDT/CBLC, glyf 为空) 就被探针
+// 判成"不可用"、却被整份解析读了出来 —— 两条路口径当场分叉。字形来源有三种,
+// 必须与 sfnt.parseGlyphData 的分支一一对应。
+func TestHasRequiredTables(t *testing.T) {
+	tr := func(tags ...string) map[string]bool {
+		m := map[string]bool{}
+		for _, s := range tags {
+			m[s] = true
+		}
+		return m
+	}
+	base := []string{"head", "maxp", "cmap", "hhea", "hmtx", "post"}
+	with := func(extra ...string) map[string]bool { return tr(append(append([]string{}, base...), extra...)...) }
+	tt := []byte{0, 1, 0, 0} // 0x00010000
+	otto := []byte("OTTO")
+
+	cases := []struct {
+		name string
+		have map[string]bool
+		ver  []byte
+		want bool
+	}{
+		{"TrueType loca+glyf", with("loca", "glyf"), tt, true},
+		{"彩色位图 CBLC/CBDT (glyf 为空)", with("CBLC", "CBDT"), tt, true},
+		{"OTTO + CFF", with("CFF "), otto, true},
+		{"OTTO + CFF2", with("CFF2"), otto, true},
+		{"缺 post", tr("head", "maxp", "cmap", "hhea", "hmtx", "loca", "glyf"), tt, false},
+		{"缺 cmap", tr("head", "maxp", "hhea", "hmtx", "post", "loca", "glyf"), tt, false},
+		{"TrueType 但既无 loca/glyf 也无 CBLC", with(), tt, false},
+		{"OTTO 但没有 CFF/CFF2", with("loca", "glyf"), otto, false},
+		{"name 缺失不影响可用性", tr("head", "maxp", "cmap", "hhea", "hmtx", "post", "loca", "glyf"), tt, true},
+	}
+	for _, c := range cases {
+		if got := hasRequiredTables(c.have, c.ver); got != c.want {
+			t.Errorf("%s: got %v, want %v", c.name, got, c.want)
+		}
+	}
+}
