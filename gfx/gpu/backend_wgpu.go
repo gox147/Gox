@@ -198,7 +198,21 @@ func New(inner gfx.Surface) (*Surface, error) {
 // 离屏模式 (inner==nil, 测试/无头) 恒 false, 但那不是包装场景。
 func (s *Surface) PresentsToWindow() bool { return s.wgpuSurf != nil }
 
-// initSwapchain 从内层平台 Surface 拿原生句柄建 wgpu surface 并配置
+// initSwapchain 是 initSwapchainTry 的两段式提交包装 (gfx.NativeWindowCommit,
+// 2026-11-19): 建链结果决定第 2 段怎么落 —— 成功提交切层 (cocoa), 失败
+// 回收未提交层 (零副作用, win32/x11 无本接口则不触达)。inner 为 nil
+// (离屏) 时没有提交对象, 直接透传。
+func (s *Surface) initSwapchain() error {
+	err := s.initSwapchainTry()
+	if err != nil && s.inner != nil {
+		if c, ok := s.inner.(gfx.NativeWindowCommit); ok {
+			c.CommitNativeWindow(false) // 未提交过 → 实现方侧是 no-op; cocoa 回收未用层
+		}
+	}
+	return err
+}
+
+// initSwapchainTry 从内层平台 Surface 拿原生句柄建 wgpu surface 并配置
 // swapchain。三道 gate, 任何一道不过都返回 error (调用方退回 CPU blit):
 //
 //  1. inner 实现 gfx.NativeWindowProvider (可选接口, 不扩 Surface 契约);
@@ -207,7 +221,7 @@ func (s *Surface) PresentsToWindow() bool { return s.wgpuSurf != nil }
 //
 // 口径纪律: 本函数只决定「能不能上屏」, 不做任何性能声明 —— 是否比
 // CPU blit 快要靠硬件口径基准 (bench-present-4k.sh, 不接受兜底口径)。
-func (s *Surface) initSwapchain() error {
+func (s *Surface) initSwapchainTry() error {
 	if devInstance == nil || devAdapter == nil {
 		return fmt.Errorf("gpu: instance/adapter 未就绪")
 	}
@@ -231,8 +245,18 @@ func (s *Surface) initSwapchain() error {
 			return fmt.Errorf("x11: 无 Xlib Display*, wgpu 建不了 surface")
 		}
 		st = wgpu.SurfaceTargetFromXlibWindow(tgt.Display, tgt.Window)
+	case "cocoa":
+		// CAMetalLayer* 由 gfx/cocoa 两段式第 1 段供给 (metal.go,
+		// 2026-11-19 落地): 此时 view 尚未切层 (CPU blit 不受影响),
+		// 建链成功后 initSwapchain 包装器经 NativeWindowCommit 提交切层。
+		// 无头沙箱无 Metal: CreateSurfaceUnsafe 失败 → commit(false) 回收,
+		// 降级语义由 commit_gate_test.go 钉住。真机点亮属 G-3 硬件覆盖项。
+		if tgt.Window == 0 {
+			return fmt.Errorf("cocoa: 无 CAMetalLayer*, wgpu 建不了 surface")
+		}
+		st = wgpu.SurfaceTargetFromMetalLayer(tgt.Window)
 	default:
-		// cocoa / wayland / android: 未实现或未接入, 见 gfx/native_window.go
+		// wayland / android: 未实现或未接入, 见 gfx/native_window.go
 		return fmt.Errorf("平台 %q 暂无 swapchain 接线", tgt.Kind)
 	}
 	surf, err := devInstance.CreateSurfaceUnsafe(st)
@@ -264,7 +288,26 @@ func (s *Surface) initSwapchain() error {
 	s.wgpuSurf = surf
 	s.swapFormat = format
 	s.swapW, s.swapH = w, h
+	// 两段式第 2 段 (gfx.NativeWindowCommit): 建链**成功**才提交 ——
+	// cocoa 在这里把 view 切到 CAMetalLayer (layer-hosting); win32/x11
+	// 句柄只读, 无本接口不触达。
+	if c, ok := s.inner.(gfx.NativeWindowCommit); ok {
+		c.CommitNativeWindow(true)
+	}
 	return nil
+}
+
+// degradeSwapchain swapchain 运行期失效后的降级收拾: 先通知「需要两段式
+// 提交」的平台恢复原呈现载体 (cocoa 恢复原 layer, CPU blit 的
+// contents=NSImage 立即可用, 窗口不黑), 再把像素交回内层。幂等: 实现
+// 方承诺 false 未提交时是 no-op, 而本函数只在 swapBroken 置位时到达。
+func (s *Surface) degradeSwapchain() {
+	if s.inner == nil {
+		return
+	}
+	if c, ok := s.inner.(gfx.NativeWindowCommit); ok {
+		c.CommitNativeWindow(false)
+	}
 }
 
 // pipelineFor 返回适配给定颜色格式的呈现管线 (按需建, 缓存于 swapPipeline)。
@@ -512,11 +555,12 @@ func (s *Surface) ShowRegions(img *image.RGBA, rects []image.Rectangle) {
 		if !ok {
 			// swapchain 运行期失效 (窗口销毁 / 驱动重置 / resize 竞态):
 			// 永久置 broken 并把**这一帧**交回内层 CPU blit —— 降级而非
-			// 失败, 窗口不许因为 GPU 疯掉而停更。
+			// 失败, 窗口不许因为 GPU 疯掉而停更。cocoa 两段式: 先恢复
+			// 原呈现载体再落回 (degradeSwapchain), 否则 CAMetalLayer 上
+			// 的 contents 路径不渲染 → 黑窗。
 			s.swapBroken = true
-			if s.inner != nil {
-				s.inner.ShowRegions(img, rects)
-			}
+			s.degradeSwapchain()
+			s.inner.ShowRegions(img, rects)
 			return
 		}
 		defer view.Release()
@@ -524,9 +568,8 @@ func (s *Surface) ShowRegions(img *image.RGBA, rects []image.Rectangle) {
 		pl, perr := s.pipelineFor(s.swapFormat)
 		if perr != nil {
 			s.swapBroken = true
-			if s.inner != nil {
-				s.inner.ShowRegions(img, rects)
-			}
+			s.degradeSwapchain()
+			s.inner.ShowRegions(img, rects)
 			return
 		}
 		renderPl = pl

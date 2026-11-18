@@ -24,13 +24,13 @@ package gfx
 //     取 Xlib Display* (gfx/x11/xlib.go, 零 cgo, 不破坏发行链)。
 //     打不开 Xlib 时安静退 0, GPU 侧 gate 拒绝建链、窗口照常 CPU
 //     blit。真机点亮待 G-3 三平台验证 (无头沙箱验不到真上屏)。
-//   - cocoa: ❌ 未实现, 且**不能照抄 win32/x11 的"只读句柄"模式**
-//     (2026-11-18 决策, 见 docs/gpu-track-audit.md「cocoa 设计约束」)。
-//     原因: CPU blit 上屏走 CALayer.contents = NSImage, 若在
-//     NativeWindowTarget() 里直接把 view 层换成 CAMetalLayer, 一旦 GPU
-//     建链失败回退 CPU, contents 路径在 CAMetalLayer 上不渲染 → 黑窗。
-//     实现必须带「GPU 链建立成功后才切层、失败零副作用」的语义
-//     (purego objc 调用本身可行, gfx/cocoa 同款)。真机验证待 G-3。
+//   - cocoa: ✅ (2026-11-19) 两段式落地 (gfx/cocoa/metal.go) ——
+//     **不能照抄 win32/x11 的"只读句柄"模式** (2026-11-18 设计约束,
+//     见 docs/gpu-track-audit.md「cocoa 设计约束」): CPU blit 上屏走
+//     CALayer.contents = NSImage, 直接切 CAMetalLayer 会让 GPU 建链
+//     失败的降级路径黑窗。第 1 段 NativeWindowTarget() 只建层不切层;
+//     第 2 段经 NativeWindowCommit 由 GPU 后端在建链成功后才提交切层,
+//     失败/运行期失效恢复原层, CPU blit 立即可用。真机点亮待 G-3。
 //   - android/ios/harmony: **决策不接入** (2026-11-18, 见
 //     docs/gpu-track-audit.md「移动端接入决策」): 上屏由宿主完成
 //     (Kotlin flush / Swift CGImage / harmony), Go 侧拿不到可建
@@ -57,4 +57,23 @@ type NativeWindowTarget struct {
 //   - 非热路径: 每窗口只在 GPU 包装时调用一次。
 type NativeWindowProvider interface {
 	NativeWindowTarget() (NativeWindowTarget, bool)
+}
+
+// NativeWindowCommit 是「接管窗口呈现载体」的平台 (cocoa) 的可选第二段
+// 提交接口 (2026-11-19, 配合 gfx/cocoa/metal.go 两段式)。
+//
+// win32/x11 的句柄是只读的, GPU 接管与否不影响 CPU blit 路径, 不需要
+// 本接口; cocoa 的 CPU blit 走 CALayer.contents = NSImage, GPU 建链
+// 成功后必须真正把 view 切到 CAMetalLayer 才算接管完成 —— 这一步
+// 必须发生在 wgpu CreateSurfaceUnsafe + Configure **成功之后**, 否则
+// 建链失败 = 黑窗。
+//
+// 调用契约 (由 gfx/gpu/backend_wgpu.go 履行):
+//   - CommitNativeWindow(true): swapchain 建链成功后调用一次;
+//   - CommitNativeWindow(false): 建链失败**或** swapchain 运行期失效
+//     (swapBroken) 时调用, 实现方恢复原呈现载体, 保证 CPU blit 立即可用;
+//   - false 幂等: 未提交过时必须是 no-op (GPU 后端在降级路径上每帧都
+//     可能触达这一句, 不得重复执行恢复动作)。
+type NativeWindowCommit interface {
+	CommitNativeWindow(ok bool)
 }

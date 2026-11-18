@@ -503,6 +503,13 @@ type surface struct {
 	conSet           bool
 	conMinW, conMinH int
 	conMaxW, conMaxH int
+
+	// GPU 呈现两段式状态 (见 metal.go, gfx.NativeWindowCommit):
+	// metalLayer 是第 1 段创建的 CAMetalLayer (未提交时对 view 无感),
+	// metalCommitted 标记 view 已切层 (layer-hosting)。与 win/view/layer
+	// 同受 mu 保护。
+	metalLayer     objc.ID
+	metalCommitted bool
 }
 
 func newSurface(cfg gfx.WindowConfig) (gfx.Surface, error) {

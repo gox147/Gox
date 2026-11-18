@@ -60,8 +60,8 @@ gogpu/wgpu 已提供原生窗口接入 API（`SurfaceTargetFromXlibWindow` /
 1. ✅ 原生句柄暴露：新增可选接口 `gfx.NativeWindowProvider`
    （`gfx/native_window.go`，不扩 Surface 契约）。win32 已实现
    （HINSTANCE+HWND）；x11 已实现（2026-11-18 补 Xlib Display* dlopen
-   方案，见下文更新）；cocoa 未实现
-   （需 CAMetalLayer，setWantsLayer 方案未验证）。
+   方案，见下文更新）；cocoa 已实现（2026-11-19 两段式 CAMetalLayer，
+   见下文更新）。
 2. ✅ swapchain 上屏：`backend_wgpu.go` 接入
    `Instance.CreateSurfaceUnsafe` + `Surface.Configure/GetCurrentTexture/
    Present`，支持 resize 重配、非 RGBA8 格式备用管线、运行期失效永久
@@ -83,7 +83,7 @@ gogpu/wgpu 已提供原生窗口接入 API（`SurfaceTargetFromXlibWindow` /
   CPU blit。降级语义有测试钉住（`gfx/x11/xlib_test.go`，无头沙箱
   PASS：无 X server 时 Display==0，行为与无 GPU 轨一致）。
 - 至此三平台句柄暴露的**代码前提**全部就位：win32 ✅ / x11 ✅（本轮）/
-  cocoa ❌（CAMetalLayer 未实现，仍待 G-3）。
+  cocoa ✅（2026-11-19 两段式，见下文更新）。
 - 诚实口径：x11 真机点亮（swapchain 真上屏 + 性能数字）属于「硬件
   覆盖待办」，本更新只核销代码层缺口，不构成 A 路径完成。
 
@@ -203,6 +203,32 @@ wgpu 初始化失败）回退 CPU blit 时，`contents` 路径在 CAMetalLayer �
 
 在满足上述约束前，cocoa 的 NativeWindowProvider 维持未实现状态 ——
 宁可缺一个平台，不做降级会黑窗的实现。
+
+### 2026-11-19 更新：cocoa 两段式按上述约束落地（`gfx/cocoa/metal.go`）
+
+约束第 1 条与第 3 条本轮闭环，第 2 条（Metal 层下 Resize/跨屏的
+contentsScale 分流）**维持待办** —— 它只在切层成功后才可达，属于真机
+覆盖项的一部分，沙箱验不到，不预写未经真机验证的代码：
+
+- ✅ 两段式落地：第 1 段 `NativeWindowTarget()` 只**创建** CAMetalLayer
+  （`alloc+init`，设 contentsScale），不碰 view —— 建链失败零副作用；
+  第 2 段新增可选接口 `gfx.NativeWindowCommit.CommitNativeWindow(ok)`，
+  由 `backend_wgpu.go` 在 `CreateSurfaceUnsafe + Configure` **成功后**
+  才发 `true`（`setLayer + setWantsLayer`，layer-hosting），建链失败
+  或 swapchain 运行期失效（`swapBroken`）发 `false` —— 恢复原
+  backing layer，CPU blit（contents=NSImage）立即可用，窗口不黑。
+  `false` 幂等（未提交时 no-op），降级路径每帧触达不重复恢复。
+- ✅ swapchain 接线：`initSwapchainTry` 增加 `case "cocoa"` →
+  `SurfaceTargetFromMetalLayer`（wgpu 原生支持，`Display` 不用）。
+- ✅ 降级测试钉住（`gfx/gpu/commit_gate_test.go`）：建链失败恰好一次
+  `false` 且不得误发 `true`；`degradeSwapchain` 每次失效触达 `false`；
+  降级后渲染照常委托 inner。无头沙箱（无 Metal）PASS。
+- ✅ 不破坏发行链：`GOOS=darwin CGO_ENABLED=0 go build ./gfx/...` 通过
+  （purego objc，零 cgo）；linux 默认轨与 win32 交叉编译通过；26 组件
+  CPU vs GPU 双轨快照 A/B（阈值 0）全绿，Prism 视觉一致性零退化。
+- 诚实口径：真机点亮（Metal 适配器探测、切层后的真上屏、Resize/跨屏
+  保鲜、性能数字）属于「硬件覆盖待办」，未做不得声称 cocoa 平台 GPU
+  上屏可用。
 
 ## G-4 视觉闸门第一块落地：26 组件 CPU vs GPU 双轨快照 A/B（2026-11-18）
 
