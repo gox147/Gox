@@ -119,6 +119,34 @@ def extract(doc: dict) -> dict:
     return {}
 
 
+def integrity(doc: dict) -> list[str]:
+    """结果文件自身是否可信 —— 与"快不快"无关，判的是"这次采样成不成立"。
+
+    背景（2026-11-20 第二十一批）：冷启动数字曾被一个**不存在的**测量缺陷污染了
+    一整批 —— 有人手敲计时得出"本机 sleep 不遵守小数秒、间隔没生效"，于是把自
+    §12.12 起所有 250ms 间隔的样本判成"其实背靠背"。重测是反过来的（sleep 0.25
+    就是 251ms，见 §12.21）。教训不是"别搞错"，而是**采样条件必须由产物自己带证**：
+    `coldstart.sh` 现在把请求间隔与实测间隔一起写进 JSON，这里就照着这两项判。
+
+    返回问题列表（空 = 可信）。只判 process 口径，其余口径的 JSON 没这些字段。
+    """
+    problems = []
+    if kind_of(doc) != "process":
+        return problems
+    req, eff = doc.get("interval_ms"), doc.get("interval_ms_effective")
+    if doc.get("interval_honored") is False:
+        problems.append("interval_honored=false（脚本自己已经声明间隔没生效）")
+    # eff 为 None = 第二十一批之前的老文件，没有这项证据；只提示，不判死（历史可比性）。
+    if isinstance(req, (int, float)) and req > 0 and isinstance(eff, (int, float)):
+        if eff < req * 0.8:
+            problems.append("请求间隔 %gms，实测只有 %gms（<80%%）—— 样本是背靠背连跑的，"
+                            "首帧会被 X server 的握手抑制拉高约 9ms" % (req, eff))
+    selftest = (doc.get("harness") or {}).get("clock_selftest_ms")
+    if isinstance(selftest, (int, float)) and selftest <= 0:
+        problems.append("harness.clock_selftest_ms=%g（时钟自检没通过，耗时不可采样）" % selftest)
+    return problems
+
+
 # runner 镜像里出现过的发行版名（字体/内核相关行为按发行版分档）。
 # 白名单而不是正则猜: 版本段（45.11.6.tl4）和发行版名（tl4）字段数一样,
 # 猜出来的往往是 "tl" 这种半截词, 既不稳定也没意义。
@@ -140,6 +168,7 @@ def linux_arch(plat: str) -> str:
 
 
 def host_of(doc: dict) -> str:
+
     h = doc.get("host") or {}
     # 三种结果文件的 host 字段形状不同（generator 各写各的），统一取三项。
     cpu = h.get("cpu") or doc.get("platform", {}).get("cpu") or ""
@@ -318,6 +347,24 @@ def self_test() -> int:
           extract(doc_in) == {"inproc_first_frame_ms": 0.74})
     check("未知口径返回空", extract({"benchmark": "something-else"}) == {})
 
+    # 采样条件自证（第二十一批）：不可信的结果必须被判"数据错误"，老格式只提示。
+    good = {"benchmark": "coldstart-process", "first_frame_ms_median": 9, "interval_ms": 250,
+            "interval_ms_effective": 251, "interval_honored": True,
+            "harness": {"clock_selftest_ms": 52}}
+    check("间隔实测达标 → 可信", integrity(good) == [])
+    bad = dict(good, interval_ms_effective=1, interval_honored=False)
+    check("间隔未生效 → 判不可信", bool(integrity(bad)))
+    # 只靠实测值也能判（不是非得信脚本自己写的 interval_honored）
+    liar = dict(good, interval_ms_effective=6, interval_honored=True)
+    check("自称 honored 但实测不符 → 仍判不可信", bool(integrity(liar)))
+    frozen = dict(good, harness={"clock_selftest_ms": 0})
+    check("时钟自检为 0 → 判不可信", bool(integrity(frozen)))
+    check("老格式（无间隔证据）→ 不判死",
+          integrity({"benchmark": "coldstart-process", "first_frame_ms_median": 9}) == [])
+    check("用户形态（请求 0）→ 不判死",
+          integrity({"benchmark": "coldstart-process", "interval_ms": 0,
+                     "interval_ms_effective": 1, "interval_honored": True}) == [])
+
     # 未入库产物必须被跳过（否则一条命令连跑几份就会把数据换成被污染的那份）。
     import tempfile
     with tempfile.TemporaryDirectory() as td:
@@ -376,6 +423,19 @@ def main() -> int:
 
     for metric, p in sorted(from_path.items()):
         print("数据: %s ← %s" % (metric, os.path.relpath(p, ROOT)))
+
+    # 采样条件自证（第二十一批）: 结果文件不可信时**不进比值判定**。这是"数据错误"
+    # 而不是"性能回归"，两者混在一起会让"脚本没生效"看起来像"代码变慢了"。
+    # 放在 --update-baseline 之前，免得把不可信的数字固化成基线。
+    for p in sorted(set(from_path.values())):
+        probs = integrity(load(p))
+        if probs:
+            print("coldstart-gate: 结果文件不可信: %s" % os.path.relpath(p, ROOT))
+            for x in probs:
+                print("  ✗ %s" % x)
+            print("  → 用 bash scripts/coldstart.sh 重跑（第二十一批起会自证间隔与时钟）；"
+                  "环境可疑时先跑 bash scripts/check-harness-clock.sh")
+            return 2
 
     if args.update_baseline:
         with open(BASELINE, "w", encoding="utf-8") as f:
