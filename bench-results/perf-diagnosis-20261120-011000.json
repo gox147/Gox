@@ -65,8 +65,8 @@
     }
   },
   "harness_findings": {
-    "sleep_fraction_truncated": "sleep 0.5 在本沙箱实测只等 1.2ms (小数按整数截断)",
-    "EPOCHREALTIME_unreliable": "相邻两次取值会给出 0; 计时改用 date +%s%6N"
+    "sleep_fraction_truncated__RETRACTED": "【已撤回, 2026-11-20 第二十一批 21a8cff】原记录为 'sleep 0.5 在本沙箱实测只等 1.2ms (小数按整数截断)' —— 错。重测 sleep 0.25/0.5/1.0 = 251/501/1001ms, 两个时钟源一致; 误判来自在 zsh 里读 bash 5+ 独有的 $EPOCHREALTIME (空串) 与把 date +%s%6N 的微秒当毫秒读。结论: 采样间隔一直生效, 历史数字不受影响。见 docs/performance.md §12.21",
+    "EPOCHREALTIME_unreliable__RETRACTED": "【已撤回, 同上】原记录为 '相邻两次取值会给出 0' —— 只在 zsh 下成立 (zsh 需 zmodload zsh/datetime), bash 5.2 下正常前进。coldstart.sh 自第二十一批起用纯 CPU 忙循环自检时钟, 不再依赖这条经验"
   },
   "withdrawn_attempts": [
     "EOF 重连 (io.EOF / ErrDeadlineExceeded 视为瞬时): 死连接上读到的是'没数据'而非 EOF, pollWait 吞掉错误重试, 无效",
