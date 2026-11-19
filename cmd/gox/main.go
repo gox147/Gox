@@ -44,6 +44,10 @@ func main() {
 	// 建窗时后台预热默认字体 (T3-5 第十六批): 库默认关闭, 由这里显式打开 —
 	// 只有"真的要开窗"的进程才付这份后台 I/O, 且它盖在建窗的 socket 往返上。
 	gfx.EnableFontPrefetch()
+	// 建窗用的显示连接提前建好 (T3-5 第十八批): 必须排在字体预取之前生效 ——
+	// 两者都在"脚本 import gx/gfx"那一刻触发, 顺序见 gfx/display_prewarm.go。
+	// 同样默认关闭, 由 CLI 边界显式打开 (库不因为被链接就连显示服务器)。
+	gfx.EnableDisplayPrewarm()
 
 	args := os.Args[1:]
 

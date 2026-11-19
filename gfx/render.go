@@ -1871,6 +1871,12 @@ func init() {
 		// 脚本一旦 import gx/gfx, 就说明这台进程要 GUI 了 (T3-5 第十六批):
 		// 默认字体放到后台加载, 与后续的模块装载 / 建树 / 建窗并行。
 		// 比"建窗时再起"早 1~1.5ms —— 那段正好盖住 1.78ms 的字体首次使用成本。
+		//
+		// 顺序要紧 (T3-5 第十八批): **先建显示连接, 再起字体预取**。字体预取
+		// 一旦在跑, X 握手会从 0.18ms 涨到 1.2~1.7ms (实测 8~10 倍, §12.18);
+		// 反过来先连、再起预取, 建窗的握手就不在争用窗口里。两件事用同一个
+		// "要 GUI 了"的信号, 只是排了个先后。
+		prewarmDisplayForGUI()
 		prefetchBaseFont()
 		return map[string]object.Value{
 			"h":                     object.NewBuiltin("h", JSBuiltinH),
@@ -2158,6 +2164,10 @@ func Mount(root *GuiNode, cfg WindowConfig) (*Window, error) {
 	// 默认字体在后台与建窗并行加载 (T3-5 第十六批, 见 font_prefetch.go):
 	// 字体初始化是首次文本测量的一次性开销 (本机 1.78ms), 与 X11 握手没有
 	// 数据依赖, 没理由排在它后面。默认关闭, 由 CLI 边界开启。
+	//
+	// 建连在预取之前 (T3-5 第十八批, 见 display_prewarm.go): 顺序反过来时
+	// 握手会被字体加载拖慢 8~10 倍。预热幂等, 模块入口已经连过这里就是空操作。
+	prewarmDisplayForGUI()
 	prefetchBaseFont()
 
 	surface, err := defaultFactory.Create(cfg)

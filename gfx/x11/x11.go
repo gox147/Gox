@@ -78,9 +78,15 @@ type surface struct {
 }
 
 func newSurface(cfg gfx.WindowConfig) (gfx.Surface, error) {
-	conn, err := xgb.NewConn() // 连接 $DISPLAY
-	if err != nil {
-		return nil, fmt.Errorf("connect X server: %w (DISPLAY set?)", err)
+	// 预热连接优先 (T3-5 第十八批, 见 prewarm.go): 建连若撞上字体后台预取,
+	// 握手会从 0.18ms 涨到 1.2~1.7ms —— 提前在无争用时连好就没这一段。
+	conn := takeWarm()
+	if conn == nil {
+		var err error
+		conn, err = xgb.NewConn() // 连接 $DISPLAY
+		if err != nil {
+			return nil, fmt.Errorf("connect X server: %w (DISPLAY set?)", err)
+		}
 	}
 	setup := xproto.Setup(conn)
 	screen := setup.DefaultScreen(conn)
@@ -95,6 +101,7 @@ func newSurface(cfg gfx.WindowConfig) (gfx.Surface, error) {
 
 	win, err := xproto.NewWindowId(conn)
 	if err != nil {
+		conn.Close() // 预热连接: 到此为止没人接手, 别把 fd 挂到进程退出
 		return nil, err
 	}
 	// 事件: 结构变化/按键(按下+抬起)/按钮(按下+抬起)/指针移动/离开窗口。
@@ -122,6 +129,7 @@ func newSurface(cfg gfx.WindowConfig) (gfx.Surface, error) {
 
 	gc, err := xproto.NewGcontextId(conn)
 	if err != nil {
+		conn.Close()
 		return nil, err
 	}
 	xproto.CreateGC(conn, gc, xproto.Drawable(win), 0, nil)

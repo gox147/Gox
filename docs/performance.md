@@ -2218,3 +2218,154 @@ base = `1c37884` 干净克隆构建（`gox version` 无 dirty），new = 同 com
   会引入新的复杂度，暂不做，先写进口径。
 - `DISPLAY` 指向死 socket 时脚本直接报错（本机 `DISPLAY=:0` 无 server 就是这种），
   值得下一批加一次"探测失败自动转 `--xvfb`"。
+
+### 12.18 T3-5 第十八批：先建连、再起字体预取 —— 把 §12.16 埋下的 1.2ms 争用挪出关键路径（2026-11-19 夜批）
+
+#### 12.18.0 起因：字体预取在跑的时候，X 握手慢 8~10 倍
+
+§12.16 把默认字体的加载挪到了后台，起跑线挂在 `import gx/gfx` 那一刻。本次按
+"冷启动优先"复审首帧预算时，先把**建窗**那一段拆开量（一次性插桩，测完即撤，未入库）：
+
+| 建窗阶段（`x11.newSurface`，同机 n=7 中位） | 耗时 |
+|---|---|
+| `xgb.NewConn`（dial + Xauthority + Setup 握手） | **1688 µs** |
+| CreateWindow / CreateGC / WM_NAME（三个 unchecked 请求） | 150 µs |
+| intern `WM_PROTOCOLS` + `WM_DELETE_WINDOW` | 73 µs |
+| `GetKeyboardMapping`（键位表） | 76 µs |
+| RandR `SelectInputChecked().Check()` | 89 µs |
+| `MapWindow` + `Sync` | 163 µs |
+| 合计 | **2277 µs** |
+
+第一步 1.69ms 很可疑：同样一条 `xgb.NewConn`，单独写个 30 行程序连 Xvfb 只要
+**170~200 µs**。于是做了两组对照，都在同一台机器、同一个二进制上：
+
+| 对照 | `xgb.NewConn` |
+|---|---|
+| 进程里**没有**字体预取（`prefetchBaseFont` 不启动） | 170 / 218 / 179 µs |
+| 预取立刻起（现状） | 1481 / 1219 / 1393 / 1423 / 1253 µs |
+| 预取**延迟 2ms** 再起（同一份代码，只改起跑时间） | 187 / 201 / 155 µs |
+| 再叠加 `GOGC=off` / `GOMAXPROCS=4` / 外部 CPU 抢占 | 仍 0.9~1.1ms / 无变化 / 无变化 |
+
+也就是说：**字体后台加载正在跑的时候，X 握手会被拖慢 8~10 倍**（0.18ms → 1.4ms），
+而它与字体加载没有任何数据依赖。§12.16 的收益账因此是"净额"：字体 1.78ms 被藏掉
+一部分，同时往关键路径里塞进了 1.2ms 的争用，最后剩 −0.7~0.95ms。
+
+> 机制没有查到 Go 运行时一级（`strace` 在本机不可用；GC、GOMAXPROCS、cgroup 限流
+> 三项都排除过）。但**现象是稳定可复现的**（上表三组各 3 次，方差很小），
+> 本批据此做的是**顺序调整**，不依赖对机制的猜测：把争用挪出关键路径即可，
+> 无论它来自调度还是 I/O。
+
+#### 12.18.1 为什么"把预取推迟"不是解法
+
+最直接的想法是让字体预取晚点起、避开握手。实测**更慢**（同二进制，只差
+`GOX_PREFETCH_DELAY`，15 对交替）：
+
+| 预取起跑 | 首帧中位 | 说明 |
+|---|---|---|
+| 立刻起（§12.16 现状） | **10.00 ms** | — |
+| 延迟 2ms 起 | 11.51 ms（**+15.2%**） | 握手干净了，但字体那 1.78ms 又变回串行 |
+
+结论：字体预取必须**尽量早**，争用只能靠"让握手先跑完"来规避，不能靠推迟预取。
+
+#### 12.18.2 改法：同一个信号上排个先后
+
+`gx/gfx` 模块查找处（以及 `Mount` 兜底处）本来是"起字体预取"一件事，现在变成两件：
+
+```go
+prewarmDisplayForGUI()  // 先：连上显示服务器并完成 Setup 握手（无争用，0.18ms）
+prefetchBaseFont()      // 后：字体后台加载（1.78ms，与建窗请求/建树/首帧布局并行）
+```
+
+- `gfx/display_prewarm.go`（新）：开关（默认关闭，CLI 边界 `EnableDisplayPrewarm()`）、
+  可选能力接口 `displayPrewarmer`（与 `displayProvider` 同一套纪律：不扩 `Surface`）、
+  以及 `prewarmDisplayForGUI()`（开关关着就是空操作）。
+- `gfx/x11/prewarm.go`（新）：`Prewarm()` 跑完 `xgb.NewConn` 把连接留在包级槽里；
+  `newSurface` 用 `takeWarm()` 优先取它，取不到才自己连。
+- **一次一取**：一个 `xgb.Conn` 上挂着一路事件流（`newSurface` 的读事件 goroutine
+  独占 `WaitForEvent`），两个窗口共用会互相抢事件 —— 那是另一个量级的改动。
+  所以预热只省第一个窗口，第二个窗口照旧自己连。
+- **DISPLAY 变过就丢弃**：`warmDisplay` 记录预热时的值，取用时比对；不一致就关掉
+  旧连接、按老路径重连。否则窗口会开到别的会话里（多会话宿主、测试都会改这个变量）。
+- **失败静默**：连不上（无 DISPLAY / 无 X server / 服务器正在清理上一个连接）返回
+  false，建窗照旧自己连、照旧报错 —— 预热不新增也不吞任何错误路径。
+- **错误路径关连接**：`NewWindowId` / `NewGcontextId` 失败时 `conn.Close()`。此前
+  这两处直接 return，靠进程退出兜底；预热连接是从槽里取出来的，至少不能挂在全局。
+
+#### 12.18.3 A/B 数字
+
+条件：AMD EPYC 9K65 / 32 核可见、**cgroup 配额 4 CPU** / Linux / go1.26.2 /
+Xvfb `:55` 1024×768×24 软渲染 / 330 个字体文件 / 2026-11-19 20:0x–20:3x 北京时间 /
+样本间隔 250ms / 预热各 2 次不计入。base = `3c24271`（本提交的父提交）干净克隆构建
+（`gox version` 无 dirty），new = 本提交构建（commit 元数据齐全）。
+
+| 批次 | base 首帧（中位） | 本批首帧（中位） | 变化 | 逐轮胜负 |
+|---|---|---|---|---|
+| 第 1 批（24 对） | 10.06 ms | **9.24 ms** | **−0.82 ms（−8.2%）** | **22/24** |
+| 第 2 批（24 对） | 9.83 ms | **9.36 ms** | **−0.46 ms（−4.7%）** | **20/24** |
+| 合计 | — | — | −0.46 ~ −0.82 ms | **42/48** |
+
+另有一组**更早的对照**（base = `78433ff`，本批改动动手前的那个提交）也在同一份
+样本文件里：10.13 → 9.52 ms（−5.9%，21/24）与 9.84 → 9.49 ms（−3.6%，22/24）。
+两组放在一起看，量级一致（−0.35 ~ −0.82 ms），**取保守值 −0.4 ms / −4% 对外叙述**。
+
+原始样本（逐轮 µs）、两个二进制的 `version` 输出与 cgroup 配额：
+`bench-results/perf-batch-20261119-202224.json`（四批全在里，`base` 字段标注各自基准）。
+
+同一批测量里，建窗那一段的**段内**对照（插桩版，n=7 中位）：
+
+| 项 | 改前 | 改后 |
+|---|---|---|
+| `newSurface` 的 `xgb.NewConn` | 1688 µs（被字体预取拖慢） | **0.96 µs**（取预热连接，不再发生） |
+| `newSurface` 合计 | 2277 µs | **965 µs** |
+
+口径声明：
+
+- 收益是**顺序收益**，总 CPU 一点没少：握手照样要跑一次，只是不再和字体抢。
+- 本机是 **4 CPU 配额**的容器。真实桌面（多核、无配额）上字体加载与握手本可真正
+  并行，这笔"争用"可能本来就不存在 —— 所以**不把 5.9% 当成桌面端的承诺值**，
+  跨机不可相减。§12.16 的预取收益同理。
+- 数字只在本节条件内可比；对外引用仍需整批重跑 `coldstart.sh` + `perf-numbers.sh`。
+
+#### 12.18.4 闸门（先建闸门再优化）
+
+| 断言 | 守的形态 |
+|---|---|
+| `TestDisplayPrewarmOffByDefault` | 未开启时模块查找与建窗都不去连显示服务器（库不自作主张） |
+| `TestGfxModuleLookupPrewarmsWhenEnabled` | `import gx/gfx` 之后建连必须已发生（起点被挪走就红） |
+| `TestPrewarmHappensBeforeFontPrefetch` | **顺序**：模块入口与 `Mount` 两处都必须是"先连后取" |
+| `TestPrewarmDisplayWithoutCapability` | 后端不认领 / 没有默认后端时返回 false，不 panic |
+| `TestPrewarmConnTakenOnce`（x11） | 预热连接只给一个取用者，重复预热不换连接 |
+| `TestPrewarmConnUsedByCreate`（x11） | 建窗**真的**用预热那份连接（指针相同），建完槽位为空 |
+| `TestPrewarmDropsConnWhenDisplayChanged`（x11） | `DISPLAY` 变过就丢弃旧连接 |
+| `TestPrewarmFailsWithoutServer`（x11） | 连不上返回 false 且不留半成品 |
+
+反向验证（都实际跑过）：
+
+- 把模块入口的 `prewarmDisplayForGUI()` 与 `prefetchBaseFont()` 两行对调 →
+  `TestPrewarmHappensBeforeFontPrefetch` 立刻红（`Mount` 里那处对调同样红）。
+  这一条是本批最重要的闸门：两行对调后**所有功能用例仍然全绿**，只有进程级首帧慢
+  0.35~0.6ms，属于"不小心改回去也发现不了"的形态。
+- 把 `newSurface` 里的 `takeWarm()` 去掉 → `TestPrewarmConnUsedByCreate` 红
+  （建窗又自己连一个）。
+- 把 `Prewarm()` 的 `displayPrewarmOn` 判断移到模块入口（即不判开关）→
+  `TestDisplayPrewarmOffByDefault` 红。
+
+竞态：`go test ./gfx/x11/ -race` 绿；`go test ./gfx/ -run 'TestDisplayPrewarm|TestPrewarm|TestFontPrefetch|TestMountPrefetches|TestPrefetchSingleShot' -race` 绿；
+`go test ./gfx/ -count=1` 全包绿（无 DISPLAY 时 x11 那 4 条自动跳过）。
+
+#### 12.18.5 遗留
+
+- **Windows / macOS 后端没有这个能力**：`cocoa` / `win32` 没实现 `PrewarmDisplay`，
+  `PrewarmDisplay()` 返回 false，行为与本批之前完全一致。要接得按各自平台的
+  "连接/初始化" 成本判断值不值（Cocoa 那边建窗成本里含 NSApplication 初始化，
+  未必能这样拆）。
+- **import 了 `gx/gfx` 但不开窗的脚本会多一条空闲 X 连接**（直到进程退出）。
+  与 §12.16 的"不开窗也付一点后台 CPU"是同一条取舍，写在开关的语义里。
+  长驻的非 GUI 脚本若在意，别开这个开关。
+- **建窗请求段仍有 ~0.6ms**：intern 两个原子（73µs，可并为一次 `InternAtoms`）、
+  键位表（76µs，可做成首次按键时再拉）、RandR `SelectInputChecked().Check()`
+  （89µs，可降为 unchecked）、尾部 `Sync`（163µs，但它是"连接可用"的确认点，
+  不动）。逐个看都只有几十微秒，本批不做，留给下一个想动建窗的人。
+- **争用的机制仍未定位**。本批只证明了"顺序改一下就没了"。
+  如果以后有人能拿到 `strace`/`perf`，值得回头补一段根因 —— 它可能同样影响
+  "字体预取与首帧布局并行"的那部分收益。
