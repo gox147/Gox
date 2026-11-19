@@ -31,6 +31,10 @@ import (
 const version = "0.27.0"
 
 func main() {
+	// 启动窗口的兜底还原: 正常路径在 runFile / startREPL 的终点已经还过,
+	// 这里覆盖 "命令走到一半返回" 的其余分支 (幂等, 见 startup.go)。
+	defer endStartupWindow()
+
 	// 剖面入口: 默认关闭, 只在 GOX_PPROF / GOX_MEMPROFILE 设了才付成本
 	// (见 cmd/gox/pprof.go)。defer 只覆盖"正常返回"这条路径, os.Exit 与
 	// 信号路径由 pprof.go 里的信号处理器兜底。
@@ -353,6 +357,9 @@ func initBundledAssets() {
 
 // runFile 读取并执行 JavaScript 文件。
 func runFile(path string) {
+	// 启动窗口: 从这个进程第一次执行用户代码开始 (终点见 startupGCWindow:
+	// 首帧已上屏之后的一小段, 由窗口自己到点还原)。
+	beginStartupWindow()
 	initBundledAssets()
 	vm, err := vm.EvalFileVM(path)
 	if err != nil {
@@ -388,8 +395,11 @@ func runFile(path string) {
 
 // startREPL 启动交互式 REPL。
 func startREPL() {
+	beginStartupWindow()
 	initBundledAssets()
 	globals := stdlib.SetupGlobals()
+	// 第一条提示符之前就还原: REPL 是长驻会话, 不是启动窗口。
+	endStartupWindow()
 
 	fmt.Println("Gox REPL (ES6 subset)")
 	fmt.Println("Type :exit to quit, :help for help")

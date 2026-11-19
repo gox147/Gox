@@ -2369,3 +2369,177 @@ Xvfb `:55` 1024×768×24 软渲染 / 330 个字体文件 / 2026-11-19 20:0x–20
 - **争用的机制仍未定位**。本批只证明了"顺序改一下就没了"。
   如果以后有人能拿到 `strace`/`perf`，值得回头补一段根因 —— 它可能同样影响
   "字体预取与首帧布局并行"的那部分收益。
+
+### 12.19 T3-5 第十九批：首帧前那一次 GC 把建窗的同步往返拖慢了一倍（2026-11-19 夜批）
+
+#### 12.19.0 先把"那 8ms 到底花在哪"补齐（§12.12.5 遗留的第一条）
+
+§12.12.5 当时写下：14ms 里"约 7~8ms 应该是进程 exec + Go runtime 启动 + 解释器
+初始化 + ES 模块装载，这一段本轮没有单独量过，下一批的第一个动作应该是把它拆开"。
+这句话挂了七个批次，本批先补它。做法是一次性临时插桩（`GOX_TRACE=1` 打
+`time.Now()` 到 stderr，测完即删，未入库），同机 n=13 中位：
+
+| 段 | 本机耗时 | 说明 |
+|---|---|---|
+| exec → `main` 第一行 | **~8.5 ms** | 动态链接 + Go runtime 初始化 + **132 个包的 init**（`GODEBUG=inittrace=1`：init 合计 2.7ms、4.5ms 处收尾） |
+| 读文件 + 编译 33 行脚本 | 0.68 ms | 解析 + 符号解析 + 字节码 |
+| `stdlib.SetupGlobals` | 1.12 ms | 建全局对象树（2102 allocs / 329KB） |
+| 模块解析 + `gx/gfx` 工厂 | 0.10 ms | 含显示预热（§12.18） |
+| **建窗 `x11.newSurface`** | **2.1~3.4 ms** | 见 12.19.1 的拆分 |
+| 首次 Layout（字体） | 1.4~2.2 ms | 预取没赶上时串行等字体 |
+| Fill + Draw | 0.33 ms | |
+| `ShowRegions`（上屏） | 0.95 ms | PutImage 320×200 |
+| 求值返回 → 进程退出 | ~0.8 ms | |
+
+一句话：**首帧的 18ms 里有 8.5ms 在 `main` 之前**，其中约 2.7ms 是包 init、其余是
+exec/链接/runtime —— 那是 T3-6（体积与启动）的话题，不在本批动；本批动的是
+"建窗那 2~3ms 里有 1.6ms 是白等"。
+
+#### 12.19.1 取证：那不是 X 服务器慢，是主 goroutine 被拉去协助 GC 了
+
+同一份二进制、同一棵树，只改环境变量 `GOGC`（n=13 中位，display 预热的 Xvfb）：
+
+| GOGC | 首帧（exec→退出） | 建窗段 | 启动期 GC 次数 |
+|---|---|---|---|
+| 100（默认） | 18.1~18.4 ms | **3.1~3.4 ms** | **1** |
+| 200 | **16.1 ms** | 1.5 ms | **0** |
+| 400 / 800 / off | 16.1~16.3 ms | 1.5 ms | 0 |
+
+`GODEBUG=gctrace=1` 把那次 GC 抓出来了：
+
+```
+gc 1 @0.030s 0%: 0.78+0.69+0.082 ms clock, 25+0.22/1.9/0.31+2.6 ms cpu, 3->4->2 MB, 4 MB goal
+```
+
+注意 `25 ms cpu` 那一项：**协助标记（mark assist）**。它不进 STW，但主 goroutine
+一分配就要替它干活 —— 而建窗那一段恰好是"发请求 + 等 reply"的同步往返
+（intern `WM_PROTOCOLS` / RandR `SelectInputChecked().Check()` / `MapWindow`+`Sync`），
+等的这几百微秒正好被 assist 吃掉。段内实测：
+
+| 建窗阶段（同一份二进制，只改 `GOGC`，n=13 中位） | GOGC=100 | GOGC=200 |
+|---|---|---|
+| intern 两个原子（两个同步往返） | 0.22 ms | 0.23 ms |
+| `GetKeyboardMapping`（同步往返） | 0.24 ms | 0.19 ms |
+| RandR `SelectInputChecked().Check()`（同步往返） | 0.25 ms | 0.22 ms |
+| **`MapWindow` + `Sync`（尾部的确认点）** | **1.00 ms** | **0.47 ms** |
+| 建窗合计 | 2.41 ms | **1.38 ms** |
+
+前三个往返几乎不受影响，被吃掉的是尾部那个 `Sync`：它要等服务器把前面攒下的
+`CreateWindow` / `CreateGC` / `ChangeProperty` / `MapWindow` 全部处理完，等的这段时间
+正好是 assist 最爱插队的地方。这与 §12.18 量到的"字体预取在跑时握手慢 8~10 倍"
+是同一个现象的两个入口 —— 区别是那次是**另一个 goroutine 抢 CPU**，这次是
+**同一次 GC 的 assist 抢主 goroutine**。
+
+结论：**收益全部来自"跳过首帧前的唯一一次 GC"，不是"GC 更快"**。200 就到顶
+（400/800/off 同档），所以本批抬到 200 而不是关掉 GC。
+
+#### 12.19.2 改法：一个"有界"的启动窗口（`internal/startupgc`）
+
+- `startupgc.Boost(window)` 把 `debug.SetGCPercent` 抬到 200；返回的 `Guard`
+  负责还原。四条纪律写在包注释里，其中两条是硬约束：
+  - **用户说了算**：环境里显式设了 `GOGC`（含 `GOGC=off`）就一次都不碰；
+  - **不许关 GC**：别处已把 GC 关掉（`prev<0`）时立刻还回去，不替别人"重新打开"。
+- 还原点：**首帧之后 + 100ms**，另有 **64MB 活堆上限**（`runtime/metrics` 读，
+  无 STW，5ms 一次）与 `main` 的 `defer` 兜底。三条独立触发，谁先到谁还原。
+- 接线（`cmd/gox/startup.go`）：起点是 `runFile`（"这台进程要执行用户代码"），
+  不是 `main` 第一行 —— `gox version` / `gox help` 一次 JS 都不跑，抬了只会让它们
+  在退出时白发一次 GC。REPL 是长驻会话，进循环前显式还原。
+- **为什么不"求值返回即还原"**（最直觉的写法，实测过）：`SetGCPercent` 降目标会
+  立刻安排一轮 GC，它就落在"首帧已上屏 → 探测轮询打印 FIRST_FRAME"之间 ——
+  用户看见了窗口，但**首帧口径把它算进去**，优化在数字上完全消失（实测
+  exec→present 8.25 → 6.45，exec→退出 17.35 → 17.25，即归零）。既然它对用户
+  没有任何额外好处（事件循环正要开始处理输入），就把还原点移到窗口之后的一小段。
+
+#### 12.19.3 A/B 数字（同机、交错采样、每样本间隔 250ms、预热各 3 次不计入）
+
+条件：Intel Xeon 6981E-C / 32 核 / Linux 6.6.117 / go1.26.2 / Xvfb `:92`
+1024×768×24 软渲染 / 330 个字体文件 / 2026-11-19 22:1x 北京时间。
+base = `778392a` **干净克隆**构建（`gox version` 无 dirty），new = 本批工作树构建
+（`778392a` + dirty）。
+
+| 口径 | base 中位 | new 中位 | 变化（配对差中位） | 逐轮胜负 |
+|---|---|---|---|---|
+| **exec → 进程退出**（对外口径，n=24 对） | 17.35 ms | **16.42 ms** | **−1.16 ms（−6.7%）** | **23/24** |
+| exec → 首帧上屏（进程内打点，n=20 对） | 8.25 ms | **6.46 ms** | **−1.85 ms（−22.4%）** | **20/20** |
+| 其中：建窗段 | 3.08 ms | **1.50 ms** | −1.58 ms（−51%） | — |
+| 其中：首次 Layout | 1.45 ms | 1.42 ms | 噪声带内 | — |
+
+同一晚稍早的另一次独立采样（base 用另一份构建，n=24 对）：18.49 → 16.21 ms
+（−2.28 ms，23/24）。两次合起来看，**对外口径 −0.9 ~ −2.3 ms（−5 ~ −12%）**，
+取保守值 **−1 ms / −6%** 对外叙述。
+
+峰值 RSS（`/usr/bin/time -v`，单次）：22.8MB → 20.9MB（同档；理论上限是窗口期
+活堆的 1 倍，本机活堆 3~5MB）。
+
+口径声明：
+
+- **延迟收益，不是吞吐收益**。总 CPU 一点没少：那轮 GC 照样要跑（25ms assist CPU），
+  只是挪到 100ms 之后 —— 那时用户已经在看窗口，不在等启动。
+- 抬到 200 之后**长驻进程的稳态仍然是 100%**（还原发生在 100ms / 64MB / 显式调用
+  三者之先到者），所以这不是"用内存换速度"的全局设置。
+- **慢机上收益会打折甚至归零**：首帧 >100ms 时，窗口在还原之后才结束，那轮 GC
+  又落回启动里（行为与本批之前一致，不倒退）。单核机器同理。
+- 数字只在本节条件下可比，跨机不可相减；对外引用仍需整批重跑
+  `coldstart.sh` + `perf-numbers.sh`。
+
+原始样本（逐对 base/new、段内耗时、两个二进制的 `version` 输出）：
+`bench-results/perf-batch-20261119-141900.json`（另一次采样见
+`perf-batch-20261119-141758.json`）。
+
+#### 12.19.4 闸门（先建闸门再优化）
+
+`internal/startupgc`（8 条，全部不依赖毫秒）：
+
+| 断言 | 守的形态 |
+|---|---|
+| `TestBoostRaisesPercent` | 抬了就是 200 |
+| `TestRestorePutsBackPreviousValue` / `TestRestoreHonoursNonDefaultPrevious` | 还的是 **Boost 前的原值**，不是写死的 100 |
+| `TestBoostSkippedWhenGOGCEnvSet` | `GOGC=50/off/100` 三种都不许碰 |
+| `TestRestoreIdempotentAndNilSafe` | 多次还原只写一次；nil Guard 不 panic |
+| `TestDoubleBoostDoesNotStack` | 第二个 Guard 不许关掉第一个的窗口 |
+| `TestDeadlineRestores` / `TestHeapGuardRestores` | 到点、堆上限两条兜底各自能收手 |
+| `TestBoostLeavesDisabledGCAlone` | `prev<0` 时不许"帮人打开"GC |
+
+`cmd/gox`（3 条）：
+
+| 断言 | 守的形态 |
+|---|---|
+| `TestRunFileOpensStartupWindow` | ①`runFile` 自己开窗口；②**求值返回时不许关**（关了收益就归零）；③3s 内必须自己关掉 |
+| `TestStartupWindowHonoursUserGOGC` | 设了 `GOGC` 就不抬 |
+| `TestBeginStartupWindowIsReentrant` | 两次 begin 一次 end 之后窗口必须真关 —— 守"句柄被覆盖" |
+
+反向验证（都实际跑过，逐条红）：
+
+- 删 `runFile` 里的 `beginStartupWindow()` → ①红（"没有打开启动窗口"）；
+- 在求值之后加一句 `endStartupWindow()` → ②红（"求值返回时窗口就关了"）；
+- 删 `startup.go` 里的 `Active()` 重入判断 → ③红（"句柄被覆盖了"）；
+- 删 `startupgc` 里的 `GOGC` 判断 → 包内 `TestBoostSkippedWhenGOGCEnvSet` 与
+  `TestStartupWindowHonoursUserGOGC` 同时红。
+
+竞态：`go test ./internal/startupgc/ ./cmd/gox/ -race` 绿。`go test ./gfx/`（417s 全包）
+绿，`go vet ./cmd/... ./internal/...` 绿，五平台构建由 CI 覆盖。
+
+#### 12.19.5 本轮试过并撤回的（留痕）
+
+| 尝试 | 实测 | 处置 |
+|---|---|---|
+| 求值返回即还原（语义最直觉） | exec→present 8.25→6.45，exec→退出 17.35→17.25（**归零**） | 撤回，改 100ms 窗口 |
+| `GOGC=off`（完全关 GC） | 与 200 同档（16.1~16.3ms） | 不采用：没有额外收益，却把"最坏情况堆上浮"从 3× 拉到不限 |
+| `ReadMemStats` 做堆上限 | 每次 STW，5ms 一轮会在 100ms 内制造 20 次停顿 | 换 `runtime/metrics`（无 STW） |
+
+#### 12.19.6 遗留
+
+- **`main` 之前的 8.5ms 仍未动**（exec + 链接 + 132 个包 init 2.7ms）。本批把它
+  量清楚了：`object` init 0.34ms、`gfx` 0.20ms、esbuild `compat` 0.17ms、
+  `regexp2/syntax` 0.10ms —— 前十名加起来 1.4ms，没有单点大头，属 T3-6
+  （`-ldflags -s -w` / 裁剪链接）的射程。
+- **`stdlib.SetupGlobals` 1.12ms** 仍是解释器初始化的全部：剖析显示是"大量小对象
+  的属性写入"（`DefineOwnProperty` / `appendKey` / `SetBuiltinProperty`），
+  没有单点热点，惰性化要动全局对象语义（`Object.prototype.toString` 等在任意时刻
+  都可能碰到任意全局），风险与本轮收益不成比例 —— 记在这里，等有人要做"按需建全局"。
+- **Windows / macOS 未实测**：机制与平台无关（纯 Go 的 GC 目标），但"首帧前是否
+  也有这一次 GC"取决于各自的分配量；三平台 CI 只跑功能闸门。
+- **首帧口径的停止计时仍在"进程退出"**（§12.17.4 第四条）。本批的收益之所以能在
+  对外口径上看见，是因为那轮 GC 被挪出了进程寿命；更干净的做法是让 harness 边读
+  stdout 边给 `FIRST_FRAME` 打时间戳（coprocess），但那**不会**让"求值返回即还原"
+  那一版重新变得可见 —— 它已经实测过是归零的。
