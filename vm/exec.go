@@ -1692,8 +1692,20 @@ func (vm *VM) runFrom(startFrameIdx int) error {
 		case bytecode.OP_GET_INDEX:
 			index := vm.stack.Pop()
 			obj := vm.stack.Pop()
-			// Proxy: 转发到 get trap (键转为字符串)
+			// Proxy: 转发到 get trap。Symbol 键以原值传给 trap
+			// (property key 语义; 字符串化会破坏 trap 内的键同一性)。
 			if proxy, ok := obj.(*object.Proxy); ok {
+				if sym, isSym := index.(*object.Symbol); isSym {
+					val, err := vm.proxyGetSymbol(proxy, sym, obj)
+					if err != nil {
+						if terr := vm.rethrowBridgeError(err); terr != nil {
+							return terr
+						}
+						continue
+					}
+					vm.stack.Push(val)
+					continue
+				}
 				key := toJSString(index)
 				val, err := vm.proxyGet(proxy, key, obj)
 				if err != nil {
@@ -1736,8 +1748,18 @@ func (vm *VM) runFrom(startFrameIdx int) error {
 			val := vm.stack.Pop()
 			index := vm.stack.Pop()
 			obj := vm.stack.Pop()
-			// Proxy: 转发到 set trap
+			// Proxy: 转发到 set trap。Symbol 键以原值传给 trap。
 			if proxy, ok := obj.(*object.Proxy); ok {
+				if sym, isSym := index.(*object.Symbol); isSym {
+					if err := vm.proxySetSymbol(proxy, sym, val, obj); err != nil {
+						if terr := vm.rethrowBridgeError(err); terr != nil {
+							return terr
+						}
+						continue
+					}
+					vm.stack.Push(val)
+					continue
+				}
 				if err := vm.proxySet(proxy, toJSString(index), val, obj); err != nil {
 					if terr := vm.rethrowBridgeError(err); terr != nil {
 						return terr
@@ -2764,10 +2786,9 @@ func (vm *VM) runFrom(startFrameIdx int) error {
 					}
 					vm.stack.Push(object.NewBoolean(deleted))
 				} else if sym, ok := key.(*object.Symbol); ok {
-					// deleteProperty trap 收到的 key 一律 String 化? 规范传
-					// 原始 Property Key (Symbol 也原样传)。Symbol 键的 trap
-					// 分发与字符串一致。
-					deleted, err := vm.proxyDelete(p, sym.Inspect())
+					// 规范 [[Delete]] 的键是原始 Property Key —— Symbol 原样
+					// 传给 deleteProperty trap (T5 r8dXes)。
+					deleted, err := vm.proxyDeleteSymbol(p, sym)
 					if err != nil {
 						if terr := vm.rethrowBridgeError(err); terr != nil {
 							return terr

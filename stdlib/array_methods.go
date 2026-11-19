@@ -1012,8 +1012,18 @@ func setupArrayProto() *object.Object {
 		return specSort(l, compareFn)
 	}))
 
-	// toString(): 数组转字符串 (等价于无参 join)
+	// toString(): 数组转字符串 (等价于无参 join)。
+	// 注意: %TypedArray%.prototype.toString 与本方法是**同一函数对象**
+	// (规范 22.2.3.28, B8 rm4Zcc 换用后) —— TA 接收者必须先委托
+	// ValidateTypedArray 语义的 join, 分离/越界抛 TypeError
+	// (TypedArray/prototype/toString/detached-buffer 族); 走下面
+	// asArrayLike 的普通路径会把分离数组读成全 undefined 不抛。
 	p.SetBuiltinProperty("toString", object.NewBuiltinMethod("toString", func(this object.Value, args ...object.Value) object.Value {
+		if ta, ok := this.(*object.TypedArray); ok {
+			if v, found := object.CallTypedArrayMethod(ta, "join", args); found {
+				return v
+			}
+		}
 		l, errVal := asArrayLike("toString", this)
 		if errVal != nil {
 			return errVal
@@ -1340,8 +1350,9 @@ func isConcatSpreadable(v object.Value) (bool, object.Value) {
 			return sv.IsTruthy(), nil
 		}
 	}
-	_, isArr := v.(*object.Array)
-	return isArr, nil
+	// 缺省 IsArray: Proxy 透过 target 判定, revoked proxy 抛 TypeError
+	// (Array/prototype/concat/create-revoked-proxy.js, T5 r8dXes)。
+	return isArrayValueOrThrow(v)
 }
 
 // isConstructorValue 判断值是否为构造器 (规范的 IsConstructor)。
@@ -1445,7 +1456,12 @@ func arraySpeciesCreate(l *arrayLike, length int64) (object.Value, object.Value)
 	// 规范的 IsArray(O): Proxy 透过 target 判定 —— 仅凭 l.arr != nil
 	// 会把 "Proxy 包数组" 的接收者误判为非数组, 跳过 species 查找
 	// (create-proxy / is-concat-spreadable-proxy 族)。
-	if !isArrayValue(l.obj) {
+	// revoked proxy 必须在此抛 TypeError (create-revoked-proxy 族:
+	// splice/slice/filter/map/concat 的 ArraySpeciesCreate 步骤, T5 r8dXes);
+	// 此前 isArrayValue 把 revoked 静默当非数组吞掉。
+	if isArray, iaErr := isArrayValueOrThrow(l.obj); iaErr != nil {
+		return nil, iaErr
+	} else if !isArray {
 		return mk(), nil
 	}
 	c, _ := l.obj.GetProperty("constructor")
@@ -1867,6 +1883,12 @@ type arrayLike struct {
 func asArrayLike(method string, this object.Value) (*arrayLike, object.Value) {
 	if this == nil || isUndefinedValue(this) || isNullValue(this) {
 		return nil, thisTypeError("Array", method, this)
+	}
+	// revoked proxy: LengthOfArrayLike 的 [[Get]] 中止 → TypeError。
+	// 此前静默解析为 length=0, create-revoked-proxy 族
+	// (splice/slice/filter/map) 不抛 (T5 r8dXes)。
+	if p, ok := this.(*object.Proxy); ok && p.IsRevoked {
+		return nil, object.NewTypeError("Cannot perform 'get' on a proxy that has been revoked")
 	}
 	if arr, ok := this.(*object.Array); ok {
 		return &arrayLike{obj: arr, arr: arr, n: int64(len(arr.Elements))}, nil

@@ -150,10 +150,12 @@ func TypeOf(v Value) string {
 		return "object"
 	}
 	// callable proxy (target 可调用) typeof 为 "function" (ProxyCreate 给
-	// target 可调用的 proxy 装 [[Call]]); revoked proxy 两个内部方法都
-	// 没有, 回落 "object" (revocable/target-is-revoked-function-proxy 族)。
+	// target 可调用的 proxy 装 [[Call]])。revoked **不移除**该内部方法
+	// (revoke 只置空 [[ProxyTarget]]/[[ProxyHandler]]) —— typeof 恒为
+	// "function", 调用时经 revoked 校验抛 TypeError (T5 r8dXes:
+	// revocable/target-is-revoked-function-proxy 断言 "function")。
 	if p, ok := v.(*Proxy); ok {
-		if !p.IsRevoked && p.Target != nil && IsCallable(p.Target) {
+		if p.WasCallable || (!p.IsRevoked && p.Target != nil && IsCallable(p.Target)) {
 			return "function"
 		}
 		return "object"

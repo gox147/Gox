@@ -79,6 +79,94 @@ func (vm *VM) proxyGet(proxy *object.Proxy, key string, receiver object.Value) (
 	return res, nil
 }
 
+// proxyGetSymbol 处理对代理的 **Symbol 键**属性读取。
+// 规范 [[Get]] 的键是 property key —— Symbol 必须以原值传给 get trap,
+// 不能 Inspect 字符串化 (否则 trap 内 `key === s` 永远 false,
+// trap-is-null-target-is-proxy / get-with-symbol 族, T5 r8dXes)。
+func (vm *VM) proxyGetSymbol(proxy *object.Proxy, sym *object.Symbol, receiver object.Value) (object.Value, error) {
+	res, handled, err := vm.proxyTrap(proxy, "get", []object.Value{proxy.Target, sym, receiver})
+	if err != nil {
+		return nil, err
+	}
+	if !handled {
+		// 无 trap: 转发到 target (target 是 proxy 时递归走其 get trap)
+		if tp, ok := proxy.Target.(*object.Proxy); ok {
+			return vm.proxyGetSymbol(tp, sym, receiver)
+		}
+		desc, found := object.LookupSymbolPropertyDescriptorChain(proxy.Target, sym)
+		if !found || desc.Value == nil {
+			return object.UndefinedSingleton, nil
+		}
+		if acc, isAcc := desc.Value.(*object.Accessor); isAcc {
+			if acc.Getter != nil && object.IsCallable(acc.Getter) {
+				return object.CallFunction(acc.Getter, receiver), nil
+			}
+			return object.UndefinedSingleton, nil
+		}
+		return desc.Value, nil
+	}
+	if res == nil {
+		return object.UndefinedSingleton, nil
+	}
+	return res, nil
+}
+
+// proxyHasSymbol 处理对代理的 Symbol 键 `in` 检查 (has trap, 键传原值)。
+func (vm *VM) proxyHasSymbol(proxy *object.Proxy, sym *object.Symbol) (bool, error) {
+	res, handled, err := vm.proxyTrap(proxy, "has", []object.Value{proxy.Target, sym})
+	if err != nil {
+		return false, err
+	}
+	if !handled {
+		if tp, ok := proxy.Target.(*object.Proxy); ok {
+			return vm.proxyHasSymbol(tp, sym)
+		}
+		if proxy.Target == nil {
+			return false, nil
+		}
+		_, found := object.LookupSymbolPropertyDescriptorChain(proxy.Target, sym)
+		return found, nil
+	}
+	return object.IsTruthyValue(res), nil
+}
+
+// proxySetSymbol 处理对代理的 Symbol 键属性写入 (set trap, 键传原值)。
+func (vm *VM) proxySetSymbol(proxy *object.Proxy, sym *object.Symbol, val, receiver object.Value) error {
+	res, handled, err := vm.proxyTrap(proxy, "set", []object.Value{proxy.Target, sym, val, receiver})
+	if err != nil {
+		return err
+	}
+	if !handled {
+		if tp, ok := proxy.Target.(*object.Proxy); ok {
+			return vm.proxySetSymbol(tp, sym, val, receiver)
+		}
+		if o, ok := proxy.Target.(*object.Object); ok {
+			o.SetSymbolProperty(sym, val)
+		}
+		return nil
+	}
+	_ = res
+	return nil
+}
+
+// proxyDeleteSymbol 处理对代理的 Symbol 键 delete (deleteProperty trap, 键传原值)。
+func (vm *VM) proxyDeleteSymbol(proxy *object.Proxy, sym *object.Symbol) (bool, error) {
+	res, handled, err := vm.proxyTrap(proxy, "deleteProperty", []object.Value{proxy.Target, sym})
+	if err != nil {
+		return false, err
+	}
+	if !handled {
+		if tp, ok := proxy.Target.(*object.Proxy); ok {
+			return vm.proxyDeleteSymbol(tp, sym)
+		}
+		if o, ok := proxy.Target.(*object.Object); ok {
+			return o.DeleteSymbolProperty(sym), nil
+		}
+		return true, nil
+	}
+	return object.IsTruthyValue(res), nil
+}
+
 // proxyForwardSet 无 set trap 时对 target 转发 [[Set]]。
 func (vm *VM) proxyForwardSet(target object.Value, key string, val, receiver object.Value) error {
 	if tp, ok := target.(*object.Proxy); ok {

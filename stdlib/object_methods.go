@@ -281,6 +281,23 @@ func setupObjectGlobal() *object.BuiltinFunction {
 		if len(args) == 0 {
 			return object.NullSingleton
 		}
+		// 规范 19.1.2.9 step 2-3: RequireObjectCoercible + ToObject —— 原始值
+		// 装箱后取其 [[Prototype]]; null/undefined 抛 TypeError
+		// (15.2.3.2-0-3 / 15.2.3.2-1 / 15.2.3.2-1-2 / 15.2.3.2-1-3, B8 rm4Zcc)。
+		switch args[0].(type) {
+		case *object.Null, *object.Undefined:
+			return object.NewTypeError("Object.getPrototypeOf: called on null or undefined")
+		case *object.Number:
+			return object.NumberProto
+		case *object.String:
+			return object.StringProto
+		case *object.Boolean:
+			return object.GetBooleanProto()
+		case *object.Symbol:
+			return object.GetSymbolProto()
+		case *object.BigInt:
+			return object.GetBigIntProto()
+		}
 		// proxy: getPrototypeOf trap 分发 (T5); 结果必须是对象或 null
 		if res, handled, errVal := proxyTrapDispatch(args[0], "getPrototypeOf"); errVal != nil {
 			return errVal
@@ -317,6 +334,14 @@ func setupObjectGlobal() *object.BuiltinFunction {
 		if obj, ok := args[0].(*object.Object); ok {
 			if obj.Proto != nil {
 				return obj.Proto
+			}
+			return object.NullSingleton
+		}
+		// Error 实例 (*object.Error 无 Proto 字段): [[Prototype]] =
+		// %Error.prototype% (15.2.3.2-2-27, B8 rm4Zcc)。
+		if _, isErr := args[0].(*object.Error); isErr {
+			if stdlibErrorProto != nil {
+				return stdlibErrorProto
 			}
 			return object.NullSingleton
 		}
@@ -1665,6 +1690,19 @@ func setupErrorTypes(env *runtime.Environment) {
 			np.SetBuiltinProperty("toString", tv)
 		}
 		attachPrototype(env, n, np)
+		// 规范 19.5.6.2: NativeError 构造器自身的 [[Prototype]] 是 %Error%
+		// (不是 %Function.prototype%)。此前回落默认 Function.prototype,
+		// NativeErrors/*/proto.js 与 15.2.3.2-2-12..17 一族直接断言
+		// Object.getPrototypeOf(TypeError) === Error, 全数失败 (B8 rm4Zcc)。
+		if errCtor, ok := env.Get("Error"); ok {
+			if eb, isB := errCtor.(*object.BuiltinFunction); isB {
+				if cv, ok2 := env.Get(n); ok2 {
+					if cb, isB2 := cv.(*object.BuiltinFunction); isB2 {
+						cb.FuncPrototype = eb
+					}
+				}
+			}
+		}
 	}
 }
 
@@ -1704,8 +1742,17 @@ func newParseFloatBuiltin() *object.BuiltinFunction {
 
 // setupNumberFunctions 设置全局数字相关函数。
 func setupNumberFunctions(env *runtime.Environment) {
-	env.Declare("parseInt", newParseIntBuiltin(), false)
-	env.Declare("parseFloat", newParseFloatBuiltin(), false)
+	// 规范 sec-number.parseint/parsefloat: Number.parseInt / Number.parseFloat
+	// 与全局 parseInt / parseFloat 是**同一函数对象**。此前两处各自 new,
+	// Number/parseInt.js 与 Number/parseFloat.js 断言 === 失败 (B8 rm4Zcc)。
+	globalParseInt := newParseIntBuiltin()
+	globalParseFloat := newParseFloatBuiltin()
+	env.Declare("parseInt", globalParseInt, false)
+	env.Declare("parseFloat", globalParseFloat, false)
+	if nv, ok := env.Get("Number"); ok {
+		nv.SetProperty("parseInt", globalParseInt)
+		nv.SetProperty("parseFloat", globalParseFloat)
+	}
 
 	env.Declare("isNaN", object.NewBuiltin("isNaN", func(args ...object.Value) object.Value {
 		if len(args) == 0 {
@@ -1853,8 +1900,8 @@ func setupGlobalFunctions(env *runtime.Environment) {
 		}
 		return object.NewBoolean(math.IsNaN(num.Value))
 	}))
-	numFn.SetProperty("parseFloat", newParseFloatBuiltin())
-	numFn.SetProperty("parseInt", newParseIntBuiltin())
+	// Number.parseInt / Number.parseFloat: 由 setupNumberFunctions 用与全局
+	// 同一函数对象补挂 (规范要求同一性, 见该函数 B8 rm4Zcc 注释)。
 	env.Declare("Number", numFn, false)
 
 	// ===== Boolean() 构造器 =====

@@ -292,6 +292,14 @@ func setupReflectProxy(env *runtime.Environment) {
 			return object.NullSingleton
 		}
 		target := args[0]
+		// 规范 26.1.8 step 2: ? RequireObjectCoercible; step 3: 若 Type(target)
+		// 非 Object 抛 TypeError —— Reflect 不做 ToObject (与 Object.getPrototypeOf
+		// 的分野; target-is-not-object-throws / target-is-symbol-throws, B8 rm4Zcc)。
+		switch target.(type) {
+		case *object.Null, *object.Undefined, *object.Number, *object.String,
+			*object.Boolean, *object.Symbol, *object.BigInt:
+			return object.NewTypeError("Reflect.getPrototypeOf: target must be an object")
+		}
 		// proxy: getPrototypeOf trap 分发; 结果必须是对象或 null
 		if res, handled, errVal := reflectProxyTrap(target, "getPrototypeOf"); errVal != nil {
 			return errVal

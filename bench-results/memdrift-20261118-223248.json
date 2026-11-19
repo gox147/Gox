@@ -1,0 +1,236 @@
+{
+  "generated_at": "2026-11-18T22:32:48Z",
+  "benchmark": "memdrift",
+  "command": "go test ./tools/memdrift/ -run TestRSSDrift -v",
+  "platform": {
+    "cpus": 32,
+    "go": "go1.26.2",
+    "gogc": "",
+    "os": "linux/amd64"
+  },
+  "params": {
+    "elapsed_s": 121.593356668,
+    "frames_per_cycle": 6,
+    "iters": 7500,
+    "ms_per_cycle": 16,
+    "rendered_frames": 45000,
+    "rows": 200,
+    "sample_every": 250,
+    "updates_per_frame": 4,
+    "warmup": 2250
+  },
+  "steady": {
+    "alloc_mb_per_s": 215.73,
+    "first_cycle": 2500,
+    "heap_first_kb": 5903.88,
+    "heap_growth_kb": 4.49,
+    "heap_last_kb": 5908.38,
+    "heap_slope_kb_per_min": 5.44,
+    "last_cycle": 7500,
+    "rss_first_kb": 37620,
+    "rss_growth_kb": 840,
+    "rss_last_kb": 38460,
+    "rss_slope_kb_per_min": 194.1
+  },
+  "verdict": {
+    "heap_ok": true,
+    "max_heap_growth_kb": 2048,
+    "max_rss_growth_kb": 16384,
+    "pass": true,
+    "rss_ok": true
+  },
+  "metric_defs": {
+    "*_slope_kb_per_min": "稳态段对 (cycle, 值) 做最小二乘，再按每轮耗时换算成每分钟",
+    "heap_growth_kb": "稳态段末次采样的 HeapAlloc 减首次；每次采样前强制 runtime.GC，只算 GC 后活对象",
+    "rss_growth_kb": "同上，取 /proc/self/status 的 VmRSS（进程实际占用，含未归还 OS 的堆页）",
+    "steady": "预热段（默认前 30% 轮次）之后；启动期一次性增长不计入"
+  },
+  "samples": [
+    {
+      "cycle": 0,
+      "rss_kb": 22100,
+      "heap_alloc_kb": 3617.4921875,
+      "total_alloc_kb": 4554.4765625
+    },
+    {
+      "cycle": 250,
+      "rss_kb": 35956,
+      "heap_alloc_kb": 5880.203125,
+      "total_alloc_kb": 899683.875
+    },
+    {
+      "cycle": 500,
+      "rss_kb": 36276,
+      "heap_alloc_kb": 5875.7265625,
+      "total_alloc_kb": 1794764.3046875
+    },
+    {
+      "cycle": 750,
+      "rss_kb": 38136,
+      "heap_alloc_kb": 5876.5546875,
+      "total_alloc_kb": 2689827.1328125
+    },
+    {
+      "cycle": 1000,
+      "rss_kb": 38868,
+      "heap_alloc_kb": 5889.1796875,
+      "total_alloc_kb": 3584889.25
+    },
+    {
+      "cycle": 1250,
+      "rss_kb": 35876,
+      "heap_alloc_kb": 5884.59375,
+      "total_alloc_kb": 4480334.0390625
+    },
+    {
+      "cycle": 1500,
+      "rss_kb": 37332,
+      "heap_alloc_kb": 5890.2890625,
+      "total_alloc_kb": 5375750.046875
+    },
+    {
+      "cycle": 1750,
+      "rss_kb": 36748,
+      "heap_alloc_kb": 5885.90625,
+      "total_alloc_kb": 6271170.828125
+    },
+    {
+      "cycle": 2000,
+      "rss_kb": 36948,
+      "heap_alloc_kb": 5891.5390625,
+      "total_alloc_kb": 7166598.6328125
+    },
+    {
+      "cycle": 2250,
+      "rss_kb": 39360,
+      "heap_alloc_kb": 5898.015625,
+      "total_alloc_kb": 8062033.1796875
+    },
+    {
+      "cycle": 2500,
+      "rss_kb": 37620,
+      "heap_alloc_kb": 5903.8828125,
+      "total_alloc_kb": 8957458.1328125
+    },
+    {
+      "cycle": 2750,
+      "rss_kb": 38440,
+      "heap_alloc_kb": 5904.6796875,
+      "total_alloc_kb": 9852877.875
+    },
+    {
+      "cycle": 3000,
+      "rss_kb": 39532,
+      "heap_alloc_kb": 5905.4140625,
+      "total_alloc_kb": 10748308.34375
+    },
+    {
+      "cycle": 3250,
+      "rss_kb": 37068,
+      "heap_alloc_kb": 5900.71875,
+      "total_alloc_kb": 11643727.9609375
+    },
+    {
+      "cycle": 3500,
+      "rss_kb": 37544,
+      "heap_alloc_kb": 5906.3984375,
+      "total_alloc_kb": 12539140.1171875
+    },
+    {
+      "cycle": 3750,
+      "rss_kb": 37716,
+      "heap_alloc_kb": 5902.828125,
+      "total_alloc_kb": 13434546.6484375
+    },
+    {
+      "cycle": 4000,
+      "rss_kb": 38368,
+      "heap_alloc_kb": 5903.453125,
+      "total_alloc_kb": 14329963.8359375
+    },
+    {
+      "cycle": 4250,
+      "rss_kb": 39260,
+      "heap_alloc_kb": 5905.515625,
+      "total_alloc_kb": 15225386.7265625
+    },
+    {
+      "cycle": 4500,
+      "rss_kb": 37320,
+      "heap_alloc_kb": 5911.1953125,
+      "total_alloc_kb": 16120807.421875
+    },
+    {
+      "cycle": 4750,
+      "rss_kb": 38732,
+      "heap_alloc_kb": 5907.515625,
+      "total_alloc_kb": 17016232.265625
+    },
+    {
+      "cycle": 5000,
+      "rss_kb": 37228,
+      "heap_alloc_kb": 5908.390625,
+      "total_alloc_kb": 17911653.1875
+    },
+    {
+      "cycle": 5250,
+      "rss_kb": 38284,
+      "heap_alloc_kb": 5913.7109375,
+      "total_alloc_kb": 18807062.671875
+    },
+    {
+      "cycle": 5500,
+      "rss_kb": 37192,
+      "heap_alloc_kb": 5914.6015625,
+      "total_alloc_kb": 19702467.6015625
+    },
+    {
+      "cycle": 5750,
+      "rss_kb": 37012,
+      "heap_alloc_kb": 5914.9296875,
+      "total_alloc_kb": 20597881.984375
+    },
+    {
+      "cycle": 6000,
+      "rss_kb": 37116,
+      "heap_alloc_kb": 5908.6640625,
+      "total_alloc_kb": 21493288.8515625
+    },
+    {
+      "cycle": 6250,
+      "rss_kb": 39660,
+      "heap_alloc_kb": 5909.5546875,
+      "total_alloc_kb": 22388686.9453125
+    },
+    {
+      "cycle": 6500,
+      "rss_kb": 38248,
+      "heap_alloc_kb": 5905.21875,
+      "total_alloc_kb": 23284104.1015625
+    },
+    {
+      "cycle": 6750,
+      "rss_kb": 37060,
+      "heap_alloc_kb": 5910.8828125,
+      "total_alloc_kb": 24179517.7109375
+    },
+    {
+      "cycle": 7000,
+      "rss_kb": 39052,
+      "heap_alloc_kb": 5906.40625,
+      "total_alloc_kb": 25074923.0078125
+    },
+    {
+      "cycle": 7250,
+      "rss_kb": 38896,
+      "heap_alloc_kb": 5912.5078125,
+      "total_alloc_kb": 25970336.53125
+    },
+    {
+      "cycle": 7500,
+      "rss_kb": 38460,
+      "heap_alloc_kb": 5908.375,
+      "total_alloc_kb": 26865761.328125
+    }
+  ]
+}

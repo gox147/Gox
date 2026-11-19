@@ -117,6 +117,12 @@ func IsConstructor(v Value) bool {
 		// BuiltinMethod 无 NotConstructable 标记: 原型方法无 [[Construct]]。
 		return false
 	case *Proxy:
+		// revoked 不移除 [[Construct]] (ProxyCreate 只在 target 可构造时
+		// 才装 [[Construct]], 快照不变) —— new 时经 revoked 校验抛 TypeError
+		// (Function/internals/Construct/base-ctor-revoked-proxy, T5 r8dXes)。
+		if f.WasConstructor {
+			return true
+		}
 		if f.IsRevoked || f.Target == nil {
 			return false
 		}
@@ -132,6 +138,11 @@ func IsCallable(v Value) bool {
 	case *Closure, *BuiltinFunction, *BuiltinMethod:
 		return true
 	case *Proxy:
+		// revoked 不移除 [[Call]] (ProxyCreate 装上的内部方法) —— typeof
+		// 恒为 "function", 调用时经 revoked 校验抛 TypeError (T5 r8dXes)。
+		if f.WasCallable {
+			return true
+		}
 		if f.IsRevoked || f.Target == nil {
 			return false
 		}

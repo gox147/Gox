@@ -11,9 +11,15 @@ import (
 func (vm *VM) inOperator(obj, key object.Value) object.Value {
 	k := propKey(key)
 
-	// Proxy: 走 has trap
+	// Proxy: 走 has trap。Symbol 键以原值传给 trap (T5 r8dXes)。
 	if p, ok := obj.(*object.Proxy); ok {
-		found, err := vm.proxyHas(p, k)
+		var found bool
+		var err error
+		if sym, isSym := key.(*object.Symbol); isSym {
+			found, err = vm.proxyHasSymbol(p, sym)
+		} else {
+			found, err = vm.proxyHas(p, k)
+		}
 		if err != nil {
 			// trap 内异常 / trap 不可调用的 TypeError 原样上抛
 			// (此前吞成 false, trap-is-not-callable 族漏抛)。
@@ -46,6 +52,42 @@ func (vm *VM) inOperator(obj, key object.Value) object.Value {
 	// 自有 + 原型链。此前掉进 GetProperty, 越界数字键恒 true。
 	if ta, ok := obj.(*object.TypedArray); ok {
 		return object.NewBoolean(ta.HasProperty(k))
+	}
+
+	// 规范 OrdinaryHasProperty: 先查自有属性 (不调 getter), 未命中沿原型链
+	// 逐层调 [[HasProperty]] —— 原型链上的 Proxy 必须走其 has trap, 而不是
+	// 用 Get 的结果判定 ("foo" in Object.create(proxy) 族,
+	// trap-is-null-target-is-proxy / has-parent-hasproperty, T5 r8dXes)。
+	if o, ok := obj.(*object.Object); ok {
+		for cur := o; cur != nil; {
+			if _, own := cur.Properties[k]; own {
+				return object.TrueSingleton
+			}
+			p := cur.Proto
+			if p == nil {
+				return object.FalseSingleton
+			}
+			if pp, isProxy := p.(*object.Proxy); isProxy {
+				found, err := vm.proxyHas(pp, k)
+				if err != nil {
+					if te, ok2 := err.(*ThrowError); ok2 {
+						return te.Value
+					}
+					if v := vm.throwJSErrorValue(err); v != nil {
+						return v
+					}
+					return object.NewBoolean(false)
+				}
+				return object.NewBoolean(found)
+			}
+			if po, isObj := p.(*object.Object); isObj {
+				cur = po
+				continue
+			}
+			// 其它内建原型 (TypedArray/Date/Map...): GetProperty 兜底。
+			_, found := p.GetProperty(k)
+			return object.NewBoolean(found)
+		}
 	}
 
 	_, found := obj.GetProperty(k)
@@ -481,7 +523,7 @@ func (vm *VM) getSymbolIndexedValue(receiver object.Value, sym *object.Symbol) o
 	// Proxy 接收者: SymbolProperties 不在代理上, 必须经 get trap 转发
 	// (键以 Symbol.Inspect() 字符串视图传入, 与字符串键通道一致)。
 	if p, ok := receiver.(*object.Proxy); ok {
-		v, err := vm.proxyGet(p, sym.Inspect(), receiver)
+		v, err := vm.proxyGetSymbol(p, sym, receiver)
 		if err != nil {
 			// 经由 getIndex 的调用点随后会 checkCallbackErr 重抛。
 			object.SetCallbackError(err)

@@ -311,6 +311,7 @@ var builtinLengths = map[string]int{
 	"Reflect.get":                                            2,
 	"Reflect.getOwnPropertyDescriptor":                       2,
 	"Reflect.getPrototypeOf":                                 1,
+	"Object.getPrototypeOf":                                  1,
 	"Reflect.has":                                            2,
 	"Reflect.isExtensible":                                   1,
 	"Reflect.ownKeys":                                        1,

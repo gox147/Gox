@@ -228,6 +228,10 @@ func buildTypedArrayGlobals(env *runtime.Environment) {
 		v, _ := buf.GetProperty("detached")
 		return v
 	}), nil)
+	// ArrayBuffer.prototype.constructor 回引 (规范 25.1.5.2): 此前缺失,
+	// ArrayBuffer/prototype/constructor.js 断言 === ArrayBuffer 失败
+	// (B8 rm4Zcc)。
+	abProto.SetBuiltinProperty("constructor", abFn)
 	setCtorPrototype(abFn, abProto)
 	env.Declare("ArrayBuffer", abFn, false)
 	// SharedArrayBuffer: Gox 是单线程运行时, 无真正共享内存 —— 以 ArrayBuffer
@@ -361,20 +365,32 @@ func buildTypedArrayGlobals(env *runtime.Environment) {
 	// 分离/越界 → TypeError)。没有它, taProto 链回 Object.prototype 之后
 	// TA.prototype.toString 会被 Object.prototype.toString 遮蔽, 分离用例退潮
 	// (TypedArray/prototype/toString/detached-buffer, T3 rewZ3Q)。
-	taProto.SetBuiltinProperty("toString", object.NewBuiltinMethod("toString", func(this object.Value, margs ...object.Value) object.Value {
-		if ta, ok := this.(*object.TypedArray); ok {
-			if v, found := object.CallTypedArrayMethod(ta, "join", nil); found {
-				return v
-			}
-			return object.UndefinedSingleton
+	// %TypedArray%.prototype.toString === Array.prototype.toString
+	// (规范 22.2.3.28: "the same built-in function object as the
+	// Array.prototype.toString method"; TypedArray/prototype/toString.js
+	// 断言同一对象, B8 rm4Zcc)。此前是自建副本, join 委托语义虽等价,
+	// 但 === 同一性失败。join 委托/分离报错语义由 Array.prototype.toString
+	// 经 this.join 解析 (TA 实例的 join 走 taProto 链) 保留。
+	if ap, isObj := object.ArrayProto.(*object.Object); isObj {
+		if ts, found := ap.GetProperty("toString"); found && ts != nil {
+			taProto.SetBuiltinProperty("toString", ts)
+		} else {
+			taProto.SetBuiltinProperty("toString", object.NewBuiltinMethod("toString", func(this object.Value, margs ...object.Value) object.Value {
+				if ta, ok := this.(*object.TypedArray); ok {
+					if v, found := object.CallTypedArrayMethod(ta, "join", nil); found {
+						return v
+					}
+					return object.UndefinedSingleton
+				}
+				if op := object.GetObjectPrototype(); op != nil {
+					if ts, found := op.GetProperty("toString"); found && object.IsCallable(ts) {
+						return object.CallFunction(ts, this, margs...)
+					}
+				}
+				return object.NewString("[object Object]")
+			}))
 		}
-		if op := object.GetObjectPrototype(); op != nil {
-			if ts, found := op.GetProperty("toString"); found && object.IsCallable(ts) {
-				return object.CallFunction(ts, this, margs...)
-			}
-		}
-		return object.NewString("[object Object]")
-	}))
+	}
 	// Symbol.iterator = values (规范同函数对象; 这里语义等价即可)。
 	if v, ok := taProto.GetProperty("values"); ok {
 		taProto.SetBuiltinSymbolProperty(object.GetGlobalSymbol("Symbol.iterator"), v)
@@ -401,6 +417,9 @@ func buildTypedArrayGlobals(env *runtime.Environment) {
 	for _, prop := range []string{"buffer", "byteLength", "byteOffset", "length"} {
 		taProto.DefineAccessor(prop, taAcc(prop), nil)
 	}
+	// %TypedArray%.prototype.constructor 回引 (规范 22.2.3.2):
+	// TypedArray/prototype/constructor.js 断言 === TypedArray (B8 rm4Zcc)。
+	taProto.SetBuiltinProperty("constructor", taFn)
 	setCtorPrototype(taFn, taProto)
 	env.Declare("TypedArray", taFn, false)
 	object.SetTypedArrayCtorProto(taFn)

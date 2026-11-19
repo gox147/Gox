@@ -16,6 +16,15 @@ type Proxy struct {
 	Handler Value
 	// IsRevoked 标记代理是否已被 revoke (简化，预留)
 	IsRevoked bool
+	// WasCallable / WasConstructor 在创建时快照 target 的能力
+	// (ProxyCreate: 包装可调用 target 的代理自带 [[Call]], 可构造 target
+	// 自带 [[Construct]])。规范里 revoke 置空 [[ProxyTarget]]/[[ProxyHandler]]
+	// 但**不移除内部方法** —— IsCallable/IsConstructor (typeof、instanceof
+	// 判定) 仍为 true, 只有真正 invoke/construct 时经 revoked 校验抛 TypeError
+	// (Proxy/revocable/target-is-revoked-function-proxy、
+	// Function/internals/Construct/base-ctor-revoked-proxy, T5 r8dXes)。
+	WasCallable    bool
+	WasConstructor bool
 }
 
 func (p *Proxy) Type() ObjectType { return PROXY_OBJ }
@@ -95,7 +104,12 @@ func NewProxy(target, handler Value) (*Proxy, *Error) {
 		return nil, NewTypeError("Cannot create proxy with a non-object as target or handler")
 	}
 
-	return &Proxy{Target: target, Handler: handler}, nil
+	return &Proxy{
+		Target:         target,
+		Handler:        handler,
+		WasCallable:    IsCallable(target),
+		WasConstructor: IsConstructor(target),
+	}, nil
 }
 
 // IsObjectLike 粗略判断一个值是否为"对象类"引用类型 (允许作为 handler)。

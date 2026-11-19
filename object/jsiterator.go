@@ -30,6 +30,13 @@ type JSIterator struct {
 }
 
 func (it *JSIterator) Type() ObjectType { return ITERATOR_OBJ }
+
+// GetProto 返回实例 [[Prototype]] = %Iterator.prototype% (规范 25.1.2,
+// 各内建迭代器原型的 [[Prototype]] 也是它)。经鸭子类型入口参与
+// Object.getPrototypeOf / 原型链查找 —— 此前缺失导致
+// StringIteratorPrototype/ancestry.js 一族退化为 null === null 假通过
+// (getPrototypeOf(null) 现按规范抛 TypeError 后暴露, T5/B8 夜批)。
+func (it *JSIterator) GetProto() Value { return IteratorProto }
 func (it *JSIterator) Inspect() string {
 	if it.Name != "" {
 		return "[object " + it.Name + " Iterator]"

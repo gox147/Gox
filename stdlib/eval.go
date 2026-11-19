@@ -154,6 +154,13 @@ func setupEvalAndMisc(env *runtime.Environment) {
 	setCtorPrototype(aggFn, aggProto)
 	aggProto.SetBuiltinProperty("constructor", aggFn)
 	env.Declare("AggregateError", aggFn, false)
+	// 规范 19.5.6.2 同口径: AggregateError 构造器的 [[Prototype]] 是 %Error%
+	// (B8 rm4Zcc, 与 NativeErrors/*/proto.js 同族)。
+	if errCtor, ok := env.Get("Error"); ok {
+		if eb, isB := errCtor.(*object.BuiltinFunction); isB {
+			aggFn.FuncPrototype = eb
+		}
+	}
 
 	// 注: %Function.prototype% 的可调用性 (Function.prototype() 返回 undefined)
 	// 已由 setupFunctionIntrinsics 在装配期直接建好 (见 stdlib/function_proto.go)，

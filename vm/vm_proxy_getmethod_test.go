@@ -75,7 +75,11 @@ func TestProxyRevokedOperationsThrow(t *testing.T) {
 	`), true)
 }
 
-// callable proxy 的 typeof 为 "function", revoked 后回落 "object"
+// callable proxy 的 typeof 为 "function"; revoked 后**仍为 "function"**
+// (规范: revoke 置空 [[ProxyTarget]]/[[ProxyHandler]] 但不移除 ProxyCreate
+// 装上的 [[Call]] 内部方法 —— typeof 语义不变, 只有真正调用时经 revoked
+// 校验抛 TypeError; test262 Proxy/revocable/target-is-revoked-function-proxy,
+// T5 r8dXes)。
 func TestProxyTypeofCallableTarget(t *testing.T) {
 	assertString(t, evalJS(t, `
 		typeof new Proxy(function(){}, {});
@@ -84,7 +88,7 @@ func TestProxyTypeofCallableTarget(t *testing.T) {
 		const { proxy, revoke } = Proxy.revocable(function(){}, {});
 		revoke();
 		typeof proxy;
-	`), "object")
+	`), "function")
 }
 
 // revocation function: 匿名 (name="") 且不可构造

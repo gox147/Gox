@@ -30,6 +30,10 @@ func setupMapSet(env *runtime.Environment) {
 		return m
 	})
 	setCtorPrototype(mapFn, mapProto)
+	// Map.prototype.constructor 回引 (规范 23.1.3.2): 此前缺失,
+	// 沿链解析到 Object.prototype.constructor = Object,
+	// Map/prototype/constructor.js 断言 === Map 失败 (B8 rm4Zcc)。
+	mapProto.SetBuiltinProperty("constructor", mapFn)
 	env.Declare("Map", mapFn, false)
 
 	// Map.groupBy(items, callback) (ES2024): 键保持原始值
@@ -54,6 +58,8 @@ func setupMapSet(env *runtime.Environment) {
 		return s
 	})
 	setCtorPrototype(setFn, setProto)
+	// Set.prototype.constructor 回引 (规范 23.2.3.2, B8 rm4Zcc)。
+	setProto.SetBuiltinProperty("constructor", setFn)
 	env.Declare("Set", setFn, false)
 
 	// ===== ES2025 Set 组合方法 =====
@@ -84,6 +90,8 @@ func setupMapSet(env *runtime.Environment) {
 		return m
 	})
 	setCtorPrototype(weakMapFn, weakMapProto)
+	// WeakMap.prototype.constructor 回引 (规范 24.3.3.2, B8 rm4Zcc)。
+	weakMapProto.SetBuiltinProperty("constructor", weakMapFn)
 	env.Declare("WeakMap", weakMapFn, false)
 
 	// ===== WeakSet =====
@@ -104,6 +112,8 @@ func setupMapSet(env *runtime.Environment) {
 		return s
 	})
 	setCtorPrototype(weakSetFn, weakSetProto)
+	// WeakSet.prototype.constructor 回引 (规范 24.4.3.2, B8 rm4Zcc)。
+	weakSetProto.SetBuiltinProperty("constructor", weakSetFn)
 	env.Declare("WeakSet", weakSetFn, false)
 }
 
@@ -568,14 +578,20 @@ func setupSetProto() *object.Object {
 		return object.NewSetIterator(s)
 	}))
 
-	// keys(): Set 的 keys 与 values 同为值迭代器
-	p.SetBuiltinProperty("keys", object.NewBuiltinMethod("keys", func(this object.Value, args ...object.Value) object.Value {
-		s, ok := this.(*object.Set)
-		if !ok {
-			return thisTypeError("Set", "keys", this)
-		}
-		return object.NewSetIterator(s)
-	}))
+	// keys(): Set 的 keys 与 values **同一函数对象** (规范 23.2.3.10:
+	// "The initial value of Set.prototype.keys is the same function object
+	// as the Set.prototype.values"; set-prototype-keys-*.js 断言 ===)。
+	if vals, ok := p.GetProperty("values"); ok {
+		p.SetBuiltinProperty("keys", vals)
+	} else {
+		p.SetBuiltinProperty("keys", object.NewBuiltinMethod("keys", func(this object.Value, args ...object.Value) object.Value {
+			s, ok := this.(*object.Set)
+			if !ok {
+				return thisTypeError("Set", "keys", this)
+			}
+			return object.NewSetIterator(s)
+		}))
+	}
 
 	// size: 规范是访问器 getter (非数据属性)。
 	p.DefineNonEnumerableAccessor("size", object.NewBuiltinMethod("get size", func(this object.Value, args ...object.Value) object.Value {
