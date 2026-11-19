@@ -483,3 +483,48 @@ swapchain 已接线（真机验证待做）、移动端未接入、CI gpu 跑批
 本窗口全部数字为无硬件兜底口径，不进闸门、不对外，不构成硬件成果。
 G-1 收尾仍差硬件覆盖三项（win32/x11/cocoa 三平台真机 audit+bench、swapchain
 真机点亮对照数字），需真机，不标 done。
+
+## 2026-11-20 02:00 执行窗口（G-1：CI 闸门修复 + 防再犯守卫 + A/B flake 加固；本节为无硬件兜底口径）
+
+### 发现并修复 CI 真实故障 —— audit 脚本可执行位第二次丢失（main 闸门红）
+
+- **现象**：run 44541248538（main@730a143，gpu-present）failure，失败 step
+  即 `scripts/gpu-track-audit.sh`，exit 126 permission denied。
+- **根因**：730a143（11-19 22:00 窗口）经 api.github.com Git Data API 重建
+  tree 推码时把该文件 entry mode 写回 **100644** —— 可执行位丢失。这与
+  11-19 04:33 窗口修复过的问题（dee1c301）**完全同因**：Git Data API 建
+  tree 时 mode 必须显式写 100755，漏写即 644。同一坑两夜两次。
+- **修复**：本窗口提交恢复 100755（blob 内容不变，仅 mode）。
+- **防再犯**：gpu-present.yml 新增第 0 步「脚本可执行位守卫」——对本
+  workflow 以 `./` 直接执行的 gpu-track-audit.sh / bench-present-4k.sh
+  校验 git tree mode，缺位即在 CI 报出一句能定位病因的诊断（含历次
+  踩坑记录），替代莫名 exit 126。收窄口径：auto-release.sh 等 5 个脚本
+  本就以 644 存放、经 `bash xxx.sh` 调用，不在守卫范围。
+
+### 26 组件 A/B 的 CI flake 加固（G-4 闸门可靠性，不改闸门语义）
+
+- **背景**：run 44391316067 曾出现 `TestGPUSnapshotAB26/checkbox` 段错误
+  （wgpu-software core dumped）；11-19 06:00 窗口建议「加一次重跑或单独
+  排查」。本窗口量化：本地沙箱连跑 10 次 `TestGPUSnapshotAB26` 全绿
+  （-count=1，0 flake）—— flake 为 CI runner Mesa/软件适配器环境特有。
+- **加固**（gpu-present.yml）：
+  1. 单元测试 step `-skip '^TestGPUSnapshotAB26$'`：26 组件 A/B 只在
+     独立 step 专跑，消除同进程重复执行，并让全量 step 不再暴露于该
+     flake（此前全量 step 也含 26 组件，崩一次两个 step 一起红）；
+  2. 专用 A/B step 加**仅崩溃重跑**语义：输出含 `signal:`（测试进程
+     崩溃）才重跑一次；像素差异 / 断言 FAIL 永不重试 —— 崩溃是环境
+     flake，FAIL 是闸门语义，混为一谈重跑即闸门弱化。
+
+### 例行复跑核销（本窗口，基线 commit 0007eed）
+
+- 三轨（gpu-track-audit.sh）：nogpu=none / wgpu=software（兜底口径）/
+  cgo=none —— 与 11-08 ~ 11-20 00:05 基线逐项一致。
+- `go test ./gfx/gpu`（nogpu 轨）与 `go test -tags gpu ./gfx/gpu`
+  （wgpu 轨）均绿；`TestGPUSnapshotAB26` PASS 阈值 0，×10 连跑零差异
+  零崩溃 —— Prism 视觉一致性零退化维持。
+
+### 诚实口径
+
+本节全部数字为无硬件兜底口径（Linux x86_64 沙箱，wgpu-software），不进
+闸门、不对外。G-1 收尾仍差硬件覆盖三项（三平台真机 audit+bench、
+swapchain 真机点亮对照数字），需真机，不标 done。

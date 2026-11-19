@@ -71,19 +71,62 @@ jobs:
       # TestGPUSnapshotAB26/list-item FAIL 而工作流整体 success)。闸门
       # 吞退出码等于没有闸门。
 
+      # 0) 脚本可执行位守卫 —— Git Data API 重建 tree 丢 mode 已经两次踩坑
+      #    (04:33 dee1c301 修复过一次, 22:00 730a143 经 API 推码又写回 100644,
+      #    run 44541248538 audit step exit 126, main 闸门红一夜)。放在最前:
+      #    把「permission denied」翻成一句能定位病因的诊断, 而不是让后续
+      #    step 莫名 exit 126。只查本 workflow 以 ./ 直接执行的两个脚本 ——
+      #    仓库另有 auto-release.sh 等 644 口径脚本 (一律 bash xxx.sh 调用),
+      #    不在本守卫范围, 收窄避免误杀。Git Data API 推码时 tree entry
+      #    mode 必须写 100755 是流程纪律, 守卫只负责在 CI 侧钉住。
+      - name: 脚本可执行位守卫 (Git Data API 丢 mode 防再犯)
+        shell: bash
+        run: |
+          fail=0
+          for f in scripts/gpu-track-audit.sh scripts/bench-present-4k.sh; do
+            mode=$(git ls-files -s "$f" | awk '{print $1}')
+            if [ "$mode" != "100755" ]; then
+              echo "::error::$f 在 git tree 中 mode=$mode (缺可执行位) —— Git Data API 建 tree 时 entry mode 必须写 100755 (第二次踩坑: 730a143 → run 44541248538 exit 126)"
+              fail=1
+            fi
+          done
+          exit $fail
+
       # 1) 单元测试（含像素级 A/B TestGPUPresentPixelExact，软件后端即可验零退化）
+      #    -skip 掉 TestGPUSnapshotAB26: 26 组件 A/B 由下面 1.5 的独立 step
+      #    专跑 (带崩溃 flake 重跑语义), 这里再跑一遍纯属重复 —— 且会让
+      #    全量 step 额外暴露在已知的 wgpu-software 崩溃 flake 上
+      #    (2026-11-19 run 44391316067 checkbox 段错误, 详见 1.5 注释)。
+      #    TestGPUSnapshotABGate (skip 判据钉子) 便宜且稳定, 保留在本 step。
       - name: go test -tags gpu ./gfx/gpu
         shell: bash
-        run: set -o pipefail; go test -tags gpu ./gfx/gpu -v 2>&1 | tee gpu-test.txt
+        run: set -o pipefail; go test -tags gpu ./gfx/gpu -skip '^TestGPUSnapshotAB26$' -v 2>&1 | tee gpu-test.txt
 
       # 1.5) G-4 视觉闸门：26 组件 CPU vs GPU 双轨像素级 A/B
       #      （gfx/gpu/snapshot_ab_test.go，表驱动，差异阈值 0）。软件适配器
       #      是确定性后端，视觉闸门跑在它上面不需要显卡；skip 判据被
       #      TestGPUSnapshotABGate 钉住，不是裸 if。产物单列一份，便于
       #      「G-4 双轨对照真跑过一次」留证。
-      - name: 26 组件双轨快照 A/B (G-4 视觉闸门)
+      #
+      #      重跑语义 (2026-11-20 接入, 口径纪律): CI runner 上 wgpu-software
+      #      偶发段错误 (run 44391316067 TestGPUSnapshotAB26/checkbox core
+      #      dumped; 本地沙箱连跑 10 次 0 复现, 属 runner Mesa/软件适配器
+      #      环境特有)。仅当输出含 "signal:" (测试进程崩溃) 才允许重跑一次;
+      #      像素差异 / 断言 FAIL 永不重试 —— 崩溃是环境 flake, FAIL 是
+      #      闸门语义, 两者混为一谈重跑就等于闸门弱化。
+      - name: 26 组件双轨快照 A/B (G-4 视觉闸门; 仅崩溃 flake 限一次重跑)
         shell: bash
-        run: set -o pipefail; go test -tags gpu ./gfx/gpu -run TestGPUSnapshotAB -v 2>&1 | tee gpu-snapshot-ab.txt
+        run: |
+          set -o pipefail
+          run_ab() { go test -tags gpu ./gfx/gpu -run TestGPUSnapshotAB -v 2>&1 | tee gpu-snapshot-ab.txt; }
+          if run_ab; then exit 0; fi
+          if grep -q "signal:" gpu-snapshot-ab.txt; then
+            echo "::warning::wgpu-software 测试进程崩溃 (已知 runner 环境偶发 flake), 按口径重跑一次"
+            run_ab
+          else
+            echo "::error::像素 A/B 闸门 FAIL (非崩溃): 不重试, 视觉一致性不许拿重跑洗白"
+            exit 1
+          fi
 
       # 1.6) x11 swapchain 端到端点亮 (A 路径硬前提 #2 接线验证):
       #      真平台窗口 + wgpu-software XPutImage 上屏 → XGetImage 读回
