@@ -18,6 +18,7 @@
 #   ./scripts/coldstart.sh --runs 15      # 加密重复
 #   ./scripts/coldstart.sh --interval 0.3 # 样本间隔秒数 (默认 0.25, 见下)
 #   ./scripts/coldstart.sh --user-form    # = --interval 0: 用户形态 (关掉就立刻再开)
+#   ./scripts/coldstart.sh --bin <path>   # 测已有二进制 (跳过构建), 用于对比两份产物
 #   ./scripts/coldstart.sh --xvfb         # 无 DISPLAY 时强制用 Xvfb 虚拟显示
 #
 # --- 样本间隔 (T3-5 第十二批, 2026-11-19; **第二十一批量化订正**) ---
@@ -55,6 +56,7 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 RUNS=7
 OUT="$ROOT/bench-results"
 WANT_XVFB=0
+BIN=""          # --bin <path>: 测已有二进制, 跳过构建
 # 样本间隔 (秒)。0 表示用户形态 (背靠背, 见文件头), 仅供复现历史数字与对外体感口径。
 INTERVAL=0.25
 SAMPLING_FORM="script"
@@ -68,6 +70,7 @@ while [[ $# -gt 0 ]]; do
     --out)  OUT="$2"; shift 2 ;;
     --interval) INTERVAL="$2"; shift 2 ;;
     --user-form) INTERVAL=0; shift ;;
+    --bin)  BIN="$2"; shift 2 ;;
     --xvfb) WANT_XVFB=1; shift ;;
     # 只打头部注释块: 跳过 shebang, 遇到第一行非注释就停 (固定行号会在改注释后错位)
     -h|--help) awk 'NR>1 && /^#/ {sub(/^# ?/, ""); print; next} NR>1 {exit}' "$0"; exit 0 ;;
@@ -132,9 +135,16 @@ else
 fi
 
 # -------- 构建 --------
-echo "[coldstart] 构建本仓库 gox ..." >&2
-GOX_BIN="$OUT/gox-coldstart"
-(cd "$ROOT" && go build -o "$GOX_BIN" ./cmd/gox) >&2
+# --bin 给了二进制就跳过构建 (用来对比两份已建好的产物: 不同 ldflags / 两个提交)。
+if [[ -n "$BIN" ]]; then
+  [[ -x "$BIN" ]] || { echo "[coldstart] --bin $BIN 不存在或不可执行" >&2; exit 1; }
+  GOX_BIN="$BIN"
+  echo "[coldstart] 用给定二进制: $GOX_BIN" >&2
+else
+  echo "[coldstart] 构建本仓库 gox ..." >&2
+  GOX_BIN="$OUT/gox-coldstart"
+  (cd "$ROOT" && go build -o "$GOX_BIN" ./cmd/gox) >&2
+fi
 
 SCRIPT="$ROOT/scripts/bench/coldstart_gui.js"
 [[ -f "$SCRIPT" ]] || { echo "[coldstart] 找不到 $SCRIPT" >&2; exit 1; }
