@@ -62,11 +62,32 @@ mkdir -p "$OUT"
 # 冷启动到首帧必须真的上屏。有 DISPLAY 就用; 没有/被要求 --xvfb 时用
 # Xvfb 虚拟显示 (软件渲染, 无合成器, 数字稳定可复现)。两者都没有就跳过。
 RUNNER=()
+XVFB_PID=""
+DISPLAY_MODE="existing"
+cleanup() { [[ -n "$XVFB_PID" ]] && kill "$XVFB_PID" 2>/dev/null; XVFB_PID=""; }
+trap cleanup EXIT INT TERM
+
 if [[ -n "${DISPLAY:-}" && "$WANT_XVFB" -eq 0 ]]; then
   echo "[coldstart] 使用现有显示: DISPLAY=$DISPLAY" >&2
-elif command -v xvfb-run >/dev/null 2>&1; then
-  echo "[coldstart] 用 Xvfb 虚拟显示 (1024x768x24, 无合成器)" >&2
-  RUNNER=(xvfb-run -a -s "-screen 0 1024x768x24")
+elif command -v Xvfb >/dev/null 2>&1; then
+  # 本脚本自己起**一个** Xvfb 并全程复用 (第十七批, 2026-11-19)。
+  #
+  # 为什么不再用 `xvfb-run -a` 包每个样本: 那会在每个样本里新起一个 X server,
+  # 把一个 30ms 级的"Xvfb 启动 + 监听 socket"算进了 gox 的首帧里。同机实测:
+  # 每样本 xvfb-run = 41ms, 复用预热好的 :55 = 9ms —— 前者不是 gox 的成本。
+  # 这与"样本间隔"是同一类口径问题: 测的是运行时的开销, 不是测试支架的开销。
+  DISPLAY_MODE="xvfb-managed"
+  for d in $(seq 90 120); do
+    if [[ ! -e "/tmp/.X11-unix/X$d" ]]; then
+      Xvfb ":$d" -screen 0 1024x768x24 >/dev/null 2>&1 &
+      XVFB_PID=$!
+      export DISPLAY=":$d"
+      for _ in $(seq 1 100); do [[ -e "/tmp/.X11-unix/X$d" ]] && break; sleep 0.02; done
+      break
+    fi
+  done
+  [[ -n "$XVFB_PID" ]] || { echo "[coldstart] 起 Xvfb 失败 (无空闲 display)" >&2; exit 1; }
+  echo "[coldstart] 用自管 Xvfb ($DISPLAY, 1024x768x24, 全程复用一次)" >&2
 else
   echo "[coldstart] 无 DISPLAY 且无 xvfb-run: 进程级首帧口径跳过 (不失败)。" >&2
   echo "[coldstart] 进程内口径仍可用: go test ./tools/perf/ -run TestColdStartToFirstFrame" >&2
@@ -82,21 +103,36 @@ SCRIPT="$ROOT/scripts/bench/coldstart_gui.js"
 [[ -f "$SCRIPT" ]] || { echo "[coldstart] 找不到 $SCRIPT" >&2; exit 1; }
 
 # -------- 计量 --------
+#
+# 时钟用 bash 内建 $EPOCHREALTIME (微秒), **不再每个样本 fork 两次 `date`**。
+# 第十七批实测: 两次 `date +%s%N` 的 fork/exec 落在 t1 那一侧, 会把 ~0.9ms
+# 的支架开销记到 gox 头上 (同机同二进制: fork 版 9ms / 内建时钟版 8.1ms)。
+# 只有 bash < 5 或变量被清掉时才退回 date。
+now_us() {
+  if [[ -n "${EPOCHREALTIME:-}" ]]; then
+    local t=${EPOCHREALTIME/[.,]/}
+    printf '%s' "$((t))"
+  else
+    date +%s%6N
+  fi
+}
+
 run_once_ms() {
   local t0 t1 out
-  t0=$(date +%s%N)
+  t0=$(now_us)
   if ! out=$("${RUNNER[@]}" "$GOX_BIN" "$SCRIPT" 2>/dev/null); then
     echo "[coldstart] 运行失败 (见下方 stderr):" >&2
     "${RUNNER[@]}" "$GOX_BIN" "$SCRIPT" >&2 || true
     exit 1
   fi
-  t1=$(date +%s%N)
+  t1=$(now_us)
   # 首帧标记必须真的打出来: 没打出来说明探测循环没等到上屏, 数字无效。
   if [[ "$out" != *"FIRST_FRAME"* ]]; then
     echo "[coldstart] 未检测到 FIRST_FRAME 标记 (输出: $out)" >&2
     exit 1
   fi
-  echo $(( (t1 - t0) / 1000000 ))
+  # 四舍五入到毫秒 (旧实现是截断, 与 date 的整毫秒相除一致取值偏低)
+  echo $(( (t1 - t0 + 500) / 1000 ))
 }
 
 run_rss_kb() {
@@ -127,6 +163,9 @@ RSS=$(run_rss_kb)
 # -------- JSON + 表 --------
 STAMP=$(date -u +%Y%m%d-%H%M%S)
 JSON="$OUT/coldstart-process-$STAMP.json"
+GOX_COLDSTART_CLOCK=$([[ -n "${EPOCHREALTIME:-}" ]] && echo "bash-epochrealtime(us, no fork)" || echo "date(us, 2 forks/sample)")
+GOX_COLDSTART_DISPLAY="$DISPLAY_MODE"
+export GOX_COLDSTART_CLOCK GOX_COLDSTART_DISPLAY
 python3 - "$JSON" "$MED" "$RSS" "$RUNS" "${SAMPLES[*]}" "$INTERVAL" <<'PYEOF'
 import sys, json, datetime, os, platform, subprocess
 
@@ -157,7 +196,13 @@ doc = {
     "first_frame_ms_all": samples,
     "rss_kb": rss,
     "interval_ms": interval_ms,
-    "method": "外部 wall time (进程 exec → 脚本打印 FIRST_FRAME, 含 ≤2ms 探测/退出开销), 跑 %d 次取中位数, 预热 2 次不计入, 样本间隔 %dms (避开 X server 断开清理造成的 accept 延迟, 见脚本头); 首帧信号 = JS 侧 1ms 轮询 gx/dev 的 devSnapshot().frame.count (只在真实上屏出口计数)" % (runs, interval_ms),
+    "harness": {
+        "clock": os.environ.get("GOX_COLDSTART_CLOCK", "unknown"),
+        "display_mode": os.environ.get("GOX_COLDSTART_DISPLAY", "unknown"),
+        "coldstart_sh_rev": "T3-5-17 (2026-11-19): 内建时钟 + 单 Xvfb 复用",
+        "note": "2026-11-19 第十七批之前的样本含 ~0.9ms `date` fork 与(在 --xvfb 模式下)~30ms 的 Xvfb 启动成本, 与本节之前的历史数字不可直接相减; 见 docs/performance.md §12.17",
+    },
+    "method": "外部 wall time (进程 exec → 脚本打印 FIRST_FRAME → 进程退出, 含 ≤2ms 探测与 ~0.7ms 退出清理, 见 §12.17), 跑 %d 次取中位数, 预热 2 次不计入, 样本间隔 %dms (避开 X server 断开清理造成的 accept 延迟, 见脚本头); 首帧信号 = JS 侧 1ms 轮询 gx/dev 的 devSnapshot().frame.count (只在真实上屏出口计数)" % (runs, interval_ms),
     "scope": "进程级冷启动到首帧: 含进程 exec/动态链接/Go runtime 启动/解释器初始化/脚本求值(含模块装载)/真实窗口创建/首次 Layout+Draw+上屏",
     "host": {
         "platform": platform.platform(),
