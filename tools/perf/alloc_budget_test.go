@@ -71,6 +71,9 @@ func TestFib28AllocBudget(t *testing.T) {
 	if testing.Short() {
 		t.Skip("-short 下跳过 (一轮求值 ~130ms, 只为量分配数)")
 	}
+	if raceDetectorEnabled {
+		t.Skip("-race 下分配次数会整体漂移, 预算判据无意义")
+	}
 	src := loadFib28(t)
 	c, err := compileForBench(src)
 	if err != nil {
@@ -99,6 +102,9 @@ func TestFib28AllocBudget(t *testing.T) {
 func TestSetupGlobalsAllocBudget(t *testing.T) {
 	if testing.Short() {
 		t.Skip("-short 下跳过")
+	}
+	if raceDetectorEnabled {
+		t.Skip("-race 下分配次数会整体漂移, 预算判据无意义")
 	}
 	got := countAllocs(20, func() {
 		if env := stdlib.SetupGlobals(); env == nil {
