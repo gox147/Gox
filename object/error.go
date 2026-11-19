@@ -21,6 +21,32 @@ func RegisterErrorConstructor(name string, ctor Value) {
 	errorCtors[name] = ctor
 }
 
+// ErrorProtoOf 按错误实例的 Name 解析对应 NativeError 的 %X.prototype%
+// (B1 rwjnvX: 此前 *Error 在原型链上恒挂 %Error.prototype%, 只靠
+// constructor/name 属性伪装出 instanceof —— Object.getPrototypeOf(reason)
+// === TypeError.prototype 一族全部失配, Promise 聚合族以 TypeError 拒绝的
+// 33 条簇即此根因)。查找走 errorCtors 注册表取构造器的 "prototype" 属性,
+// 与 attachPrototype 的装配点单一同源; 未注册的类型返回 nil (调用方回落
+// 原行为), 不改变引擎既有形态。
+func ErrorProtoOf(e *Error) Value {
+	n := e.Name
+	if n == "" {
+		n = "Error"
+	}
+	errorCtorMu.RLock()
+	ctor := errorCtors[n]
+	errorCtorMu.RUnlock()
+	if ctor == nil {
+		return nil
+	}
+	if g, ok := ctor.(interface{ GetProperty(string) (Value, bool) }); ok {
+		if p, found := g.GetProperty("prototype"); found && p != nil {
+			return p
+		}
+	}
+	return nil
+}
+
 // Error 表示 JavaScript 的错误对象。
 type Error struct {
 	Message string

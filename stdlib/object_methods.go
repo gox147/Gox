@@ -337,9 +337,14 @@ func setupObjectGlobal() *object.BuiltinFunction {
 			}
 			return object.NullSingleton
 		}
-		// Error 实例 (*object.Error 无 Proto 字段): [[Prototype]] =
-		// %Error.prototype% (15.2.3.2-2-27, B8 rm4Zcc)。
-		if _, isErr := args[0].(*object.Error); isErr {
+		// Error 实例: [[Prototype]] = 按 Name 解析的 NativeError.prototype
+		// (B1 rwjnvX) —— TypeError 实例返回 %TypeError.prototype%, 不再恒
+		// 回 %Error.prototype%; 未注册的 Name 回落旧口径 (B8 rm4Zcc,
+		// 15.2.3.2-2-27)。
+		if e, isErr := args[0].(*object.Error); isErr {
+			if p := object.ErrorProtoOf(e); p != nil {
+				return p
+			}
 			if stdlibErrorProto != nil {
 				return stdlibErrorProto
 			}

@@ -153,6 +153,10 @@ func setupEvalAndMisc(env *runtime.Environment) {
 	}
 	setCtorPrototype(aggFn, aggProto)
 	aggProto.SetBuiltinProperty("constructor", aggFn)
+	// errorCtors 注册 (B1 rwjnvX): AggregateError 实例 (newAggregateError /
+	// Promise.any 全拒) 是 *Error{Name:"AggregateError"}, ErrorProtoOf 要经
+	// 注册表找到 aggFn.prototype 才能给出正确 [[Prototype]]。
+	object.RegisterErrorConstructor("AggregateError", aggFn)
 	env.Declare("AggregateError", aggFn, false)
 	// 规范 19.5.6.2 同口径: AggregateError 构造器的 [[Prototype]] 是 %Error%
 	// (B8 rm4Zcc, 与 NativeErrors/*/proto.js 同族)。

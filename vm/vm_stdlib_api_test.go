@@ -310,10 +310,18 @@ func TestPromiseRejectionPropagatesThroughThen(t *testing.T) {
 }
 
 func TestPromiseCombinatorsRejectOnNonIterable(t *testing.T) {
-	// 过去 race/allSettled 对非数组参数返回永久 pending 的 Promise
-	assertJSAsync(t, `Promise.race("bad").catch(function(e){ globalThis.__r = e.name })`, "TypeError")
-	assertJSAsync(t, `Promise.allSettled("bad").catch(function(e){ globalThis.__r = e.name })`, "TypeError")
-	assertJSAsync(t, `Promise.all("bad").catch(function(e){ globalThis.__r = e.name })`, "TypeError")
+	// 过去 race/allSettled 对非数组参数返回永久 pending 的 Promise。
+	// B1 rwjnvX 按规范修正: **字符串是可迭代的** (String.prototype[@@iterator]),
+	// Promise.all/allSettled/race("bad") 应当 fulfill 而不是 reject ——
+	// test262 race|all|allSettled iter-arg-is-string-resolve 族即此口径。
+	assertJSAsync(t, `Promise.race("bad").then(function(v){ globalThis.__r = v })`, "b")
+	assertJSAsync(t, `Promise.allSettled("bad").then(function(v){ globalThis.__r = v.map(function(x){return x.value}).join("") })`, "bad")
+	assertJSAsync(t, `Promise.all("bad").then(function(v){ globalThis.__r = v.join("") })`, "bad")
+	// 真正不可迭代的原始值 (true/123/null 语义) → TypeError reject
+	assertJSAsync(t, `Promise.race(true).catch(function(e){ globalThis.__r = e.name })`, "TypeError")
+	assertJSAsync(t, `Promise.allSettled(123).catch(function(e){ globalThis.__r = e.name })`, "TypeError")
+	assertJSAsync(t, `Promise.all(false).catch(function(e){ globalThis.__r = e.name })`, "TypeError")
+	assertJSAsync(t, `Promise.any(undefined).catch(function(e){ globalThis.__r = e.name })`, "TypeError")
 }
 
 func TestPromiseAllAllSettledAny(t *testing.T) {

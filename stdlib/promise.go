@@ -14,6 +14,11 @@ import (
 // 的"取 x.constructor"那一步干脆没实现 (rj9MwH)。
 var promiseCtor object.Value
 
+// promiseProtoThen 是 %Promise.prototype%.then 的内建方法值 (B1 rwjnvX):
+// promiseAttach 的 *Promise 快路径用它判断 "then 是否被覆写" —— 覆写后必须
+// 走通用 Invoke (invoke-then 族: 覆写后调用计数 0 ≠ 3)。
+var promiseProtoThen object.Value
+
 // promiseCapability 是 NewPromiseCapability 的产物: 内建 %Promise% 快路径
 // 的真实 Promise + resolve/reject 函数; 用户构造器路径则是对注册进去的
 // resolve/reject 的包装调用。
@@ -101,10 +106,12 @@ func newPromiseCapability(thisVal object.Value) (*promiseCapability, object.Valu
 			p.Resolve(argAt(args, 0))
 			return object.UndefinedSingleton
 		})
+		resolve.SetFunctionLength(1)
 		reject := object.NewBuiltin("reject", func(args ...object.Value) object.Value {
 			p.Reject(argAt(args, 0))
 			return object.UndefinedSingleton
 		})
+		reject.SetFunctionLength(1)
 		return &promiseCapability{promise: p, resolve: resolve, reject: reject}, nil
 	}
 	cap := &promiseCapability{}
@@ -276,96 +283,29 @@ func setupPromise(env *runtime.Environment) {
 
 	// Promise.all(iterable)
 	promiseFn.SetProperty("all", object.NewBuiltinMethod("all", func(this object.Value, args ...object.Value) object.Value {
-		// 规范 PerformPromiseAll: 先 NewPromiseCapability(C), 再 GetPromiseResolve,
-		// 再解析 iterable —— 顺序不可颠倒。
+		// 规范 27.2.4.1: NewPromiseCapability → GetPromiseResolve → GetIterator
+		// —— 顺序不可颠倒。
 		cap, errVal := newPromiseCapability(this)
 		if errVal != nil {
 			return errVal
 		}
 		promiseResolve, errVal := getPromiseResolve(this)
 		if errVal != nil {
-			// GetPromiseResolve 异常 → IfAbruptRejectPromise (异步 reject,
-			// 迭代器不关闭 —— capability-resolve-throws-no-close 族)。
+			// GetPromiseResolve 异常 → IfAbruptRejectPromise (异步 reject)。
 			if ev := cap.callReject(errVal); ev != nil {
 				return ev
 			}
 			return cap.result()
 		}
-		elements, errVal := promiseCollectElements(argAt(args, 0))
-		if errVal != nil {
-			if ev := cap.callReject(errVal); ev != nil {
-				return ev
-			}
-			return cap.result()
-		}
-
-		results := make([]object.Value, len(elements))
-		remaining := len(elements)
-		rejected := false
-
-		for i, elem := range elements {
-			idx := i
-			// nextPromise = ? Call(promiseResolve, C, «value») —— 调用异常
-			// → reject capability (不同步抛出)。
-			nextPromise := object.CallFunction(promiseResolve, this, elem)
-			if ev := object.TakeThrownValue(); ev != object.UndefinedSingleton {
-				if ev2 := cap.callReject(unwrapThrown(ev)); ev2 != nil {
-					return ev2
-				}
-				return cap.result()
-			}
-			if e, isErr := nextPromise.(*object.Error); isErr && e != nil {
-				if ev := cap.callReject(unwrapThrown(e)); ev != nil {
-					return ev
-				}
-				return cap.result()
-			}
-			errVal := promiseAttach(nextPromise,
-				reactionBuiltin("__all_resolve", func(args ...object.Value) object.Value {
-					if rejected {
-						return object.UndefinedSingleton
-					}
-					results[idx] = argAt(args, 0)
-					remaining--
-					if remaining == 0 {
-						if ev := cap.callResolve(object.NewArray(results)); ev != nil {
-							return ev
-						}
-					}
-					return object.UndefinedSingleton
-				}),
-				reactionBuiltin("__all_reject", func(args ...object.Value) object.Value {
-					if !rejected {
-						rejected = true
-						if ev := cap.callReject(argAt(args, 0)); ev != nil {
-							return ev
-						}
-					}
-					return object.UndefinedSingleton
-				}))
-			if errVal != nil {
-				if ev := cap.callReject(errVal); ev != nil {
-					return ev
-				}
-				return cap.result()
-			}
-		}
-		if remaining == 0 {
-			// 规范: final Resolve 异常 → PerformPromiseAll abrupt →
-			// IfAbruptRejectPromise (异步 reject, 不同步抛出)。
-			if ev := cap.callResolve(object.NewArray(results)); ev != nil {
-				_ = cap.callReject(unwrapThrown(ev))
-				return cap.result()
-			}
-			return cap.result()
-		}
-
-		return cap.result()
+		// 交错迭代 + 逐元素 resolve element (B1 rwjnvX): reject 侧是共享的
+		// capability [[Reject]], resolve element 每元素一个 ([[AlreadyCalled]]
+		// 守卫 + values List 增长语义)。
+		return promiseAggregate(aggAll, cap, promiseResolve, this, argAt(args, 0))
 	}))
 
 	// Promise.race(iterable): 第一个 settled 的结果决定胜负
 	promiseFn.SetProperty("race", object.NewBuiltinMethod("race", func(this object.Value, args ...object.Value) object.Value {
-		// capability 校验 (T7) → GetPromiseResolve → iterable。
+		// capability 校验 (T7) → GetPromiseResolve → GetIterator。
 		cap, errVal := newPromiseCapability(this)
 		if errVal != nil {
 			return errVal
@@ -377,63 +317,16 @@ func setupPromise(env *runtime.Environment) {
 			}
 			return cap.result()
 		}
-		elements, errVal := promiseCollectElements(argAt(args, 0))
-		if errVal != nil {
-			if ev := cap.callReject(errVal); ev != nil {
-				return ev
-			}
-			return cap.result()
-		}
-
-		settled := false
-
-		for _, elem := range elements {
-			nextPromise := object.CallFunction(promiseResolve, this, elem)
-			if ev := object.TakeThrownValue(); ev != object.UndefinedSingleton {
-				if ev2 := cap.callReject(unwrapThrown(ev)); ev2 != nil {
-					return ev2
-				}
-				return cap.result()
-			}
-			if e, isErr := nextPromise.(*object.Error); isErr && e != nil {
-				if ev := cap.callReject(unwrapThrown(e)); ev != nil {
-					return ev
-				}
-				return cap.result()
-			}
-			errVal := promiseAttach(nextPromise,
-				reactionBuiltin("__race_resolve", func(args ...object.Value) object.Value {
-					if !settled {
-						settled = true
-						if ev := cap.callResolve(argAt(args, 0)); ev != nil {
-							return ev
-						}
-					}
-					return object.UndefinedSingleton
-				}),
-				reactionBuiltin("__race_reject", func(args ...object.Value) object.Value {
-					if !settled {
-						settled = true
-						if ev := cap.callReject(argAt(args, 0)); ev != nil {
-							return ev
-						}
-					}
-					return object.UndefinedSingleton
-				}))
-			if errVal != nil {
-				if ev := cap.callReject(errVal); ev != nil {
-					return ev
-				}
-				return cap.result()
-			}
-		}
-
-		return cap.result()
+		// 规范 PerformPromiseRace: 两侧都是 capability 的 [[Resolve]]/[[Reject]]
+		// 本体 —— 每元素共享同一函数对象 (same-resolve-function /
+		// same-reject-function 族), settle 幂等由 Promise 内部 alreadyResolved
+		// 语义保证, 不需要本地 settled 标志 (B1 rwjnvX)。
+		return promiseAggregate(aggRace, cap, promiseResolve, this, argAt(args, 0))
 	}))
 
 	// Promise.allSettled(iterable): 等待全部 settle，永不 reject (除参数非法)
 	promiseFn.SetProperty("allSettled", object.NewBuiltinMethod("allSettled", func(this object.Value, args ...object.Value) object.Value {
-		// capability 校验 (T7) → GetPromiseResolve → iterable。
+		// capability 校验 (T7) → GetPromiseResolve → GetIterator。
 		cap, errVal := newPromiseCapability(this)
 		if errVal != nil {
 			return errVal
@@ -445,83 +338,16 @@ func setupPromise(env *runtime.Environment) {
 			}
 			return cap.result()
 		}
-		elements, errVal := promiseCollectElements(argAt(args, 0))
-		if errVal != nil {
-			if ev := cap.callReject(errVal); ev != nil {
-				return ev
-			}
-			return cap.result()
-		}
-
-		results := make([]object.Value, len(elements))
-		remaining := len(elements)
-
-		for i, elem := range elements {
-			idx := i
-			nextPromise := object.CallFunction(promiseResolve, this, elem)
-			if ev := object.TakeThrownValue(); ev != object.UndefinedSingleton {
-				if ev2 := cap.callReject(unwrapThrown(ev)); ev2 != nil {
-					return ev2
-				}
-				return cap.result()
-			}
-			if e, isErr := nextPromise.(*object.Error); isErr && e != nil {
-				if ev := cap.callReject(unwrapThrown(e)); ev != nil {
-					return ev
-				}
-				return cap.result()
-			}
-			errVal := promiseAttach(nextPromise,
-				reactionBuiltin("__settled_resolve", func(args ...object.Value) object.Value {
-					statusObj := object.NewObject()
-					statusObj.SetProperty("status", object.NewString("fulfilled"))
-					statusObj.SetProperty("value", argAt(args, 0))
-					results[idx] = statusObj
-					remaining--
-					if remaining == 0 {
-						if ev := cap.callResolve(object.NewArray(results)); ev != nil {
-							return ev
-						}
-					}
-					return object.UndefinedSingleton
-				}),
-				reactionBuiltin("__settled_reject", func(args ...object.Value) object.Value {
-					statusObj := object.NewObject()
-					statusObj.SetProperty("status", object.NewString("rejected"))
-					statusObj.SetProperty("reason", argAt(args, 0))
-					results[idx] = statusObj
-					remaining--
-					if remaining == 0 {
-						if ev := cap.callResolve(object.NewArray(results)); ev != nil {
-							return ev
-						}
-					}
-					return object.UndefinedSingleton
-				}))
-			if errVal != nil {
-				if ev := cap.callReject(errVal); ev != nil {
-					return ev
-				}
-				return cap.result()
-			}
-		}
-		if remaining == 0 {
-			// 规范: final Resolve 异常 → PerformPromiseAll abrupt →
-			// IfAbruptRejectPromise (异步 reject, 不同步抛出)。
-			if ev := cap.callResolve(object.NewArray(results)); ev != nil {
-				_ = cap.callReject(unwrapThrown(ev))
-				return cap.result()
-			}
-			return cap.result()
-		}
-
-		return cap.result()
+		// 规范 PerformPromiseAllSettled: 两侧 element function 都是每元素一个
+		// (各自带 [[AlreadyCalled]] 守卫 + index), reject 不共享 (与 all/any
+		// 不同 —— allSettled 必须等每个元素各自的结算记录, B1 rwjnvX)。
+		return promiseAggregate(aggAllSettled, cap, promiseResolve, this, argAt(args, 0))
 	}))
 
 	// Promise.any(iterable): 第一个 fulfilled 获胜；全部 rejected 时
 	// 以 AggregateError 拒绝 (ES2021)
 	promiseFn.SetProperty("any", object.NewBuiltinMethod("any", func(this object.Value, args ...object.Value) object.Value {
-		// capability 校验 (T7) → GetPromiseResolve → iterable。
+		// capability 校验 (T7) → GetPromiseResolve → GetIterator。
 		cap, errVal := newPromiseCapability(this)
 		if errVal != nil {
 			return errVal
@@ -533,74 +359,9 @@ func setupPromise(env *runtime.Environment) {
 			}
 			return cap.result()
 		}
-		elements, errVal := promiseCollectElements(argAt(args, 0))
-		if errVal != nil {
-			if ev := cap.callReject(errVal); ev != nil {
-				return ev
-			}
-			return cap.result()
-		}
-
-		n := len(elements)
-		rejectedCount := 0
-		settled := false
-		errors := make([]object.Value, n)
-
-		for i, elem := range elements {
-			idx := i
-			nextPromise := object.CallFunction(promiseResolve, this, elem)
-			if ev := object.TakeThrownValue(); ev != object.UndefinedSingleton {
-				if ev2 := cap.callReject(unwrapThrown(ev)); ev2 != nil {
-					return ev2
-				}
-				return cap.result()
-			}
-			if e, isErr := nextPromise.(*object.Error); isErr && e != nil {
-				if ev := cap.callReject(unwrapThrown(e)); ev != nil {
-					return ev
-				}
-				return cap.result()
-			}
-			errVal := promiseAttach(nextPromise,
-				reactionBuiltin("__any_resolve", func(args ...object.Value) object.Value {
-					if !settled {
-						settled = true
-						if ev := cap.callResolve(argAt(args, 0)); ev != nil {
-							return ev
-						}
-					}
-					return object.UndefinedSingleton
-				}),
-				reactionBuiltin("__any_reject", func(args ...object.Value) object.Value {
-					if settled {
-						return object.UndefinedSingleton
-					}
-					errors[idx] = argAt(args, 0)
-					rejectedCount++
-					if rejectedCount == n {
-						settled = true
-						if ev := cap.callReject(newAggregateError(errors, "All promises were rejected")); ev != nil {
-							return ev
-						}
-					}
-					return object.UndefinedSingleton
-				}))
-			if errVal != nil {
-				if ev := cap.callReject(errVal); ev != nil {
-					return ev
-				}
-				return cap.result()
-			}
-		}
-		if rejectedCount == n {
-			if ev := cap.callReject(newAggregateError(errors, "All promises were rejected")); ev != nil {
-				_ = cap.callReject(unwrapThrown(ev))
-				return cap.result()
-			}
-			return cap.result()
-		}
-
-		return cap.result()
+		// 规范 PerformPromiseAny: resolve 侧共享 capability [[Resolve]],
+		// reject 侧是每元素的 error element ([[AlreadyCalled]] + errors List)。
+		return promiseAggregate(aggAny, cap, promiseResolve, this, argAt(args, 0))
 	}))
 
 	// Promise.withResolvers() (ES2024): 返回 {promise, resolve, reject}
@@ -878,7 +639,9 @@ func promiseKeyed(this object.Value, args []object.Value, settled bool) object.V
 			}),
 			onRejected)
 		if errVal != nil {
-			_ = cap.callReject(errVal)
+			// unwrap: promiseAttach 返回的包装 Error 带 Original
+			// (invoke-then-error-reject / get-error-reject 的 reason 身份, B1)。
+			_ = cap.callReject(unwrapThrown(errVal))
 			return cap.result()
 		}
 	}
@@ -921,18 +684,61 @@ func getPromiseResolve(ctor object.Value) (object.Value, object.Value) {
 	return fn, nil
 }
 
-// promiseAttach 在 nextPromise 上挂一对反应处理函数: *Promise 直挂内部回调
-// (零桥接); 其他对象走 Invoke(nextPromise, "then", «...»), 读取或调用异常
-// → 返回错误值 (IfAbruptRejectPromise)。
+// promiseAttach 在 nextPromise 上挂一对反应处理函数: *Promise 且 then 未被
+// 覆写时直挂内部回调 (零桥接); 其余走 Invoke(nextPromise, "then", «...»),
+// 读取或调用异常 → 返回错误值 (IfAbruptRejectPromise)。
+// 快路径前提 (B1 rwjnvX): (1) 回调都是内建函数; (2) p 的 "then" 属性查回
+// 的仍是 %Promise.prototype%.then 本体 —— 覆写后必须走通用路径
+// (invoke-then 族: 覆写后调用计数 0 ≠ 3)。"then" 只读一次: 访问器 getter
+// 只允许被调一次 (invoke-resolve-get-once 族), 读回的覆写值直接 Invoke,
+// 不重复做属性查找。
 func promiseAttach(nextPromise, onF, onR object.Value) object.Value {
 	if p, ok := nextPromise.(*object.Promise); ok {
-		if of, ok2 := onF.(*object.BuiltinFunction); ok2 {
-			p.OnFulfilled(of)
+		of, ofOk := onF.(*object.BuiltinFunction)
+		or, orOk := onR.(*object.BuiltinFunction)
+		if ofOk && orOk && promiseProtoThen != nil {
+			tv, _ := p.GetProperty("then")
+			if cbErr := object.TakeCallbackError(); cbErr != nil {
+				if thrown := object.TakeCallbackErrorValue(); thrown != object.UndefinedSingleton {
+					if e, isErr := thrown.(*object.Error); isErr && e != nil {
+						return e
+					}
+					// 非 Error 抛值 (Test262Error 实例等): 裸包装必须带
+					// Original, 否则 rejection reason 身份丢失
+					// (invoke-then-get-error-reject 族, B1 rwjnvX)。
+					w := object.NewErrorWithName("Error", cbErr.Error())
+					w.Original = thrown
+					return w
+				}
+				return object.NewErrorWithName("Error", cbErr.Error())
+			}
+			if ev := object.TakeThrownValue(); ev != object.UndefinedSingleton {
+				if e, isErr := ev.(*object.Error); isErr && e != nil {
+					return e
+				}
+			}
+			if tv == promiseProtoThen {
+				p.OnFulfilled(of)
+				p.OnRejected(or)
+				return nil
+			}
+			// then 被覆写: 用已读到的值直接 Invoke (不再二次查属性)。
+			if tv != nil && object.IsCallable(tv) {
+				res := object.CallFunction(tv, nextPromise, onF, onR)
+				if ev := object.TakeThrownValue(); ev != object.UndefinedSingleton {
+					if e, isErr := ev.(*object.Error); isErr && e != nil {
+						return e
+					}
+					return object.NewErrorWithName("Error", "then call failed")
+				}
+				if e, isErr := res.(*object.Error); isErr && e != nil {
+					return e
+				}
+				return nil
+			}
+			return object.NewTypeError("Promise: resolution has no callable 'then'")
 		}
-		if or, ok2 := onR.(*object.BuiltinFunction); ok2 {
-			p.OnRejected(or)
-		}
-		return nil
+		// 回调非内建 (用户构造器路径): 落通用路径。
 	}
 	getter, hasGet := nextPromise.(interface {
 		GetProperty(string) (object.Value, bool)
@@ -946,6 +752,11 @@ func promiseAttach(nextPromise, onF, onR object.Value) object.Value {
 			if e, isErr := thrown.(*object.Error); isErr && e != nil {
 				return e
 			}
+			// 非 Error 抛值: 裸包装带 Original, 保住 rejection reason 身份
+			// (B1 rwjnvX, 与快路径同口径)。
+			w := object.NewErrorWithName("Error", cbErr.Error())
+			w.Original = thrown
+			return w
 		}
 		return object.NewErrorWithName("Error", cbErr.Error())
 	}
@@ -958,7 +769,9 @@ func promiseAttach(nextPromise, onF, onR object.Value) object.Value {
 		if e, isErr := ev.(*object.Error); isErr && e != nil {
 			return e
 		}
-		return object.NewErrorWithName("Error", "then call failed")
+		w := object.NewErrorWithName("Error", "then call failed")
+		w.Original = unwrapThrown(ev)
+		return w
 	}
 	if e, isErr := res.(*object.Error); isErr && e != nil {
 		return e
@@ -966,71 +779,337 @@ func promiseAttach(nextPromise, onF, onR object.Value) object.Value {
 	return nil
 }
 
-// promiseCollectElements 收集可迭代参数的元素: 数组快路径; 其余走通用迭代
-// 协议 (GetIterator/next/done)。迭代期异常 → 返回错误值。
-func promiseCollectElements(arg object.Value) ([]object.Value, object.Value) {
-	if arg == nil {
-		return nil, object.NewTypeError("Promise: argument is not iterable")
+// ── 聚合族交错驱动 (B1 rwjnvX) ─────────────────────────────────────────────
+//
+// 根因清单 (对应子单 rwjnvX 描述, 全部在本驱动内收口):
+//  1. 旧实现先 promiseCollectElements 把迭代器**排干**再逐元素 resolve ——
+//     规范是「每 next 一个元素立即 resolve 并挂反应」的交错循环
+//     (PerformPromiseAll/AllSettled/Any/Race)。排干在 done 永不成立的迭代器
+//     上死循环 (20 条超时), resolve/then 抛错后也不会 IteratorClose。
+//  2. resolve element 缺 [[AlreadyCalled]] 守卫 —— 同一元素二次结算会改写
+//     results / 提前 remaining 归零 (call-resolve-element-after-return /
+//     resolve-from-same-thenable 族)。
+//  3. reject element 用了每元素独立闭包 —— 规范里 all/any 的 reject 侧与
+//     race 两侧都是共享的 capability [[Reject]]/[[Resolve]]
+//     (same-reject-function / same-resolve-function 族)。
+//  4. element function 缺 length=1 / name="" (resolve-element-function-* /
+//     reject-element-function-* 族, reactionBuiltin 统一补齐)。
+//
+// ⚠ mode: aggAll / aggAllSettled / aggAny / aggRace。
+
+type aggMode int
+
+const (
+	aggAll aggMode = iota
+	aggAllSettled
+	aggAny
+	aggRace
+)
+
+// promiseAggregateReject 统一出口: IfAbruptRejectPromise —— 以 reason 异步
+// reject capability 并返回其 promise; reject 自身异常原样上抛。
+func promiseAggregateReject(cap *promiseCapability, reason object.Value) object.Value {
+	if ev := cap.callReject(reason); ev != nil {
+		return ev
 	}
-	if arr, ok := arg.(*object.Array); ok {
-		return arr.Elements, nil
+	return cap.result()
+}
+
+// promiseIteratorClose 实现 IteratorClose (7.4.7): 取 iterator.return,
+// 可调用则以 iterator 为 this 调用。规范: close 期间 (读取 return、调用)
+// 的任何异常都不覆盖调用方的原始 abrupt completion —— 这里全部吞掉。
+// return 属性存在但不可调用按 GetMethod 语义视作异常, 同样吞掉。
+func promiseIteratorClose(iterator object.Value) {
+	if iterator == nil || !object.IsObjectValue(iterator) {
+		return
 	}
-	sym := object.GetGlobalSymbol("Symbol.iterator")
-	var iterFn object.Value
-	if sym != nil {
-		if sp, ok := arg.(object.SymbolPropertyStore); ok {
-			if v, found := sp.GetSymbolProperty(sym); found && v != nil &&
-				v != object.UndefinedSingleton && v != object.NullSingleton {
+	retFn, _ := iterator.GetProperty("return")
+	if ev := object.TakeThrownValue(); ev != object.UndefinedSingleton {
+		return
+	}
+	if retFn == nil || !object.IsCallable(retFn) {
+		return
+	}
+	_ = object.CallFunction(retFn, iterator)
+	object.TakeThrownValue()
+}
+
+// promiseAggregate 是 all/allSettled/any/race 的共享交错驱动。
+// GetIterator → 逐元素 next → 立即 resolve → 按模式挂反应;
+// 任一 abrupt (next/done/value/resolve/then) 一律 IteratorClose +
+// IfAbruptRejectPromise。返回值恒为 capability 的 promise。
+func promiseAggregate(mode aggMode, cap *promiseCapability, promiseResolve, ctor, iterable object.Value) object.Value {
+	// GetIterator (7.4.1): 数组与字符串原始值走内建快路径 (原生迭代器无
+	// return 语义, 无需 close); 其余走通用 @@iterator —— 沿原型链查符号属性
+	// 并展开访问器 getter, 使 String/Boolean 等原始值经原型获得可迭代性
+	// (iter-arg-is-string-* 族)。
+	var elems []object.Value
+	var iterator, nextFn object.Value
+	if arr, ok := iterable.(*object.Array); ok {
+		elems = arr.Elements
+	} else if s, ok := iterable.(*object.String); ok {
+		for _, r := range s.Value {
+			elems = append(elems, object.NewString(string(r)))
+		}
+	} else {
+		sym := object.GetGlobalSymbol("Symbol.iterator")
+		var iterFn object.Value
+		if sym != nil {
+			if desc, found := object.LookupSymbolPropertyDescriptorChain(iterable, sym); found {
+				v := desc.Value
+				if acc, isAcc := v.(*object.Accessor); isAcc {
+					if acc.Getter == nil {
+						v = object.UndefinedSingleton
+					} else {
+						v = object.CallFunction(acc.Getter, iterable)
+						if ev := object.TakeThrownValue(); ev != object.UndefinedSingleton {
+							return promiseAggregateReject(cap, unwrapThrown(ev))
+						}
+					}
+				}
 				iterFn = v
 			}
 		}
-	}
-	if iterFn == nil {
-		return nil, object.NewTypeError("Promise: argument is not iterable")
-	}
-	if !object.IsCallable(iterFn) {
-		return nil, object.NewTypeError("Promise: [Symbol.iterator] is not a function")
-	}
-	iterator := object.CallFunction(iterFn, arg)
-	if ev := object.TakeThrownValue(); ev != object.UndefinedSingleton {
-		if e, isErr := ev.(*object.Error); isErr && e != nil {
-			return nil, e
+		if iterFn == nil || iterFn == object.UndefinedSingleton || iterFn == object.NullSingleton {
+			return promiseAggregateReject(cap, object.NewTypeError("Promise: argument is not iterable"))
 		}
-		return nil, object.NewErrorWithName("Error", "iterator creation failed")
-	}
-	if !object.IsObjectValue(iterator) {
-		return nil, object.NewTypeError("Promise: iterator is not an object")
-	}
-	var elements []object.Value
-	for {
-		nextFn, found := iterator.GetProperty("next")
-		if !found || nextFn == nil || !object.IsCallable(nextFn) {
-			return nil, object.NewTypeError("Promise: iterator has no callable next")
+		if !object.IsCallable(iterFn) {
+			return promiseAggregateReject(cap, object.NewTypeError("Promise: [Symbol.iterator] is not a function"))
 		}
-		result := object.CallFunction(nextFn, iterator)
+		iterator = object.CallFunction(iterFn, iterable)
 		if ev := object.TakeThrownValue(); ev != object.UndefinedSingleton {
-			if e, isErr := ev.(*object.Error); isErr && e != nil {
-				return nil, e
-			}
-			return nil, object.NewErrorWithName("Error", "next() failed")
+			return promiseAggregateReject(cap, unwrapThrown(ev))
 		}
-		if !object.IsObjectValue(result) {
-			return nil, object.NewTypeError("Promise: iterator result is not an object")
+		if e, isErr := iterator.(*object.Error); isErr && e != nil {
+			return promiseAggregateReject(cap, unwrapThrown(e))
 		}
-		if doneVal, _ := result.GetProperty("done"); doneVal != nil && object.IsTruthyValue(doneVal) {
-			return elements, nil
+		if !object.IsObjectValue(iterator) {
+			return promiseAggregateReject(cap, object.NewTypeError("Promise: iterator is not an object"))
 		}
-		v, _ := result.GetProperty("value")
-		elements = append(elements, v)
+		nextFn, _ = iterator.GetProperty("next")
+		if ev := object.TakeThrownValue(); ev != object.UndefinedSingleton {
+			return promiseAggregateReject(cap, unwrapThrown(ev))
+		}
+		if nextFn == nil || !object.IsCallable(nextFn) {
+			return promiseAggregateReject(cap, object.NewTypeError("Promise: iterator has no callable next"))
+		}
 	}
+
+	// all/allSettled: 结果 List (规范 values 的增长语义: index 不足处补
+	// undefined); any: errors List。remaining 初值 1 = 「迭代正常完成」这一
+	// 份 (规范 remainingElementCount), 元素结算各扣 1, 归零方执行终局 settle。
+	values := []object.Value{}
+	errors := []object.Value{}
+	remaining := 1
+
+	// growList: values/errors List 增长到 index+1 (不足处补 undefined)。
+	growList := func(list []object.Value, index int) []object.Value {
+		for len(list) <= index {
+			list = append(list, object.UndefinedSingleton)
+		}
+		return list
+	}
+	// finalResolve: 终局 resolve (values 数组), 异常 → IfAbruptRejectPromise。
+	finalResolve := func() {
+		if ev := cap.callResolve(object.NewArray(values)); ev != nil {
+			_ = cap.callReject(unwrapThrown(ev))
+		}
+	}
+	// finalAnyReject: 全部失败 → AggregateError, 异常 → IfAbruptRejectPromise。
+	finalAnyReject := func() {
+		if ev := cap.callReject(newAggregateError(errors, "All promises were rejected")); ev != nil {
+			_ = cap.callReject(unwrapThrown(ev))
+		}
+	}
+
+	// makeAllResolveElement: Promise.all Resolve Element Functions ——
+	// [[AlreadyCalled]] 守卫 + values[index] 写入 + remaining 归零终局。
+	makeAllResolveElement := func(index int) object.Value {
+		alreadyCalled := false
+		return reactionBuiltin("", func(args ...object.Value) object.Value {
+			if alreadyCalled {
+				return object.UndefinedSingleton
+			}
+			alreadyCalled = true
+			values = growList(values, index)
+			values[index] = argAt(args, 0)
+			remaining--
+			if remaining == 0 {
+				finalResolve()
+			}
+			return object.UndefinedSingleton
+		})
+	}
+	// makeSettledFulfillElement / makeSettledRejectElement: allSettled 的
+	// 两个 element function —— 规范里同一元素的一对函数**共享**同一个
+	// [[AlreadyCalled]] 记录 (先结算者生效, 另一侧被忽略)。
+	makeSettledElements := func(index int) (object.Value, object.Value) {
+		alreadyCalled := false
+		markSettled := func(statusObj object.Value) {
+			values = growList(values, index)
+			values[index] = statusObj
+			remaining--
+			if remaining == 0 {
+				finalResolve()
+			}
+		}
+		onF := reactionBuiltin("", func(args ...object.Value) object.Value {
+			if alreadyCalled {
+				return object.UndefinedSingleton
+			}
+			alreadyCalled = true
+			statusObj := object.NewObject()
+			statusObj.SetProperty("status", object.NewString("fulfilled"))
+			statusObj.SetProperty("value", argAt(args, 0))
+			markSettled(statusObj)
+			return object.UndefinedSingleton
+		})
+		onR := reactionBuiltin("", func(args ...object.Value) object.Value {
+			if alreadyCalled {
+				return object.UndefinedSingleton
+			}
+			alreadyCalled = true
+			statusObj := object.NewObject()
+			statusObj.SetProperty("status", object.NewString("rejected"))
+			statusObj.SetProperty("reason", argAt(args, 0))
+			markSettled(statusObj)
+			return object.UndefinedSingleton
+		})
+		return onF, onR
+	}
+	// makeAnyErrorElement: Promise.any Reject Element Functions ——
+	// errors[index] 写入 + remaining 归零 → AggregateError。
+	makeAnyErrorElement := func(index int) object.Value {
+		alreadyCalled := false
+		return reactionBuiltin("", func(args ...object.Value) object.Value {
+			if alreadyCalled {
+				return object.UndefinedSingleton
+			}
+			alreadyCalled = true
+			errors = growList(errors, index)
+			errors[index] = argAt(args, 0)
+			remaining--
+			if remaining == 0 {
+				finalAnyReject()
+			}
+			return object.UndefinedSingleton
+		})
+	}
+
+	// 交错主循环。
+	//
+	// close 语义 (对齐规范 Promise.all/allSettled/any/race 调用方步骤):
+	// IteratorStepValue 内部的异常 (next()/读取 done/value) 会把
+	// iteratorRecord.[[Done]] 置 true —— 调用方据此**跳过** IteratorClose
+	// (iter-step-err-no-close / iter-next-val-err-no-close 族断言 returnCount
+	// === 0); 而 promiseResolve 调用或 Invoke(nextPromise,"then") 异常时
+	// [[Done]] 仍为 false —— 调用方执行 IteratorClose 后 IfAbruptRejectPromise
+	// (resolve-throws-iterator-return-* / invoke-then-error-close 族)。
+	elem := object.Value(object.UndefinedSingleton)
+	idx := 0
+	iterDone := false
+	closeUnlessDone := func() {
+		if !iterDone && iterator != nil {
+			promiseIteratorClose(iterator)
+		}
+	}
+	for {
+		if nextFn == nil {
+			// 内建快路径 (数组/字符串): 无迭代器对象, 取尽即完, 无 close。
+			if idx >= len(elems) {
+				break
+			}
+			elem = elems[idx]
+		} else {
+			result := object.CallFunction(nextFn, iterator)
+			if ev := object.TakeThrownValue(); ev != object.UndefinedSingleton {
+				iterDone = true
+				return promiseAggregateReject(cap, unwrapThrown(ev))
+			}
+			if e, isErr := result.(*object.Error); isErr && e != nil {
+				iterDone = true
+				return promiseAggregateReject(cap, unwrapThrown(e))
+			}
+			if !object.IsObjectValue(result) {
+				iterDone = true
+				return promiseAggregateReject(cap, object.NewTypeError("Promise: iterator result is not an object"))
+			}
+			doneVal, _ := result.GetProperty("done")
+			if ev := object.TakeThrownValue(); ev != object.UndefinedSingleton {
+				iterDone = true
+				return promiseAggregateReject(cap, unwrapThrown(ev))
+			}
+			if doneVal != nil && object.IsTruthyValue(doneVal) {
+				break
+			}
+			elem, _ = result.GetProperty("value")
+			if ev := object.TakeThrownValue(); ev != object.UndefinedSingleton {
+				iterDone = true
+				return promiseAggregateReject(cap, unwrapThrown(ev))
+			}
+		}
+
+		// nextPromise = Call(promiseResolve, ctor, «value») —— receiver 是
+		// 构造器 ctor (规范 PerformPromiseAll: Call(promiseResolve, ctor, «next»);
+		// invoke-resolve.js: assert.sameValue(this, Promise))。
+		nextPromise := object.CallFunction(promiseResolve, ctor, elem)
+		if ev := object.TakeThrownValue(); ev != object.UndefinedSingleton {
+			closeUnlessDone()
+			return promiseAggregateReject(cap, unwrapThrown(ev))
+		}
+		if e, isErr := nextPromise.(*object.Error); isErr && e != nil {
+			closeUnlessDone()
+			return promiseAggregateReject(cap, unwrapThrown(e))
+		}
+
+		// 规范: 每挂一个元素 remainingElementsCount +1 (在 Invoke "then" 前)。
+		remaining++
+
+		// 按模式挂反应 (reject/resolve 侧共享或每元素, 见根因清单 2/3)。
+		var onF, onR object.Value
+		switch mode {
+		case aggAll:
+			onF = makeAllResolveElement(idx)
+			onR = cap.reject
+		case aggAllSettled:
+			onF, onR = makeSettledElements(idx)
+		case aggAny:
+			onF = cap.resolve
+			onR = makeAnyErrorElement(idx)
+		case aggRace:
+			onF = cap.resolve
+			onR = cap.reject
+		}
+		if errVal := promiseAttach(nextPromise, onF, onR); errVal != nil {
+			closeUnlessDone()
+			return promiseAggregateReject(cap, unwrapThrown(errVal))
+		}
+		idx++
+	}
+
+	// 迭代正常完成: remaining 扣 1, 归零方执行终局 settle
+	// (空迭代器 → 直接终局)。
+	remaining--
+	if remaining == 0 {
+		switch mode {
+		case aggAll, aggAllSettled:
+			finalResolve()
+		case aggAny:
+			finalAnyReject()
+		}
+	}
+	return cap.result()
 }
 
 // reactionBuiltin 创建反应元素函数 (resolve/reject element): 规范上它们
 // 没有 [[Construct]] —— `new resolveFn` 必须 TypeError
 // (resolve-element-function-nonconstructor / reject-element-* 族)。
+// length 统一为 1、name 由调用方给 "" (规范 element function 是匿名函数,
+// verifyProperty 的 length/name 描述符族, B1 rwjnvX)。
 func reactionBuiltin(name string, fn func(args ...object.Value) object.Value) *object.BuiltinFunction {
 	b := object.NewBuiltin(name, fn)
 	b.NotConstructable = true
+	b.SetFunctionLength(1)
 	return b
 }
 
@@ -1054,7 +1133,7 @@ func setupPromiseProto() *object.Object {
 	p := object.NewObject()
 
 	// then(onFulfilled, onRejected) —— 27.5.5.4: species 构造器 + 能力校验
-	p.SetBuiltinProperty("then", object.NewBuiltinMethod("then", func(this object.Value, args ...object.Value) object.Value {
+	thenBuiltin := object.NewBuiltinMethod("then", func(this object.Value, args ...object.Value) object.Value {
 		// 步骤 2: IsPromise(this) false → TypeError
 		promise, ok := this.(*object.Promise)
 		if !ok {
@@ -1160,7 +1239,9 @@ func setupPromiseProto() *object.Object {
 		}
 		// 反应回调统一走微任务队列 (已结算也不同步执行), 实现在 object 层。
 		return promise.ThenCatch(onFulfilled, onRejected)
-	}))
+	})
+	p.SetBuiltinProperty("then", thenBuiltin)
+	promiseProtoThen = thenBuiltin
 
 	// catch(onRejected)
 	p.SetBuiltinProperty("catch", object.NewBuiltinMethod("catch", func(this object.Value, args ...object.Value) object.Value {

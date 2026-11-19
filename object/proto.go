@@ -67,6 +67,11 @@ func ProtoOf(v Value) Value {
 	// RegExp 的原型同样在类型注册表里 (object.RegExpProto, 见 rEXjyz)。
 	case *RegExp:
 		return t.GetProto()
+	// 错误实例按 Name 解析 NativeError.prototype (B1 rwjnvX): TypeError
+	// 实例的原型必须是 %TypeError.prototype% 而非 %Error.prototype%。
+	// 未注册的 Name 返回 nil, 由调用方回落既有口径。
+	case *Error:
+		return ErrorProtoOf(t)
 	}
 	return nil
 }
