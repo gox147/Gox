@@ -444,3 +444,42 @@ A 路径「零 cgo、单机交叉编译」矩阵自此五平台全通（js/wasm 
 G-1 收尾仍差硬件覆盖三项（win32/x11/cocoa 三平台真机 audit+bench、swapchain 真机
 点亮对照数字），需真机，不标 done。26 组件 CPU vs GPU 双轨快照 A/B（CI run
 44523852777）差异像素 0 —— Prism 视觉一致性维持零退化，本窗口变更未触碰视觉面。
+
+## 2026-11-20 00:05 执行窗口复跑核销（Linux x86_64 32 核沙箱，无 GPU 硬件，全部为兜底口径：不进闸门、不对外）
+
+### 环境与基线
+
+- 基线 commit 751687e（main，本轮 builtins 侧新提交后的首次 GPU 三轨复跑；
+  main 自 778392a 起漂移，需确认渲染面无回归）。
+- 本窗口为纯核销运行，不触碰任何 Go 渲染代码，无代码变更提交。
+
+### 三轨复跑（gpu-track-audit.sh）
+
+| 轨 | BackendKind | Backend | 结论 |
+|---|---|---|---|
+| nogpu | none | none | 恒 ErrNotBuilt，CPU blit |
+| wgpu | software | wgpu-software | 无硬件兜底口径：不进闸门、不对外 |
+| cgo | none | cgo | 骨架阶段恒 ErrNotBuilt |
+
+与 11-08 / 11-15 / 11-18 / 11-19 基线逐项一致，无漂移。接入面核销不变：
+swapchain 已接线（真机验证待做）、移动端未接入、CI gpu 跑批在位。
+
+### 回归与交叉编译矩阵
+
+- `go test ./gfx/gpu`（nogpu 轨）与 `go test -tags gpu ./gfx/gpu`（wgpu 轨）均绿；
+  `go test ./gfx/...` 全包零失败。
+- `--xcompile` 矩阵（CGO_ENABLED=0）：windows/amd64+arm64、linux/amd64+arm64
+  （`-tags gpu`）、darwin/amd64+arm64（`-tags gpu,nofakecgo`）共 6 目标全 `ok`；
+  js/wasm 维持已知不支持（wgpu hal/allbackends 无 wasm 构建），诚实输出。
+
+### 视觉与降级闸门
+
+- `TestGPUSnapshotAB26`（26 组件 CPU vs GPU 双轨快照，阈值 0）PASS —— Prism
+  视觉一致性零退化；`TestGPUPresentPixelExact` PASS；`TestSwapchainGate`
+  五道降级 gate 全绿。
+
+### 诚实口径
+
+本窗口全部数字为无硬件兜底口径，不进闸门、不对外，不构成硬件成果。
+G-1 收尾仍差硬件覆盖三项（win32/x11/cocoa 三平台真机 audit+bench、swapchain
+真机点亮对照数字），需真机，不标 done。
