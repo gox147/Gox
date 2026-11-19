@@ -1,0 +1,90 @@
+{
+  "generated_at": "2026-11-19T16:36:35.135858+00:00",
+  "batch": "T3-5 第二十批 (2026-11-20 凌晨) §12.20",
+  "kind": "measurement-artifact-diagnosis (no runtime change shipped)",
+  "summary": "首帧口径里 10~15ms 的双峰是 Xvfb 的 accept 抑制 (上一个客户端断开后 ~1s 内新连接不被服务), 不是 gox 代码。本批只做口径与探针, 运行时零改动。",
+  "binary": {
+    "base_commit": "751687e",
+    "note": "本批工作树运行时文件与 751687e 一致 (git status 无 gfx/ 改动); 二进制未入库"
+  },
+  "probe": {
+    "cmd": "./scripts/x11-dead-socket-probe.sh --display :55 --runs N --gap G",
+    "gap0": {
+      "runs": 8,
+      "fast": 1,
+      "slow": 7,
+      "failed": 0,
+      "slow_range_ms": [
+        13.9,
+        15.7
+      ]
+    },
+    "gap1_2": {
+      "runs": 16,
+      "fast": 16,
+      "slow": 0,
+      "failed": 0,
+      "range_ms": [
+        0.14,
+        0.17
+      ]
+    }
+  },
+  "coldstart_same_binary": {
+    "form_A_user_pattern_no_gap": {
+      "n": 10,
+      "median_ms": 18,
+      "samples_ms": [
+        9,
+        18,
+        17,
+        18,
+        19,
+        18,
+        18,
+        18,
+        18,
+        17
+      ]
+    },
+    "form_B_script_gap_1_2s": {
+      "n": 10,
+      "median_ms": 9,
+      "samples_ms": [
+        9,
+        9,
+        19,
+        9,
+        9,
+        9,
+        9,
+        10,
+        9,
+        9
+      ]
+    }
+  },
+  "harness_findings": {
+    "sleep_fraction_truncated": "sleep 0.5 在本沙箱实测只等 1.2ms (小数按整数截断)",
+    "EPOCHREALTIME_unreliable": "相邻两次取值会给出 0; 计时改用 date +%s%6N"
+  },
+  "withdrawn_attempts": [
+    "EOF 重连 (io.EOF / ErrDeadlineExceeded 视为瞬时): 死连接上读到的是'没数据'而非 EOF, pollWait 吞掉错误重试, 无效",
+    "2ms 固定期限: 2ms×6~8 次 ≈ 13~16ms, 与不优化持平",
+    "梯度期限 (2ms→350µs): 干净握手 0.06~0.11ms 被误伤, 首帧 30ms 级",
+    "SHUT_WR watchdog: 半关闭不能打断读, 仍等内核 11~14ms",
+    "SetDeadline 打断读: 反复开连→立刻放弃 会把 Xvfb 恢复期续上 (40 次全慢, 累计 42ms)",
+    "建窗后补预热连接: 第二条连接并存使下个进程握手 78~208ms"
+  ],
+  "conditions": {
+    "cpu": "AMD EPYC 9K65 192-Core Processor",
+    "cores": 32,
+    "cgroup_cpu_max": "400000 100000",
+    "kernel": "6.6.117-45.11.6.tl4.x86_64",
+    "go": "go version go1.26.2 linux/amd64",
+    "display": "Xvfb :55 1024x768x24",
+    "fonts": "426",
+    "when": "2026-11-20 00:30-01:10 北京时间"
+  },
+  "note": "本文件只记录口径结论与撤回记录; 不含任何'优化收益'数字 —— 本批没有把任何运行时改动合入。"
+}

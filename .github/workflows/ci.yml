@@ -358,6 +358,14 @@ jobs:
         run: |
           set -euo pipefail
           sudo apt-get install -yq fonts-noto-cjk
+          # 本机 X server 是否会挂住新连接 (T3-5 第二十批, §12.20): 只记录不判红 ——
+          # 它描述的是 runner 环境而不是产品代码, 红在这里会让"环境换了"被误读成
+          # "回归"。记录下来是为了下次有人看到冷启动数字双峰时能立刻排除口径。
+          if [[ -n "${DISPLAY:-}" ]]; then
+            bash scripts/x11-dead-socket-probe.sh --runs 6 --gap 0 || true
+          else
+            echo "[probe] runner 无 DISPLAY, 跳过 X 建连探针"
+          fi
           if ! go test ./gfx/ -run 'TestFontFileReadOnceAcrossScanAndChoose|TestScanSystemFontsDoesNotReadFontBytes|TestFontFileReadHookIsLive|TestFontFileCacheHonoursFileIdentity|TestChooseBaseFontReadsOnlyChosenFile|TestChooseBaseFontFallbackStillReadsOneFile|TestProbeFileFaceRankMatchesFullParse' -count=1; then
             echo "::error::字体栈读盘纪律被破坏 —— 扫描不该读字节, 选默认只该整份读被选中的那个, 探针与整份解析必须同口径（见 gfx/font.go 的 fontFileEntry / probeFileFaceRank 注释, docs/performance.md §12.10）"
             exit 1
