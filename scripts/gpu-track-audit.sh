@@ -90,9 +90,16 @@ echo "  - CI gpu 跑批: ${gpu_ci:-无 (见 .github/workflows/gpu-present.yml �
 # ---- 交叉编译矩阵抽查 (可选) ----
 if [[ "$XCOMPILE" == 1 ]]; then
   echo ""
-  echo "交叉编译矩阵抽查 (-tags gpu, 编译期验证 wgpu 纯 Go 可交叉):"
-  for tgt in "windows/amd64" "darwin/arm64" "linux/arm64" "js/wasm"; do
-    GOOS="${tgt%%/*}" GOARCH="${tgt##*/}" CGO_ENABLED=0 go build -tags gpu -o /dev/null ./cmd/gox \
-      && echo "  ok   $tgt" || echo "  FAIL $tgt"
+  echo "交叉编译矩阵抽查 (CGO_ENABLED=0, 编译期验证 wgpu 纯 Go 可交叉):"
+  # darwin 必须加 nofakecgo: cocoa (purego) 与 goffi 各带一份 fakecgo,
+  # CGO_ENABLED=0 下 _cgo_init 重复定义 (2026-11-19 08:00 窗口修复,
+  # 见 docs/gpu-track-audit.md「darwin 交叉编译冲突」节)。
+  # linux GPU 轨不能加 nofakecgo: 无 purego 用户时禁掉 goffi fakecgo
+  # 会导致 relocation target crosscall2 not defined。
+  for tgt in "windows/amd64" "darwin/amd64" "darwin/arm64" "linux/amd64" "linux/arm64" "js/wasm"; do
+    _goos="${tgt%%/*}"; _goarch="${tgt##*/}"
+    if [[ "$_goos" == "darwin" ]]; then _tags="gpu,nofakecgo"; else _tags="gpu"; fi
+    GOOS="$_goos" GOARCH="$_goarch" CGO_ENABLED=0 go build -tags "$_tags" -o /dev/null ./cmd/gox \
+      && echo "  ok   $tgt (-tags $_tags)" || echo "  FAIL $tgt"
   done
 fi

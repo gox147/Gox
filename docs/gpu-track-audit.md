@@ -366,3 +366,40 @@ Xvfb 下逐像素实测复现（红象限读回为蓝）。修复：窗口化 sw
 不产生任何可对外引用的性能数字；硬件口径仍归 hardware job（GPU_HARDWARE_RUNNER）。
 真机三平台点亮（win32 HWND / cocoa CAMetalLayer 侧）仍属 G-3 硬件覆盖待办；
 x11 这一行自此从「纯真机待办」中拆出（接线 + 像素已钉，性能待硬件）。
+
+## darwin 交叉编译冲突修复：nofakecgo 官方开关（2026-11-19 08:00 执行窗口，Linux x86_64 32 核沙箱，编译期验证）
+
+上一窗口遗留的「另案」——darwin GPU 轨 `CGO_ENABLED=0` 交叉编译炸链接——本窗口修复，
+A 路径「零 cgo、单机交叉编译」矩阵自此五平台全通（js/wasm 维持已知不支持，诚实输出）。
+
+### 根因与修复
+
+- **根因**：darwin GPU 轨构建里，gfx/cocoa（purego/objc，默认轨必需）与 goffi（GPU 轨
+  wgpu 调用）**各带一份 `internal/fakecgo`**，两者都注入 `_cgo_init` 等符号；
+  `CGO_ENABLED=0` 下链接 `cmd/gox` 报
+  `duplicated definition of symbol _cgo_init ... goffi/internal/fakecgo and purego/internal/fakecgo`。
+- **修复**：goffi 自带官方开关——`ffi/fakecgo_unix.go` 的构建约束是
+  `(linux || darwin || freebsd) && !cgo && !nofakecgo`，注释明确写着「for projects that
+  already provide these symbols through another package (e.g., purego's internal/fakecgo)」。
+  darwin GPU 构建加 `nofakecgo` 即让 goffi 复用 purego 的 fakecgo（两者同源 fork，符号集兼容）。
+- **实测**（编译期，`go build -tags gpu,nofakecgo`）：darwin amd64 ✅ / darwin arm64 ✅。
+
+### 平台差异化口径（重要，别抄错）
+
+| 平台 | GPU 轨构建 tag | 原因 |
+|---|---|---|
+| darwin (amd64/arm64) | `-tags gpu,nofakecgo` | cocoa 的 purego 提供 fakecgo，必须禁 goffi 自带份 |
+| linux (amd64/arm64) | `-tags gpu`（**不能**加 nofakecgo） | GPU 轨已无 purego 用户，禁掉 goffi fakecgo 后无人提供 `runtime.iscgo`，链接报 `relocation target crosscall2 not defined`（实测复现） |
+| windows/amd64 | `-tags gpu` | goffi fakecgo 仅 unix 生效，无冲突 |
+| js/wasm | 已知不支持 | wgpu hal/allbackends 无 wasm 构建 |
+
+落地：`scripts/gpu-track-audit.sh` 的 `--xcompile` 矩阵按平台自动选 tag（darwin 两架构
+加入矩阵），复跑输出 win/linux amd64+arm64 与 darwin amd64+arm64 全 `ok`。
+
+### 诚实口径
+
+- 本节全部为**编译期验证**（Linux x86_64 沙箱交叉编译），无 GPU 硬件，不产生任何性能
+  数字；darwin 真机上 goffi×purego 混用 fakecgo 的**运行时语义**（回调、线程、异常路径）
+  仍属 G-3 cocoa 真机点亮验证项，不得因编译通过声称 cocoa GPU 轨可用。
+- 本窗口未触碰任何 Go 代码（仅 shell 脚本 + 文档），26 组件 CPU vs GPU 双轨快照 A/B
+  （`-tags gpu`，软件适配器兜底口径）复跑 PASS，差异像素 0 —— Prism 视觉一致性零退化。
