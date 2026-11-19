@@ -387,6 +387,25 @@ jobs:
             exit 1
           fi
 
+      # 分配预算闸门（T3-4 第九批，2026-11-20 凌晨批）。
+      # 为什么它必须独立成一步、且不挂 if: runner.os：
+      #   它判的是**分配次数**（确定性，同一份代码逐轮差 ≤3 次，跨机器基本一致），
+      #   不是毫秒数，所以在 2 核 runner 上也不会假红；而它守的退化恰恰是
+      #   check-bench（毫秒，噪声 ±1% ⇒ 少 10% 分配看不出来）与 check-coldstart
+      #   （首帧，与热循环无关）都拦不住的那一类：把快路径退回通用路径。
+      #   三平台都跑，是因为这条退化与平台无关，只在 Linux 上守等于给另外两个
+      #   平台留门（与字体缓存身份纪律同一条理由）。
+      - name: 分配预算闸门（热循环 + 解释器初始化）
+        shell: bash
+        run: |
+          set -uo pipefail
+          go test ./tools/perf/ -run 'TestFib28AllocBudget|TestSetupGlobalsAllocBudget' -count=1 -v 2>&1
+          rc=$?
+          if [ "$rc" -ne 0 ]; then
+            echo "::error::分配预算被打破 —— fib28 热循环或解释器初始化的分配次数超预算。这不是毫秒级回归, 是「快路径退化」: 先看是不是把 Number+Number / arguments 惰性化 / 常量池复用退回了通用路径（docs/performance.md §3.4.7、§12.22.5）"
+            exit 1
+          fi
+
       # 证据纪律（看板 rXrGfu，2026-10-07 补）：本步曾在 macos-latest 上持续红，
       # 而 check-run 注解只有 `Process completed with exit code 1.`（未登录读不到
       # job 日志）⇒ 与 Linux 那条同款处理：自己把「失败包 + 失败用例名 + 断言明细」
