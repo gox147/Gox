@@ -28,6 +28,7 @@ import (
 	"image"
 	"image/color"
 	"math"
+	"os"
 	"testing"
 
 	"github.com/gogpu/gputypes"
@@ -102,6 +103,19 @@ fn fs(v: VOut) -> @location(0) vec4f {
 
 // probeGPUDevice 与 gfx/gpu.Device 同构的最小 device 建立（gfx 包内测试
 // 不能 import gfx/gpu —— 它反过来 import gfx, 会成环）。返回 (device, 口径)。
+//
+// 【2026-11-20 段错误根因与门控】本函数在**共享的 gfx 测试进程内**执行
+// wgpu.CreateInstance + RequestAdapter —— RequestAdapter 会按 allbackends
+// 注册顺序逐后端枚举, 在装有 libvulkan.so.1 的机器上会经 goffi(FFI)
+// dlopen **真 Vulkan loader** 并枚举适配器（如 lavapipe）, loader 自建
+// 原生线程。实测组合后果: 全量 `go test -tags gpu ./gfx/` 在探针之后
+// ~150 个用例处延迟 SIGSEGV, 崩溃栈 gdb 取证为 **cgo trampoline
+// (runtime/cgo crosscall1) 执行堆地址**(无 Go 运行时栈, GOTRACEBACK=crash
+// 亦无输出), -race 零 DATA RACE 报告; 对照实验: 无 -tags gpu 全量 PASS、
+// 前缀剔除本探针 PASS、GOMAXPROCS=2 仍崩（非调度规模问题）。
+// ⇒ 探针存在价值在「硬件复测/专项运行」, 不在全量跑批的进程卫生。改为
+// 显式 opt-in: GOX_GPU_PROBE=1 才运行; gpu-hardware runner 的 job 里
+// 显式带上该变量。
 func probeGPUDevice(t *testing.T) (*wgpu.Device, string) {
 	t.Helper()
 	inst, err := wgpu.CreateInstance(nil)
@@ -323,6 +337,11 @@ func readbackTexture(t *testing.T, dev *wgpu.Device, tex *wgpu.Texture) *image.R
 }
 
 func TestProbeGPURoundRectPixelAB(t *testing.T) {
+	// 显式 opt-in（见 probeGPUDevice 上方门控注释）: 全量跑批默认跳过,
+	// 专项探针运行 GOX_GPU_PROBE=1 ./... 打开。
+	if os.Getenv("GOX_GPU_PROBE") != "1" {
+		t.Skip("GPU 光栅化探针默认不在全量跑批内运行 —— 探针经 goffi 枚举真 Vulkan loader, 会污染共享测试进程（2026-11-20 段错误根因, 见上方注释）; 专项运行: GOX_GPU_PROBE=1 go test -tags gpu ./gfx/ -run TestProbeGPURoundRectPixelAB")
+	}
 	// GPU device 建立与口径报告
 	dev, kind := probeGPUDevice(t)
 
