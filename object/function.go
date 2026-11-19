@@ -400,6 +400,16 @@ type BuiltinFunction struct {
 	// 把返回的 TypedArray 实例回填为派生构造器帧的 this (super() 走
 	// [[Construct]] 而非普通调用, 见 vm.invokeWithThis)。
 	IsTypedArrayCtor bool
+	// Length 是函数对象 length 自有属性的值 (规范形参个数)。
+	//
+	// T3-5 第二十三批: 此前内建函数的 length 只存在于 PropDescs 里 —— 于是
+	// 每个内建函数都要为它建一张 map 并分配一个描述符, 而 SetupGlobals 末尾
+	// 的 applyBuiltinLengths 又会逐个写一遍, 这条路径在本机剖面里占初始化
+	// 时间的约 6%。GetProperty / OwnDescriptor 的 "length" 分支本就按规范
+	// 硬编码了不可写/不可枚举/可配置, 所以结构体字段足以承载它, 语义不变,
+	// 却省掉每个函数一次 map 建立。用户显式 defineProperty 的 length 仍写
+	// PropDescs, 优先级不变。
+	Length int
 }
 
 // constructCallDepth 记录当前是否处于"内建经 new 调用"的同步窗口。
@@ -458,7 +468,7 @@ func (b *BuiltinFunction) GetProperty(name string) (Value, bool) {
 	case "name":
 		return NewString(b.Name), true
 	case "length":
-		return NewInt(0), true
+		return NewInt(int64(b.Length)), true
 	case "call", "apply", "bind", "toString":
 		return funcProtoLookup(b, name)
 	}
@@ -585,16 +595,27 @@ func NewBuiltin(name string, fn func(args ...Value) Value) *BuiltinFunction {
 // 值为 n, 描述符 { [[Writable]]: false, [[Enumerable]]: false,
 // [[Configurable]]: true }。
 //
-// 必须走 DefineOwn (写 PropDescs) 而不是 SetProperty: 后者只写 Properties,
-// 而 OwnDescriptor("length") 走的是结构体分支 (恒 0), 于是会出现
-// `Function.length === 1` 但 `getOwnPropertyDescriptor(Function,"length").value
-// === 0` 的口径分裂 (built-ins/Function 类用例会因此挂)。
+// 必须写结构体字段而不是 SetProperty: 后者只写 Properties, 而 OwnDescriptor
+// ("length") 走的是结构体分支, 于是会出现 `Function.length === 1` 但
+// `getOwnPropertyDescriptor(Function,"length").value === 0` 的口径分裂
+// (built-ins/Function 类用例会因此挂)。
+//
+// T3-5 第二十三批: 由「写 PropDescs」改为「写 Length 字段」—— 见字段注释。
+// 语义不变, 闸门 stdlib/builtin_lengths_test.go。
 func (b *BuiltinFunction) SetFunctionLength(n int) {
-	b.DefineOwn("length", PropertyDescriptor{Value: NewInt(int64(n)), Writable: false, Enumerable: false, Configurable: true})
+	// T3-5 第二十三批: 结构体 Length 是唯一真相源 (见 BuiltinFunction.Length)。
+	//
+	// 用户显式 defineProperty(f, "length", {...}) 走 *BuiltinFunction.DefineOwn
+	// 的 length 分支, 那里**同时**写 PropDescs 与这个字段 —— 否则 delete
+	// f.length 再重新 defineProperty 的序列会让两份取值互相看不见。
+	// 这条分支曾被怀疑拖慢 fib28 而短暂撤回过, 三方差分实测差 0.3% (噪声内),
+	// 见 docs/performance.md §3.4.9。
+	b.Length = n
 }
 
-// SetFunctionLength 是 BuiltinMethod 的同语义版本 (与 *BuiltinFunction 同法,
-// 走 PropDescs 以保证 GetProperty 与 getOwnPropertyDescriptor 口径一致)。
+// SetFunctionLength 是 BuiltinMethod 的同语义版本 —— 同样写结构体 Length
+// 字段 (T3-5 第二十三批), GetProperty 与 getOwnPropertyDescriptor 都读它,
+// 口径天然一致。
 func (b *BuiltinMethod) SetFunctionLength(n int) {
 	b.DefineOwn("length", PropertyDescriptor{Value: NewInt(int64(n)), Writable: false, Enumerable: false, Configurable: true})
 }

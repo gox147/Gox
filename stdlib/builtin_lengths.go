@@ -3,9 +3,9 @@
 package stdlib
 
 import (
-	"github.com/14752222/Gox/object"
 	"strings"
 
+	"github.com/14752222/Gox/object"
 	"github.com/14752222/Gox/runtime"
 )
 
@@ -573,13 +573,27 @@ var builtinLengths = map[string]int{
 }
 
 // applyBuiltinLengths 遍历 builtinLengths, 把每个限定名解析为实际的内建
-// 函数/方法对象并设置规范的 length 自有属性 (SetFunctionLength: 不可写、
-// 不可枚举、可配置)。解析失败的键静默跳过 (如引擎未实现的命名空间)。
+// 函数/方法对象并设置规范的 length 自有属性 (不可写、不可枚举、可配置)。
+// 解析失败的键静默跳过 (如引擎未实现的命名空间)。
 //
 // 应在 SetupGlobals 末尾 (所有内建注册完毕后) 调用一次。
 //
 // 冷启动热路径 (T3-5 第二批): 全部 ~575 个限定名都不切 slice —— 见
 // splitRoot / setLengthFromNamePath 的注释。
+//
+// 冷启动热路径 (T3-5 第二十三批): 不再逐条走 DefineOwn 写 PropDescs。
+//
+// 原先每条 SetFunctionLength 都是 DefineOwn("length", ...) —— 建一张 map、
+// 分配一个描述符、再在收尾 linkBuiltinPrototypes 遍历时被多扫一次。但
+// BuiltinFunction/BuiltinMethod 的 length **本来就**是结构体字段 (GetProperty
+// 与 OwnDescriptor 的 "length" 分支都读它, 描述符标志也按规范硬编码为不可写/
+// 不可枚举/可配置), 所以往 PropDescs 里再放一份等于双写: 内存多一份、GC
+// 多扫一处、启动多一段时间 (本机剖面: SetFunctionLength cum 占 SetupGlobals
+// 约 6%)。改为只写结构体字段后语义不变, 闸门是 stdlib/builtin_lengths_test.go
+// (描述符标志 / for-in 不可见 / defineProperty 口径 / 0 值不跳过)。
+//
+// 非 Builtin 的函数类 (Temporal 等惰性工厂可能造出 *object.Object 包装) 仍走
+// SetFunctionLength: 它们的 length 不在结构体上, 无处可省。
 func applyBuiltinLengths(env *runtime.Environment) {
 	for path, n := range builtinLengths {
 		root, rest := splitRoot(path)
@@ -675,10 +689,24 @@ func setLengthFromNamePath(root object.Value, path string, n int) {
 		}
 		v = nv
 	}
+	setBuiltinLength(v, n)
+}
+
+// setBuiltinLength 把规范 length 写到内建函数类值上。
+//
+// 为什么结构体字段就够 (T3-5 第二十三批): *BuiltinFunction 与 *BuiltinMethod
+// 的 "length" 读路径 (GetProperty / OwnDescriptor) 都直读 b.Length, 描述符
+// 标志硬编码为 {writable:false, enumerable:false, configurable:true} —— 与
+// SetFunctionLength 写进 PropDescs 的那份完全等价。写字段不走 map 分配。
+// 用户 delete 之后再 defineProperty 的序列由 DefineOwn 的 length 分支同步。
+//
+// 其余能承载 length 的对象 (例如惰性工厂用 NewObject + SetProperty 造出来的
+// 命名空间成员) 保留原语义, 走 SetFunctionLength 的 DefineOwn 路径。
+func setBuiltinLength(v object.Value, n int) {
 	switch fn := v.(type) {
 	case *object.BuiltinFunction:
-		fn.SetFunctionLength(n)
+		fn.Length = n
 	case *object.BuiltinMethod:
-		fn.SetFunctionLength(n)
+		fn.Length = n
 	}
 }

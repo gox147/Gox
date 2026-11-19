@@ -1,0 +1,62 @@
+{
+  "tool": "perf-ab.sh",
+  "generated_at": "2026-11-19T22:15:11Z",
+  "bench": "Fib28PureEval",
+  "benchtime": "10x",
+  "runs": 12,
+  "base": {
+    "rev": "HEAD",
+    "commit": "281d47c",
+    "dirty": false
+  },
+  "candidate": {
+    "commit": "281d47c",
+    "dirty": true
+  },
+  "ns_per_op": {
+    "base_median": 136946453.5,
+    "candidate_median": 138122100.5,
+    "gain_pct": -0.85847203045678
+  },
+  "b_per_op": {
+    "base_median": 10814509.0,
+    "candidate_median": 10708107.0
+  },
+  "allocs_per_op": {
+    "base_median": 403269.0,
+    "candidate_median": 402737.0
+  },
+  "rounds_candidate_faster": 3,
+  "threshold_pct": 5.0,
+  "verdict": "fail",
+  "samples": {
+    "base": [
+      137583713.0,
+      136451874.0,
+      135869155.0,
+      137531462.0,
+      137959194.0,
+      137296259.0,
+      136596648.0,
+      136070721.0,
+      136275679.0,
+      135189535.0,
+      139180352.0,
+      137397054.0
+    ],
+    "candidate": [
+      138519200.0,
+      137170649.0,
+      138446252.0,
+      136886134.0,
+      138055407.0,
+      137316998.0,
+      137434704.0,
+      138188794.0,
+      138922672.0,
+      138479279.0,
+      138708337.0,
+      137154387.0
+    ]
+  }
+}

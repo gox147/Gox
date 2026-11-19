@@ -759,7 +759,7 @@ func (b *BuiltinFunction) OwnDescriptor(name string) (PropertyDescriptor, bool) 
 	case "name":
 		return functionNameDescriptor(b)
 	case "length":
-		return closureLengthDescriptor(0), true
+		return closureLengthDescriptor(b.Length), true
 	}
 	if b.Properties != nil {
 		if v, ok := b.Properties[name]; ok {
@@ -776,6 +776,17 @@ func (b *BuiltinFunction) OwnDescriptor(name string) (PropertyDescriptor, bool) 
 }
 
 func (b *BuiltinFunction) DefineOwn(name string, desc PropertyDescriptor) bool {
+	if name == "length" {
+		if b.PropDescs == nil {
+			b.PropDescs = make(map[string]PropertyDescriptor)
+		}
+		noteFuncKey(&b.propKeyOrder, name)
+		b.PropDescs[name] = desc
+		if n, isNum := desc.Value.(*Number); isNum && !desc.Deleted {
+			b.Length = int(n.Value)
+		}
+		return true
+	}
 	if b.PropDescs == nil {
 		b.PropDescs = make(map[string]PropertyDescriptor)
 	}

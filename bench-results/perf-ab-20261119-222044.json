@@ -1,0 +1,58 @@
+{
+  "tool": "perf-ab.sh",
+  "generated_at": "2026-11-19T22:20:44Z",
+  "bench": "SetupGlobals",
+  "benchtime": "20x",
+  "runs": 10,
+  "base": {
+    "rev": "HEAD",
+    "commit": "281d47c",
+    "dirty": false
+  },
+  "candidate": {
+    "commit": "281d47c",
+    "dirty": true
+  },
+  "ns_per_op": {
+    "base_median": 293694.5,
+    "candidate_median": 224095.5,
+    "gain_pct": 23.697753958620265
+  },
+  "b_per_op": {
+    "base_median": 329483.5,
+    "candidate_median": 222682.0
+  },
+  "allocs_per_op": {
+    "base_median": 2103.0,
+    "candidate_median": 1570.0
+  },
+  "rounds_candidate_faster": 10,
+  "threshold_pct": 5.0,
+  "verdict": "pass",
+  "samples": {
+    "base": [
+      290322.0,
+      277679.0,
+      276055.0,
+      283862.0,
+      310509.0,
+      319792.0,
+      275060.0,
+      304605.0,
+      297067.0,
+      318308.0
+    ],
+    "candidate": [
+      227789.0,
+      238315.0,
+      238247.0,
+      222091.0,
+      260993.0,
+      222214.0,
+      222687.0,
+      213795.0,
+      225504.0,
+      219280.0
+    ]
+  }
+}

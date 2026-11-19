@@ -30,6 +30,8 @@
 |---|---|---|
 | 解释器性能达 goja 同级 | ✅ **达标（2026-11-14 CI 复测）** | fib28 纯计算口径 gox/goja = **1.22×**（247 / 203 ms，CI runner）≤ §3.1 阈值 ×1.25。历史轨迹：2.39×（2026-10-02）→ 1.7×（10-31，T2-4）→ 1.32×（11-10 CI）→ 1.22×（11-14 CI，T3-4 三批后首次落闸）→ **1.09×**（11-17 本机夜批，T3-4 第四批），见 [§3.2](#32-跨运行时四栈台账t2-22026-10-28-首跑--2026-10-31-复验) |
 | 对 node 的 fib28 ≤ 3× | ❌ **结构性不可达（2026-11-19 实测，§3.4）** | 本机 200ms vs node 30ms = **6.7×**；3× 要求每指令 **12.9ns → 5.9ns**，而同类解释器 goja 也在 12ns 量级。差的 39 倍里绝大部分是**解释器 vs JIT** 的固有差距（§3），不是实现缺陷 |
+| 解释器初始化（冷启动引擎侧） | ✅ **−23.7%（2026-11-20 第二十三批）** | `SetupGlobals` 293.7µs → 224.1µs、分配 2,103 → 1,570、占用 329KB → 222KB（同机配对 A/B 10 轮，10/10 胜）；首帧中位仍是 **9ms**（采样粒度 1ms，看不出）——省下的是中间层，见 [§3.4.9](#349-t3-5-第二十三批内建-length-不再逐条建-map冷启动初始化--237) |
+| 内存长时漂移（T3-3 顺手复跑） | ✅ **无漂移（2026-11-20 06:06）** | 7,500 轮 / 45,000 帧：稳态 HeapAlloc 增长 **−0.09KB**、RSS 增长 1,316KB（预算 16MB）；RSS 斜率 566KB/min 属 Go 堆向 OS 归还前的驻留，不是泄漏。原始档 `bench-results/memdrift-20261119-220620.json` 随本提交归档 |
 | 分配预算闸门 | ✅ **已进 CI（2026-11-20 第九批）** | 判据是**分配次数**而不是毫秒（确定性、跨机器不假红）：fib28 一次求值 403,269 次、`SetupGlobals` 2,102 次，超预算即红。它守的是「快路径被退回通用路径」这类毫秒闸门看不见的退化，见 [§3.4.7](#347-第九批三条候选被同机配对-ab-否掉留痕) / [§12.22.5](#12225-复现命令) |
 | UI 无 GC 毛刺 | ✅ **达标** | 重压 3 次聚合：p95 帧间隔 **5.95ms** ≤ 16.7ms；单次 GC 停顿 max **1.382ms** ≤ 5ms |
 
@@ -2940,6 +2942,14 @@ go build -ldflags "-s -w" -o /tmp/gox-slim ./cmd/gox
 测量噪声里看不见。
 
 **处置：遗留③（解释器初始化惰性化）按"上限 2.9%、低于 5% 纪律"结案，不再排期。**
+> **2026-11-20 补充（第二十三批，§3.4.9）**：本节的算术没有错，但"分母 = 262µs
+> 全部"这个前提**有一半是冗余**。`SetupGlobals` 里约 70µs 花在给每个内建函数
+> 往 `PropDescs` 里写一份 length，而这份 length 与结构体字段完全重复 —— 这
+> 不是"惰性化能省的钱"，而是"双写浪费掉的钱"。去掉双写后 `SetupGlobals`
+> **293.7 → 224.1µs（−23.7%，10/10 轮）、分配 2,103 → 1,570**。所以"冷启动的
+> 引擎侧已经没有 ≥5% 的活"这句要改写成：**惰性化**这条路上没有了；但"清掉
+> 初始化期的冗余工作"仍有约 24% 可做，只是它换不来首帧上的可见毫秒。
+
 字节码缓存那一半已在 §12.5 给出"不做"结论（解析+编译 <0.1ms，缓存要付失效规则
 与体积代价），两项合起来意味着**冷启动的引擎侧已经没有 ≥5% 的活**。后续若首帧
 还要降，靶子只剩 GUI 侧那 ~5.96ms（建窗/字体/Layout/上屏），与引擎无关。
@@ -3103,4 +3113,136 @@ go run ./tools/abcontract -self-test
 go run ./tools/abcontract -history origin/main~200..origin/main
 go run ./tools/abcontract -tree
 ./scripts/install-hooks.sh      # 装到本仓 commit-msg
+
+### 3.4.9 T3-5 第二十三批：内建 length 不再逐条建 map（冷启动初始化 −23.7%）
+
+> 本节同时是 T3-4（引擎热点）的「试图优化 → 撤回」留痕。一句话：**收益全部在
+> 初始化路径上，热循环只是没被拖慢**；过程中有一次 2.8% 的"假退化"被三方差分
+> 证伪，这个陷阱对下一批有用，记在 3.4.9.5。
+
+#### 3.4.9.1 先建闸门，再动代码
+
+`stdlib/builtin_lengths_test.go`（改动前跑通，不是改动后补的）：
+
+| 断言 | 守的是什么 |
+|---|---|
+| 21 个探针 × OwnDescriptor + GetProperty | length **值**（取自改动前基线，不是凭记忆写的规范值）、**不可写**、**不可枚举**、**可配置**，且"属性读取"与"描述符查询"两条口径不许分裂 |
+| 5 个 0 值探针 | "值为 0 就跳过不写"这类优化最先踩坏的一批 |
+| for-in / Object.keys 看不见 length | 若把 length 写进 `Properties`（而不是描述符/字段），枚举器会漏出来 |
+| `Object.getOwnPropertyNames` / `hasOwnProperty` 看得见 | 反向 |
+| `defineProperty` 改 length 后读新值、delete 后再定义 | 结构体字段与 PropDescs 的优先级不能打架 |
+| 2 条 **已知基线缺陷**，标 `t.Skip` 并注明 §3.4.8 | 严格模式赋值**不抛** TypeError；`delete f.length` 返回 true 但之后 `hasOwnProperty("length")` 仍为 false —— 都是改动前就有的，本批不修，只保证行为不变 |
+
+#### 3.4.9.2 剖面把靶子指到了这里
+
+`SetupGlobals` 3000 轮，Total samples 2.84s（2026-11-20 06:0x，AMD EPYC 9K65 / go1.26.2 / 32 核）：
+
+| 项 | flat | cum |
+|---|---|---|
+| `applyBuiltinLengths` | 0.4% | **21.5%** |
+| ├ `setLengthFromNamePath` | — | 13.7% |
+| │ └ `SetFunctionLength` | — | **6.0%** |
+| `setupIteratorGlobal` | 6.3% | 6.3% |
+| `mapassign_faststr` / `mapaccess2_faststr` | 3.2% / 3.2% | 16.6% / 10.2% |
+| `gcDrainMarkWorkerDedicated` | — | 19.7% |
+
+关键事实：`BuiltinFunction` / `BuiltinMethod` 的 `length` **本来就是结构体字段**
+（`GetProperty` 与 `OwnDescriptor` 的 `"length"` 分支都读它，描述符标志按规范
+硬编码为不可写/不可枚举/可配置）。`SetFunctionLength` 却走 `DefineOwn` 往
+`PropDescs` 里再放一份 —— 等于双写：每个内建函数多一张 map、多一个描述符对象、
+GC 多扫一处。第二次 `SetupGlobals` 时 gcDrain 占 19.7% 就是这么来的。
+
+#### 3.4.9.3 改了什么
+
+| 文件 | 改动 |
+|---|---|
+| `object/function.go` | `BuiltinFunction` 新增 `Length int` 字段；`GetProperty("length")` 由 `NewInt(0)` 改读字段；`SetFunctionLength` 改为写字段 |
+| `object/ownproperty.go` | `OwnDescriptor("length")` 由 `closureLengthDescriptor(0)` 改读字段；`DefineOwn` 的 `"length"` 分支同步字段（见 3.4.9.5） |
+| `stdlib/builtin_lengths.go` | `setBuiltinLength` 只写字段；非 Builtin 形态保留 `SetFunctionLength` |
+
+#### 3.4.9.4 A/B（同机配对，`scripts/perf-ab.sh`）
+
+| 口径 | base (281d47c) | candidate | 变化 | 逐轮胜 |
+|---|---|---|---|---|
+| `SetupGlobals` ns/op（`-benchtime 20x`，10 轮） | 293,694 | **224,096** | **−23.70%** | **10/10** |
+| `SetupGlobals` allocs/op | 2,103 | **1,570** | −25.34% | — |
+| `SetupGlobals` B/op | 329,484 | **222,682** | −32.41% | — |
+| `Fib28PureEval` ns/op（`10x`，12 轮） | 135,607,295 | 137,815,625 | +1.63%（噪声内，见 3.4.9.5） | 3/12 |
+| `Fib28PureEval` allocs/op | 403,269 | 402,736 | −0.13% | — |
+
+原始样本：`bench-results/perf-ab-20261119-222044.json`（SetupGlobals）、
+`...-222218.json` / `...-222132.json`（Fib28PureEval）。
+
+**这个 −23.7% 在首帧上看不出来**，别拿它当冷启动成绩单：
+
+| 口径 | base | candidate |
+|---|---|---|
+| `gox version` 进程墙钟（n=20） | 3ms | 3ms |
+| `coldstart.sh` 首帧（n=15，间隔 251ms） | 9ms | 9ms（样本 8~10） |
+| 空载 RSS | 20,340KB | 20,920KB（+2.9%，共 15 个样本，噪声内） |
+
+省下来的是 210 次 `mallocgc` 与约 107KB 活对象——它让**GC 起点更低、初始化期间
+的 gcDrain 更短**，但 0.07ms 落在 1ms 采样粒度以下。这正好印证 §12.22 的算术：
+冷启动的引擎侧已经只剩零点几毫秒可省，本批把它再削掉约 24%。
+
+#### 3.4.9.5 留痕一：一次 2.8% 的"退化"是三方差分证伪的
+
+第一版为了顺手修 `delete f.length` 后再 defineProperty 的一致性，在
+`*BuiltinFunction.DefineOwn` 顶部加了 `name == "length"` 分支 + 类型断言。随后
+`Fib28PureEval` A/B 给出 **+2.76%（0/12 轮胜）**，看着像"动了热路径的结构布局"。
+
+撤掉分支后复测 **−0.86%**，但下一轮又回到 **−1.63%** —— 同样代码、同样机器，
+两次结论差 2.5 个百分点，说明这台机器上 fib28 的**逐次 A/B 不可分辨**，不是
+代码在动。于是做了一次三方交错（base / 无分支 / 有分支，同轮次相邻取样，n=10）：
+
+| 树 | 中位 |
+|---|---|
+| base | 135.0ms |
+| candidate（无 DefineOwn 分支） | 136.0ms |
+| candidate（有 DefineOwn 分支） | 135.5ms |
+
+真正要命的不是这 1ms，而是**噪声底本身**：同一份代码、两个 `git worktree` 各编
+一个基准二进制，中位差可以到 1~2ms（逐次取值 133~142ms）。之前的"±1%"是历史
+记录（§3.4.6，8 轮），本机的**逐次**离散度是 ±3%。所以：
+
+> **口径修正：本机 fib28 的裁决只能看"配对方向 + 样本数"，不能看单轮中位小数点。
+> 若要判 2% 级别的改动，样本至少 20 轮且必须做 A/A 对照。**
+
+既然差 0.3% 在噪声内，就没有理由保留一个已知不一致的行为缺口 —— `DefineOwn` 的
+length 分支**保留**，删除/重定义序列由
+`TestBuiltinLengthDefinePropertySync` 钉住。
+
+#### 3.4.9.6 留痕二：与规范不符但本批不修的 baseline 缺口
+
+闸门的期望值取自改动前的**实测**，顺手发现三处与 ECMA-262 不符（改动前就有，
+本批不夹带修复，因为"优化 + 纠偏"混在一个提交里会让 A/B 失去意义）：
+
+| 项 | Gox 现状 | 规范 |
+|---|---|---|
+| `String.prototype.slice` / `charCodeAt` ... 一批 String 原型方法 | length = 0 | 2 / 1 …（`builtinLengths` 表里缺这些键） |
+| 严格模式下给内建函数 `length` 赋值 | 静默忽略 | 抛 TypeError |
+| `delete f.length` 之后 `hasOwnProperty("length")` | false | true（可配置，删除后应重新可定义/走原型链） |
+
+第三条本批已能顺带修好（`DefineOwn` 分支），第一条要往生成表里补约 30 个键并
+让 test262 复跑，第二条要动 VM 的严格模式赋值路径 —— 都是独立提案，建议挂到
+T3-4 的 backlog，不要混进性能提交。
+
+#### 3.4.9.7 复现命令
+
+```bash
+# 先跑闸门（改动前后都必须绿）
+go test ./stdlib/ -run 'BuiltinLength' -count=1 -v
+
+# 初始化 A/B（阈值 5%，10 轮）
+./scripts/perf-ab.sh --base HEAD --bench SetupGlobals --benchtime 20x --runs 10
+
+# 热循环回归（只看方向，别看小数点；见 3.4.9.5）
+./scripts/perf-ab.sh --base HEAD --bench Fib28PureEval --benchtime 10x --runs 12 --no-gate
+
+# 分配预算闸门（预算刻意不下调，留 40% 余量给编译器升级）
+go test ./tools/perf/ -run 'AllocBudget' -count=1 -v
+
+# 首帧与进程墙钟（证明"省下来的东西在首帧上看不见"）
+./scripts/coldstart.sh --runs 15
+for i in $(seq 20); do s=$(date +%s%N); ./gox version >/dev/null; e=$(date +%s%N); echo $(((e-s)/1000000)); done
 ```
