@@ -27,37 +27,66 @@ import (
 	"github.com/14752222/Gox/gfx/gpu"
 )
 
-func init() {
-	// Available() 会触发 device 创建 (含软件回退); 建不起来就安静退出,
+// gpuPresentPlan 是接入层的判定结果 —— 抽成纯函数是为了可测 (G-3 验收:
+// 降级路径必须有测试钉住, init 里的不可测判定等于裸奔)。
+type gpuPresentPlan int
+
+const (
+	// gpuPlanUnavailable: 适配器建不起来 (Available()==false) → 安静退回,
 	// 窗口照常走平台 CPU blit —— GPU 是加速器, 不是依赖。
-	if !gpu.Available() {
-		return
+	gpuPlanUnavailable gpuPresentPlan = iota
+	// gpuPlanSoftNotForced: 适配器是软件渲染且未显式 GOX_GPU=software →
+	// 不包装 (文件头: 软件后端慢 5 倍), 只打一行 stderr 提示。
+	gpuPlanSoftNotForced
+	// gpuPlanWrap: 安装呈现包装器; 单个窗口是否真走 GPU 由包装器内动态
+	// 判定 (swapchain 就绪才真上屏, 见 gpuPresentWrapper)。
+	gpuPlanWrap
+)
+
+// planGPUPresent 是 init 判定的纯函数形态: available = gpu.Available(),
+// kind = gpu.BackendKind(), forced = GOX_GPU=software。
+func planGPUPresent(available bool, kind string, forced bool) gpuPresentPlan {
+	if !available {
+		return gpuPlanUnavailable
 	}
-	// 软件适配器: 生产不包装 (见文件头)。显式 GOX_GPU=software 时强制,
-	// 让 CI 与无头环境能走 GPU 合成路径做像素级验证。
-	if gpu.BackendKind() == "software" && os.Getenv("GOX_GPU") != "software" {
+	if kind == "software" && !forced {
+		return gpuPlanSoftNotForced
+	}
+	return gpuPlanWrap
+}
+
+// gpuPresentWrapper 是安装进 gfx 的呈现包装器 (行为与 2026-11-17 版完全一致)。
+// 返回 ok=false 表示该窗口降级 CPU blit, 绝不让窗口黑掉。
+func gpuPresentWrapper(inner gfx.Surface) (gfx.Surface, bool) {
+	s, err := gpu.New(inner)
+	if err != nil || !s.PresentsToWindow() {
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "gox: GPU 呈现不可用, 退回 CPU blit: %v\n", err)
+		} else {
+			fmt.Fprintf(os.Stderr,
+				"gox: GPU 呈现未启用 —— 原生句柄不可用 (平台 %T 暂无 swapchain 接线), 退回 CPU blit\n", inner)
+		}
+		return nil, false
+	}
+	return s, true
+}
+
+// installGPUPresent 是 init 的可测主体; 返回判定结果供测试断言。
+func installGPUPresent() gpuPresentPlan {
+	plan := planGPUPresent(gpu.Available(), gpu.BackendKind(), os.Getenv("GOX_GPU") == "software")
+	switch plan {
+	case gpuPlanUnavailable:
+		return plan
+	case gpuPlanSoftNotForced:
 		fmt.Fprintf(os.Stderr,
 			"gox: GPU 呈现未启用 —— 适配器为软件渲染 (%s), 实测比 CPU blit 慢; "+
 				"设 GOX_GPU=software 可强制启用\n", gpu.Backend())
-		return
+		return plan
 	}
-	// 包装判据 (2026-11-17 A 路径硬前提 #2 落地后的新口径):
-	//   - swapchain 就绪 (PresentsToWindow) → 包装, 真上屏;
-	//   - 没就绪 → **不包装**。GPU 轨在窗口化模式下只到离屏纹理为止,
-	//     硬包装等于把窗口变黑 (2026-11-17 之前的旧行为, audit 文档
-	//     「A 路径硬前提缺口」记录的正是这个洞)。
-	// 离屏/无头场景 (inner==nil) 不经此判断 —— 那是测试与基准的入口。
-	gfx.SetPresentWrapper(func(inner gfx.Surface) (gfx.Surface, bool) {
-		s, err := gpu.New(inner)
-		if err != nil || !s.PresentsToWindow() {
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "gox: GPU 呈现不可用, 退回 CPU blit: %v\n", err)
-			} else {
-				fmt.Fprintf(os.Stderr,
-					"gox: GPU 呈现未启用 —— 原生句柄不可用 (平台 %T 暂无 swapchain 接线), 退回 CPU blit\n", inner)
-			}
-			return nil, false
-		}
-		return s, true
-	})
+	gfx.SetPresentWrapper(gpuPresentWrapper)
+	return plan
+}
+
+func init() {
+	installGPUPresent()
 }
