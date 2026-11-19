@@ -1,0 +1,55 @@
+{
+  "tool": "perf-ab.sh",
+  "generated_at": "2026-11-19T20:19:06Z",
+  "label": "候选A: dbg 诊断三元组挪进运行时开关",
+  "bench": "Fib28PureEval",
+  "benchtime": "10x",
+  "runs": 8,
+  "base": {
+    "rev": "origin/main",
+    "commit": "281d47c",
+    "dirty": false
+  },
+  "candidate": {
+    "commit": "3737970",
+    "dirty": false
+  },
+  "ns_per_op": {
+    "base_median": 135572293.0,
+    "candidate_median": 133807192.0,
+    "gain_pct": 1.3019629313196022
+  },
+  "b_per_op": {
+    "base_median": 10814535.0,
+    "candidate_median": 10814522.5
+  },
+  "allocs_per_op": {
+    "base_median": 403269.0,
+    "candidate_median": 403269.0
+  },
+  "rounds_candidate_faster": 5,
+  "threshold_pct": 5.0,
+  "verdict": "fail",
+  "samples": {
+    "base": [
+      134933661.0,
+      134664977.0,
+      135524450.0,
+      135620136.0,
+      135746656.0,
+      137039656.0,
+      137902298.0,
+      134443820.0
+    ],
+    "candidate": [
+      133510898.0,
+      134103486.0,
+      133505187.0,
+      137174484.0,
+      133148470.0,
+      131318366.0,
+      141945116.0,
+      137405131.0
+    ]
+  }
+}

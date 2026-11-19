@@ -127,6 +127,56 @@ jobs:
             exit 1
           fi
 
+  # ── 性能 A/B 契约（看板 rrIdLN / T3-1 第二十三批）──────────────────────────
+  # 为什么单独一个作业：它是 Go 侧工具（tools/abcontract）对 **git 历史与提交
+  #   信息**的检查，不跑基准、不要 xvfb；与 registries（Python 文本）、
+  #   init-purity（Go AST）的失败归因都不同。
+  #
+  # 守的是 2026-11-20 夜批暴露的流程缺口：四条热点候选做了同机 8 轮 A/B，三条
+  #   被数字否掉、第四条连 vm 全量测试都过不了；而"有没有做 A/B""实验代码有没有
+  #   留在树里""否掉的候选有没有带数字"在提交那一刻**全都不可验证**。
+  #
+  # 判据见 tools/abcontract 头部；这里只做两件事：跑它的自测（负向样本必红），
+  #   再拿它扫本次 PR/push 带进来的提交区间 —— 只扫区间、不扫全历史，否则
+  #   早年不合规的提交会让闸门永远红（那等于没有闸门）。
+  ab-contract:
+    name: 性能 A/B 契约（数字 / 复现命令 / 无实验残留）
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: 判据自测 + 区间扫描
+        run: |
+          set -euo pipefail
+          # 守卫自身也要有守卫：正样本必绿、负样本必红（与 initpurity / check-bench.py 同一纪律）。
+          if ! go run ./tools/abcontract -self-test; then
+            echo "::error::abcontract 自测未通过 —— 判据已失效，它可能不再拦任何东西"
+            exit 1
+          fi
+          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+            RANGE="origin/${{ github.base_ref }}..${{ github.sha }}"
+          elif [[ "${{ github.event.before }}" =~ ^0+$ ]]; then
+            RANGE="${{ github.sha }}~1..${{ github.sha }}"
+          else
+            RANGE="${{ github.event.before }}..${{ github.sha }}"
+          fi
+          echo "[ab-contract] 扫描区间: $RANGE"
+          if ! go run ./tools/abcontract -history "$RANGE"; then
+            echo "::error::性能提交缺 A/B 数字 / 复现命令，或把实验提交（exp( / [EXP）带进了历史 —— 逐条见上；本地可跑 scripts/install-hooks.sh 装上同一判据的 commit-msg 钩子"
+            exit 1
+          fi
+          if ! go run ./tools/abcontract -tree; then
+            echo "::error::工作树里残留实验标记 [EXP —— 实验代码不提交，只提交结论与数字"
+            exit 1
+          fi
+
   # ── apps/ 静默陷阱 lint（看板 rG73bo 3/3）──────────────────────────────────
   # 为什么单独一个作业：它扫的是 apps/ 的 **JS 源码**，与 registries 的注册表
   #   文本分析、init-purity 的 Go AST 分析三者失败归因完全不同，混在一起会互相

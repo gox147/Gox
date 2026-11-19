@@ -21,13 +21,19 @@
 #   - 每次取样是**独立进程**（-test.count 1），避免同进程内的堆状态互相影响；
 #     交替顺序抵消漂移，不抵消「同一侧内部」的抖动 —— 所以至少 5 轮。
 #   - base 侧永远是一棵**干净 checkout**（git worktree 到 /tmp）；candidate 侧
-#     是当前工作树（可以脏，dirty 会写进结果 JSON 与表格）。
+#     默认是当前工作树（可以脏，dirty 会写进结果 JSON 与表格）。
+#   - 两侧都给干净 checkout 时用 --candidate-rev：这样"两次测量之间换了工作树
+#     内容"这类手工失误就从流程里消失了（比较的对象被钉在某个 commit 上）。
 #
 # 跑法:
 #   ./scripts/perf-ab.sh                                  # 默认 Fib28PureEval, 6 轮
 #   ./scripts/perf-ab.sh --bench SetupGlobals --runs 8
 #   ./scripts/perf-ab.sh --base origin/main --benchtime 20x
 #   ./scripts/perf-ab.sh --no-gate                        # 只看数, 不按阈值退码
+#   ./scripts/perf-ab.sh --label "候选A: dbg 三元组"      # 结果 JSON 带上本次实验名
+#   ./scripts/perf-ab.sh --candidate-rev perf/abA         # candidate 侧改用另一个
+#                                                         # **已提交**的 rev (干净
+#                                                         # checkout), 不读工作树
 #
 # 结果: bench-results/perf-ab-<UTC时间>.json + stdout 一张表。
 # 默认 base = HEAD（未提交改动与 HEAD 比）；--base <rev> 可与任意提交比。
@@ -43,6 +49,8 @@ PKG="./tools/perf"
 MIN_GAIN=5
 GATE=1
 KEEP=0
+CAND_REV=""
+LABEL=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -53,6 +61,8 @@ while [[ $# -gt 0 ]]; do
     --pkg) PKG="$2"; shift 2 ;;
     --min-gain) MIN_GAIN="$2"; shift 2 ;;
     --no-gate) GATE=0; shift ;;
+    --candidate-rev) CAND_REV="$2"; shift 2 ;;
+    --label) LABEL="$2"; shift 2 ;;
     --keep) KEEP=1; shift ;;
     -h|--help) sed -n '2,40p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "未知参数 $1 (见 --help)"; exit 1 ;;
@@ -71,21 +81,35 @@ cleanup() {
     return
   fi
   git -C "$ROOT" worktree remove --force "$WORK/base" >/dev/null 2>&1 || true
+  git -C "$ROOT" worktree remove --force "$WORK/cand" >/dev/null 2>&1 || true
   rm -rf "$WORK"
 }
 trap cleanup EXIT
 
 BASE_SHA="$(git -C "$ROOT" rev-parse --verify --short "$BASE_REV")"
-HEAD_SHA="$(git -C "$ROOT" rev-parse --short HEAD)"
 BASE_DIRTY=false
-HEAD_DIRTY=false
-if [[ -n "$(git -C "$ROOT" status --porcelain)" ]]; then HEAD_DIRTY=true; fi
+if [[ -n "$CAND_REV" ]]; then
+  # 显式指定 candidate rev: 两侧都是干净 checkout, 身份即 commit 本身。
+  HEAD_SHA="$(git -C "$ROOT" rev-parse --verify --short "$CAND_REV")"
+  HEAD_DIRTY=false
+else
+  HEAD_SHA="$(git -C "$ROOT" rev-parse --short HEAD)"
+  HEAD_DIRTY=false
+  if [[ -n "$(git -C "$ROOT" status --porcelain)" ]]; then HEAD_DIRTY=true; fi
+fi
 
 echo "==================================================================="
 echo "[perf-ab] 同机配对 A/B"
 echo "  时间(UTC):   $(date -u +%Y-%m-%dT%H:%M:%SZ)"
 echo "  base:        $BASE_REV ($BASE_SHA, dirty=$BASE_DIRTY)"
-echo "  candidate:   工作树 ($HEAD_SHA, dirty=$HEAD_DIRTY)"
+if [[ -n "$CAND_REV" ]]; then
+  echo "  candidate:   $CAND_REV ($HEAD_SHA, clean)"
+else
+  echo "  candidate:   工作树 ($HEAD_SHA, dirty=$HEAD_DIRTY)"
+fi
+if [[ -n "$LABEL" ]]; then
+  echo "  实验:        $LABEL"
+fi
 echo "  基准:        $PKG -bench $BENCH -benchtime $BENCHTIME, 交替 $RUNS 轮"
 echo "  判据:        中位改善 ≥ ${MIN_GAIN}% (gate=$GATE)"
 echo "  机器:        $(nproc) 核 / $(/usr/bin/grep -m1 'model name' /proc/cpuinfo 2>/dev/null | cut -d: -f2 | xargs || echo n/a)"
@@ -96,8 +120,13 @@ echo "==================================================================="
 git -C "$ROOT" worktree add --detach "$WORK/base" "$BASE_REV" >/dev/null
 ( cd "$WORK/base" && GOFLAGS="-mod=mod" go test -c -o "$WORK/base.test" "$PKG" >/dev/null )
 
-# candidate 侧: 当前工作树（含未提交改动）
-( cd "$ROOT" && go test -c -o "$WORK/head.test" "$PKG" >/dev/null )
+# candidate 侧: 显式 rev 走独立干净 checkout; 否则用当前工作树（含未提交改动）
+if [[ -n "$CAND_REV" ]]; then
+  git -C "$ROOT" worktree add --detach "$WORK/cand" "$CAND_REV" >/dev/null
+  ( cd "$WORK/cand" && go test -c -o "$WORK/head.test" "$PKG" >/dev/null )
+else
+  ( cd "$ROOT" && go test -c -o "$WORK/head.test" "$PKG" >/dev/null )
+fi
 
 run_once() { # $1=binary $2=outfile
   "$1" -test.run '^$' -test.bench "$BENCH" -test.benchtime "$BENCHTIME" -test.count 1 \
@@ -114,11 +143,11 @@ for i in $(seq 1 "$RUNS"); do
   printf 'B=%-10s\n' "$(awk '/ns\/op/{print $3}' "$WORK/b-$i.txt" | head -1)"
 done
 
-python3 - "$ROOT" "$WORK" "$RUNS" "$BASE_REV" "$BASE_SHA" "$HEAD_SHA" "$BASE_DIRTY" "$HEAD_DIRTY" "$BENCH" "$BENCHTIME" "$MIN_GAIN" "$GATE" <<'PY'
+python3 - "$ROOT" "$WORK" "$RUNS" "$BASE_REV" "$BASE_SHA" "$HEAD_SHA" "$BASE_DIRTY" "$HEAD_DIRTY" "$BENCH" "$BENCHTIME" "$MIN_GAIN" "$GATE" "$LABEL" <<'PY'
 import json, os, re, statistics, subprocess, sys, time
 
 (root, work, runs, base_rev, base_sha, head_sha, base_dirty, head_dirty,
- bench, benchtime, min_gain, gate) = sys.argv[1:13]
+ bench, benchtime, min_gain, gate, label) = sys.argv[1:14]
 runs = int(runs); min_gain = float(min_gain); gate = gate == "1"
 
 def parse(path):
@@ -171,6 +200,7 @@ print(f"判定: 中位改善 {gain:+.2f}%，阈值 {min_gain:.2f}% ⇒ {verdict}
 out = {
     "tool": "perf-ab.sh",
     "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    "label": label,
     "bench": bench,
     "benchtime": benchtime,
     "runs": runs,

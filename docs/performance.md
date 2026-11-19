@@ -2975,3 +2975,132 @@ go test ./tools/perf/ -run 'TestSetupGlobalsAllocBudget' -count=1 -v
 # 分配预算闸门（本批新增，确定性，跨机器不假红）
 go test ./tools/perf/ -run 'TestFib28AllocBudget|TestSetupGlobalsAllocBudget' -count=1 -v
 ```
+
+### 12.23 T3-4 第二十三批：四条热路径候选被同机 A/B 否掉，并把「A/B 契约」变成闸门（2026-11-20 凌晨批）
+
+冷启动引擎侧已在 §12.22 结案（上限 2.9% < 5%），所以本批按"冷启动优先、热点其次"
+把火力放到热点线的**每指令分派成本**上 —— 目标仍是把 12.9ns/条往下压，让 fib28
+与 node 的差距远离 3× 红线。
+
+实况：**四条候选，三条被数字否掉，第四条在语义上就不成立。** 本批的产出因此不是
+加速，而是把"为什么会这样"与"以后不许再这样"变成可执行的东西。
+
+#### 12.23.1 同机 8 轮交替 A/B（AMD EPYC 9K65 / 32 核 / go1.26.2）
+
+口径：`scripts/perf-ab.sh --bench Fib28PureEval --benchtime 10x --runs 8`，
+base = `origin/main`（281d47c），candidate = **干净 checkout** 的候选分支
+（本批给 `perf-ab.sh` 新增 `--candidate-rev` / `--label`，见 §12.23.3）。
+基线中位 135.6~137.0ms / 403,269 分配，8 轮噪声底 ≈ ±1%（§3.4.6）。
+
+| 候选 | 机制 | ns/op 变化 | 逐轮胜 | 判定 |
+|---|---|---|---|---|
+| **A. dbg 三元组挪进运行时开关** | 主循环每条指令都写 `vm.dbgOp/dbgPC/dbgFrames`，唯一读者是 `GOX_PANIC_TRACE` 的 panic 分支；改为 `traceOn` 为真时才写 | **−1.30% ~ −1.43%**（两轮独立实验） | 7/8、5/8 | **否**：<5%；且进程级 `gox version` 只有 −0.08ms（−3.0%，n=12×3，在噪声内）|
+| **B. 到站判定改比末指令起点** | 先算 `lastPC = len(ins)-3`，判定写成 `pc == lastPC \|\| pc >= len(ins)`，省一次帧字段加载 | **+2.17%** | 0/8 | **否**：更慢。新比较依赖 PC，把关键链拉长了 |
+| **C. 操作数栈头内联进 VM** | `Push/Pop` 从"读写切片头 (len/cap/ptr 在 `*Stack` 上)"改为"只装箱 VM 上的 int" | **+9.99%** | 0/8 | **否**：更慢 10%。每指令要多回写一次切片头 |
+| **D. PC 本地副本** | PC 提到寄存器，循环尾写回帧 | 未跑 A/B | — | **否**：vm 全量测试挂死（解构迭代 8 条失败 + `TestAsyncGeneratorForAwaitCollects` 超时）⇒ 语义不成立 |
+
+四条都在**同一份剖面**上量（`go tool pprof`，fib28 `-benchtime 12x`）：
+`runFrom` 本体 flat **40.9%**、`Stack.Pop` 6.6%、`callClosure` 6.1%、取指 3.9%、`Push` 3.9%。
+反汇编进一步确认了根因的形状：
+
+```
+exec.go:48  MOVQ (BX), CX        ; frame.Instructions 指针
+            LEAQ 3(R13), SI      ; PC+3
+            MOVZX (CX)(R13*1), DI; 取 opcode
+            MOVQ 0x8(BX), R15    ; frame 的 len(Instructions)
+            ...
+exec.go:69  MOVB DI, 0x188(AX)   ; vm.dbgOp
+            MOVQ R13, 0x190(AX)  ; vm.dbgPC
+            MOVQ R12, 0x198(AX)  ; vm.dbgFrames
+```
+
+`frame.PC` 在每条指令里都被**重读**（第 48 行与取指各一次）、被**写回** 3 次
+（`frame.PC += 3` 与 dbg 三元组）。也就是说 13ns/条里有一块纯粹是"把解释器状态
+放在堆上再反复搬来搬去"。A/C/D 三个候选都是冲着这一块去的，**三个都失败**，
+而且失败方向一致：
+
+> 在 Go 里，**把这些字段搬到别处（VM 上、寄存器里、局部变量里）都不省事** ——
+> 搬到 VM 上仍要经指针，搬到寄存器要显式写回，而任何"每指令一次"的新增写入
+> 都比原来自带的 `frame.PC += 3` 更贵。真正的解法是让它们**不再被写**（寄存器式
+> 字节码把"PC"换成 IP 增量、值表示换成非 interface），那是 §3.4.3 已经写的
+> 2~3 周重写，不是一个夜间批次能碰的。
+
+#### 12.23.2 冷启动侧为什么本批没有新动作
+
+§12.22.3 已经把"引擎侧惰性化"的上限钉在 2.9%，本批不重复量。冷启动剩下的靶子
+是 GUI 侧 ~5.96ms（建窗 / 字体 / Layout / 上屏），与引擎无关，且 §12.20~§12.21
+刚证明**测量支架本身**（Xvfb 的 accept 抑制）会伪造成 5~10ms 的假收益 —— 在把
+支架弄到能分辨 0.5ms 之前，GUI 侧的优化同样无法判定。所以本批的选择是：
+**先把"判定能力"造好**，再动 GUI 侧。
+
+#### 12.23.3 本批新增的闸门：同机 A/B 工具有了两个缺口
+
+`perf-ab.sh`（§3.4.6）此前只支持"candidate = 当前工作树"。这在一个夜里试四条
+候选的流程下有两个隐患：
+
+1. **候选必须暂存进工作树**才能测，于是"测的是哪个版本"取决于记性；
+2. 结果 JSON 里没有实验名，四份文件只差时间戳。
+
+本批补上 `--candidate-rev <rev>`（candidate 侧也走干净 checkout）与 `--label`：
+
+```bash
+./scripts/perf-ab.sh --base origin/main --candidate-rev perf/abA --runs 8 \
+  --bench Fib28PureEval --benchtime 10x --label "候选A: dbg 诊断三元组挪进运行时开关"
+```
+
+两侧都是干净 checkout 时，`dirty=false` 恒成立，二进制身份即 commit —— 与
+`cmd/gox/buildinfo.go` 的纪律一致。
+
+#### 12.23.4 新增闸门：`tools/abcontract`（性能 A/B 契约进提交钩子与 CI）
+
+上面四条候选的 A/B 都做了，但**没有任何机制能验证"做了"**。`tools/abcontract`
+把 §3.4.6 与 §12.22 的纪律变成可判定的：
+
+| 判据 | 触发条件 | 说明 |
+|---|---|---|
+| 本文 | `perf(` / `exp(` / `measure(` 开头的提交 | 正文必须有 A/B 数字 |
+| 数字 | 同上 | `-1.30%` 形式的符号百分数，或 `ns/op` / `allocs/op` / `µs` / `ms` |
+| 可复现 | 同上 | `perf-ab.sh` / `coldstart.sh` / `go test` / `go tool pprof` / `--benchtime` / `复现命令:` 段落 |
+| 负结果也要数字 | 正文出现"否掉 / 不合并 / 未达阈值"等判定 | 只写"否了"不算 —— §3.4.7 的小整数缓存那次正是这个形态 |
+| 无实验残留 | 任何提交 | `exp(` 或 `[EXP ` 开头的提交不许进 main 历史；工作树里也不许留 `[EXP` 标记 |
+
+接入点：`scripts/install-hooks.sh` 装 commit-msg 钩子（亚秒，不跑基准）；
+`.github/workflows/ci.yml` 的 `ab-contract` 作业在 PR/push 区间上再跑一遍，
+并且**先跑自测**（10 条正/负样本，负样本必红）——与 `initpurity`、
+`check-bench.py --self-test` 同一纪律。
+
+为什么判据是被"回扫"逼出来的，而不是一次写对：首版拿 `origin/main~40` 回扫，
+四条历史提交被判红，逐条看下来**三条是误报**：
+
+| 提交 | 首版判红的原因 | 修正 |
+|---|---|---|
+| d75ed41 | 正文有 `262µs`，但指标词表里没有 `µs` | 指标词表补 `µs` |
+| 778392a / 6d7abdf | 正文写的是"只改一个变量即可复现"的配方，没有脚本名 | 复现锚点放宽到 `--benchtime` / `复现命令:` 段落 |
+| 21a8cff | "撤回"指的是**撤回上一批的错误结论**（结论已被证伪），不是"这个优化被否了" | 否定判定收窄到"否掉 / 不合并 / 未达阈值"等明确形态 |
+
+另有一个**真 bug**：首版用 `git log --format=...%x1f`，git 对含非 ASCII 的字段会加
+引号转义（`%x1f` 变成字面量 `^_`），于是正文永远解析不到、四条全被误判无数字。
+改用 `-z` + NUL 分隔后回扫通过。**闸门的误报比漏报更危险** —— 被误判过一次的人
+会直接绕过它，所以这一版把"误报"当成阻塞问题修，而不是记进已知问题。
+
+端到端验证（独立仓库，装同一个钩子）：缺数字的性能提交 **rc=1**、`exp(perf): [EXP B]`
+**rc=1**、带数字与 `perf-ab.sh` 命令的提交 **rc=0**。
+
+#### 12.23.5 复现命令
+
+```bash
+# 本批四条候选的 A/B（候选分支为实验分支，未合并；JSON 见 bench-results/perf-ab-20261119-20*.json）
+./scripts/perf-ab.sh --base origin/main --candidate-rev perf/abA --runs 8 --bench Fib28PureEval --benchtime 10x --label "候选A"
+./scripts/perf-ab.sh --base origin/main --candidate-rev perf/abB --runs 8 --bench Fib28PureEval --benchtime 10x --label "候选B"
+./scripts/perf-ab.sh --base origin/main --candidate-rev perf/abC --runs 8 --bench Fib28PureEval --benchtime 10x --label "候选C"
+
+# 剖面（确认 40.9% 在 runFrom 本体、6.6% 在 Stack.Pop）
+go test ./tools/perf/ -run XXX -bench Fib28PureEval -benchtime 12x -cpuprofile /tmp/fib28.cpu -o /tmp/perf.test
+go tool pprof -top /tmp/perf.test /tmp/fib28.cpu
+
+# A/B 契约闸门（自测 → 扫区间 → 扫工作树）
+go run ./tools/abcontract -self-test
+go run ./tools/abcontract -history origin/main~200..origin/main
+go run ./tools/abcontract -tree
+./scripts/install-hooks.sh      # 装到本仓 commit-msg
+```

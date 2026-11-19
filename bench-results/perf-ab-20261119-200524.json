@@ -1,0 +1,55 @@
+{
+  "label": "候选C: 操作数栈头内联进 VM",
+  "tool": "perf-ab.sh",
+  "generated_at": "2026-11-19T20:05:24Z",
+  "bench": "Fib28PureEval",
+  "benchtime": "10x",
+  "runs": 8,
+  "base": {
+    "rev": "origin/main",
+    "commit": "281d47c",
+    "dirty": false
+  },
+  "candidate": {
+    "commit": "d5a8e3f",
+    "dirty": false
+  },
+  "ns_per_op": {
+    "base_median": 136952184.5,
+    "candidate_median": 150629102.0,
+    "gain_pct": -9.986636978397376
+  },
+  "b_per_op": {
+    "base_median": 10814507.0,
+    "candidate_median": 10814252.0
+  },
+  "allocs_per_op": {
+    "base_median": 403269.0,
+    "candidate_median": 403269.0
+  },
+  "rounds_candidate_faster": 0,
+  "threshold_pct": 5.0,
+  "verdict": "fail",
+  "samples": {
+    "base": [
+      135622351.0,
+      136798981.0,
+      146129976.0,
+      135100368.0,
+      137105388.0,
+      140046153.0,
+      141084733.0,
+      135133189.0
+    ],
+    "candidate": [
+      149615784.0,
+      147243374.0,
+      150053766.0,
+      147147337.0,
+      153565990.0,
+      151204438.0,
+      165068352.0,
+      152008863.0
+    ]
+  }
+}

@@ -1,0 +1,55 @@
+{
+  "label": "候选A: dbg 诊断三元组挪进运行时开关（首轮）",
+  "tool": "perf-ab.sh",
+  "generated_at": "2026-11-19T20:02:39Z",
+  "bench": "Fib28PureEval",
+  "benchtime": "10x",
+  "runs": 8,
+  "base": {
+    "rev": "origin/main",
+    "commit": "281d47c",
+    "dirty": false
+  },
+  "candidate": {
+    "commit": "3737970",
+    "dirty": false
+  },
+  "ns_per_op": {
+    "base_median": 137862967.5,
+    "candidate_median": 135887663.5,
+    "gain_pct": 1.4328024674211368
+  },
+  "b_per_op": {
+    "base_median": 10814808.5,
+    "candidate_median": 10814758.0
+  },
+  "allocs_per_op": {
+    "base_median": 403269.0,
+    "candidate_median": 403269.0
+  },
+  "rounds_candidate_faster": 7,
+  "threshold_pct": 5.0,
+  "verdict": "fail",
+  "samples": {
+    "base": [
+      138424217.0,
+      138192414.0,
+      137533521.0,
+      136291743.0,
+      139547153.0,
+      139676196.0,
+      136637666.0,
+      136492463.0
+    ],
+    "candidate": [
+      137635261.0,
+      134585991.0,
+      134841045.0,
+      135950526.0,
+      132791815.0,
+      135824801.0,
+      136475785.0,
+      138985726.0
+    ]
+  }
+}
