@@ -9,9 +9,11 @@
 #   - ubuntu-latest 没有 GPU 硬件，wgpu 轨只拿软件适配器 —— **兜底口径**：
 #     数字不进 bench-all.sh 的 nightly 闸门、不对外；它钉住的是
 #     「像素零退化」与「不比现状回退」两条回归线，不是性能数字。
-#   - 硬件数字的接入位：`hardware` job 用 self-hosted runner 标签
-#     [gpu-hardware] 占位，labels 不匹配时自动 skip，不阻塞 PR；
-#     有硬件 runner 挂上后本 job 无需改动即为可信口径。
+#   - 硬件数字的接入位：`hardware` job 用仓库变量 GPU_HARDWARE_RUNNER 守卫
+#     （Settings → Variables → Actions 置 true 才启用）。不能只靠 self-hosted
+#     runs-on 标签守卫 —— 仓库没有 [gpu-hardware] runner 时标签不匹配会让
+#     job 停在 queued 直到 timeout 报红，而不是自动 skip（2026-11-15 首跑
+#     实测踩中，f6c64d3 修复）。硬件 runner 挂上后本 job 无需改动即为可信口径。
 #
 # 与其它工作流的关系：与 ci.yml 互不阻塞（本工作流失败说明 GPU 回归，
 # 不拦普通提交；需要变闸门时靠分支保护把对应 job 设为 required）。

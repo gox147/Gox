@@ -403,3 +403,44 @@ A 路径「零 cgo、单机交叉编译」矩阵自此五平台全通（js/wasm 
   仍属 G-3 cocoa 真机点亮验证项，不得因编译通过声称 cocoa GPU 轨可用。
 - 本窗口未触碰任何 Go 代码（仅 shell 脚本 + 文档），26 组件 CPU vs GPU 双轨快照 A/B
   （`-tags gpu`，软件适配器兜底口径）复跑 PASS，差异像素 0 —— Prism 视觉一致性零退化。
+
+## 2026-11-19 22:00 执行窗口复跑核销（Linux x86_64 32 核沙箱，无 GPU 硬件，全部为兜底口径：不进闸门、不对外）
+
+### 环境与基线
+
+- 基线 commit 778392a（main，CI gpu-present run 44523852777 success）；
+  本窗口纯文档 + 审计脚本改动，不触碰任何 Go 渲染代码。
+
+### 三轨复跑（gpu-track-audit.sh）
+
+| 轨 | BackendKind | Backend | 结论 |
+|---|---|---|---|
+| nogpu | none | none | 恒 ErrNotBuilt，CPU blit |
+| wgpu | software | wgpu-software | 无硬件兜底口径：不进闸门、不对外 |
+| cgo | none | cgo | 骨架阶段恒 ErrNotBuilt |
+
+与 11-08 / 11-15 / 11-18（04:01、08:00）基线逐项一致，无漂移。
+回归：`go test ./gfx/gpu`（nogpu 轨）与 `go test -tags gpu ./gfx/gpu`（wgpu 轨）均绿；
+`go test ./gfx/...` 全包零失败。
+
+### 本窗口修复：交叉编译矩阵抽查补齐 windows/arm64（口径对齐）
+
+- 发现：be1671a 实测口径为「win/linux amd64+arm64 ✅」共 6 个可交叉目标，但
+  `gpu-track-audit.sh --xcompile` 矩阵抽查只列了 `windows/amd64`，windows/arm64
+  从未被脚本覆盖；而上一节文档却声称「win/linux amd64+arm64 全 ok」—— 文档口径
+  超出脚本实际验证面。本窗口补齐：矩阵加入 `windows/arm64`（`-tags gpu`），
+  实测编译通过，脚本输出自此与文档声明逐目标对齐。
+- 复跑矩阵（CGO_ENABLED=0）：windows/amd64 ✅ windows/arm64 ✅ darwin/amd64 ✅
+  （-tags gpu,nofakecgo）darwin/arm64 ✅（同前）linux/amd64 ✅ linux/arm64 ✅；
+  js/wasm 维持已知不支持（hal/allbackends 无 wasm 构建，诚实输出）。
+- 同窗口订正 `.github/workflows/gpu-present.yml` 头部注释：旧「labels 不匹配时
+  自动 skip」口径已被 2026-11-15 首跑实测证伪（无 [gpu-hardware] runner 时 job
+  停 queued 至 timeout 报红），订正为 GPU_HARDWARE_RUNNER 仓库变量守卫口径，
+  与 f6c64d3 的实际实现及 job 级注释一致。
+
+### 口径纪律维持
+
+本窗口全部数字为无硬件兜底口径，不进闸门、不对外，不构成硬件成果。
+G-1 收尾仍差硬件覆盖三项（win32/x11/cocoa 三平台真机 audit+bench、swapchain 真机
+点亮对照数字），需真机，不标 done。26 组件 CPU vs GPU 双轨快照 A/B（CI run
+44523852777）差异像素 0 —— Prism 视觉一致性维持零退化，本窗口变更未触碰视觉面。
