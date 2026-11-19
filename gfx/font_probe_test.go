@@ -68,7 +68,20 @@ func TestProbeReadsOnlyNameAndPost(t *testing.T) {
 	}
 	var got int64
 	var calls int
-	fontProbeBytesHook = func(_ string, n int) { calls++; got += int64(n) }
+	// 只统计**这个文件**的读: fontProbeBytesHook 是包级全局, 任何并发发生的
+	// 探针都会打到它 —— 默认字体的后台预取 (T3-5 第十六批, gfx/font_prefetch.go)
+	// 在首次 import gx/gfx 时就起了一个 goroutine, 同包前面几个建窗用例留下的
+	// 预取也可能还在跑, 它们探的是 NotoSans/默认字重, 不是这里的 fonts[0]。
+	// 2026-11-20 的 CI 上就是这么红的: "探针钩子触发 3 次, 期望 1 次" —— 3 次里
+	// 只有 1 次是 p, 另外 2 次是后台预取 (本机复跑恒为 1 次, 只在负载不同的
+	// runner 上偶发)。闸门判的是"探 p 的代价", 所以按路径过滤, 而不是放宽次数。
+	fontProbeBytesHook = func(path string, n int) {
+		if path != p {
+			return
+		}
+		calls++
+		got += int64(n)
+	}
 	t.Cleanup(func() { fontProbeBytesHook = nil })
 
 	if _, ok := probeFileFaceRank(p); !ok {
