@@ -579,3 +579,40 @@ main 全绿。
 本节全部数字为无硬件兜底口径（Linux x86_64 沙箱，wgpu-software），
 不进闸门、不对外。G-1 收尾仍差硬件覆盖三项（三平台真机 audit+bench
 出可信对照数字、swapchain 真机点亮对照数字），需真机，不标 done。
+
+## 2026-11-20 20:00 执行窗口复跑核销（Linux x86_64 沙箱，无 GPU 硬件，全部为兜底口径：不进闸门、不对外）
+
+### 背景与范围
+
+main 自 08:00 窗口（d4e6a04）起漂移 6 提交至 2c75287（0.28.0 release
+同步；9f106c1/8d16f2a/988067d 为 T3-5/T3-1 性能侧；40cbb9e 为 G-1
+复跑核销；11146db 为 G-3 呈现接入层测试钉住；281d47c 为探针读盘闸门
+路径过滤）。本窗口对漂移后 main 再做一次 GPU 三轨全量核销，纯核销
+运行，无 Go 渲染代码变更。两段式提交语义（gfx.NativeWindowCommit）
+确认已有 commit_gate_test.go 钉住（G-3 A 路径「降级路径有测试钉住」
+验收项闭环）。
+
+### 三轨核销（gpu-track-audit.sh --xcompile，2026-11-20 20:04）
+
+nogpu=none / wgpu=software（wgpu-software，兜底口径）/ cgo=none（骨
+架恒 ErrNotBuilt）—— 与 11-08 ~ 11-20 08:00 基线逐项一致，无漂移。
+交叉编译矩阵（CGO_ENABLED=0）6 目标全 ok：windows/amd64+arm64、
+linux/amd64+arm64（-tags gpu）、darwin/amd64+arm64（-tags
+gpu,nofakecgo）；js/wasm 维持已知不支持（wgpu hal 无 wasm 后端）。
+
+### 回归与视觉闸门
+
+- `go test ./gfx`（默认轨）ok；`GOX_GPU_PROBE=1 GOX_GPU=software
+  go test ./gfx/gpu`（wgpu 轨）ok；`go vet ./gfx/... ./cmd/gox` 干净；
+- `TestSwapchainGate`（5 道 gate）、`TestSwapchainCommitGate`（两段式
+  提交 4 例）、`TestGPUPresentPixelExact` 全绿 —— 降级语义与像素一致性
+  在漂移后 main 上保持钉住；
+- x11 swapchain e2e（GOX_GPU_X11_E2E=1 + xvfb-run 独立进程，软件适配
+  器兜底口径）PASS —— 窗口化点亮链路保持可用。
+
+### 诚实口径
+
+本节全部数字为无硬件兜底口径（Linux x86_64 沙箱，wgpu-software，
+go1.26.2），不进闸门、不对外。G-3 A 路径剩余与 G-1 收尾仍差硬件覆盖
+三项（三平台真机 audit+bench、swapchain 真机点亮对照数字），需真机
+runner（GPU_HARDWARE_RUNNER=true），不声称 A 路径完成。
