@@ -776,6 +776,11 @@ func setupTemporalPlainYearMonth(temporal *object.Object) {
 				return oerr
 			}
 		}
+		if bag, isBag := plainBagOf(args[0]); isBag {
+			if e := rejectTemporalLikeObject(bag); e != nil {
+				return e
+			}
+		}
 		y, m, err := yearMonthFieldsFromWith(t, args[0])
 		if err != nil {
 			return err
@@ -878,11 +883,17 @@ func setupTemporalPlainYearMonth(temporal *object.Object) {
 		}
 		day := t.RefDay()
 		if len(args) > 0 {
-			if o, ok := args[0].(*object.Object); ok {
-				if dv, found := o.GetProperty("day"); found && dv != object.UndefinedSingleton {
-					day = int32(toFloat(dv))
-				}
+			// spec ToTemporalDate: 参数必须是对象; 且必须含 "day" 字段
+			// (缺失或只有无关字段 → TypeError)。
+			o, ok := args[0].(*object.Object)
+			if !ok {
+				return tgType("toPlainDate requires an object")
 			}
+			dv, found := o.GetProperty("day")
+			if !found || dv == object.UndefinedSingleton {
+				return tgType("day is required")
+			}
+			day = int32(toFloat(dv))
 		}
 		d := object.ISODate{Year: t.Year(), Month: t.Month(), Day: day}
 		if !object.IsValidISODate(d) {
@@ -960,6 +971,9 @@ func setupTemporalPlainYearMonth(temporal *object.Object) {
 			if !ok {
 				return tgRange("Invalid PlainYearMonth string: " + v.Value)
 			}
+			if e := calendarFromAnnotation(f.Calendar); e != nil {
+				return e
+			}
 			if !object.ISOYearMonthInRange(f.Year, f.Month) {
 				return tgRange("PlainYearMonth is outside of supported range")
 			}
@@ -1032,6 +1046,18 @@ func yearMonthFieldsFromWith(t *object.TemporalPlainYearMonth, src object.Value)
 	o, ok := src.(*object.Object)
 	if !ok {
 		return 0, 0, tgType("with requires an object")
+	}
+	// spec PrepareTemporalFields: 至少一个受支持字段 (year/month/monthCode)
+	// 必须出现, 否则 TypeError (argument-missing-fields 族)。
+	hasField := false
+	for _, k := range []string{"year", "month", "monthCode"} {
+		if v, found := o.GetProperty(k); found && v != object.UndefinedSingleton {
+			hasField = true
+			break
+		}
+	}
+	if !hasField {
+		return 0, 0, tgType("no supported properties found")
 	}
 	y, m := t.Year(), t.Month()
 	if v, found := o.GetProperty("year"); found && v != object.UndefinedSingleton {
@@ -1174,6 +1200,10 @@ func setupTemporalPlainMonthDay(temporal *object.Object) {
 		if !ok {
 			return tgType("with requires an object")
 		}
+		// spec 顺序: RejectObjectWithCalendarOrTimeZone 先于字段读取。
+		if e := rejectTemporalLikeObject(o); e != nil {
+			return e
+		}
 		m, d := t.Month(), t.Day()
 		if v, found := o.GetProperty("month"); found && v != object.UndefinedSingleton {
 			m = int32(toFloat(v))
@@ -1217,11 +1247,16 @@ func setupTemporalPlainMonthDay(temporal *object.Object) {
 		}
 		year := t.RefYear()
 		if len(args) > 0 {
-			if o, ok := args[0].(*object.Object); ok {
-				if yv, found := o.GetProperty("year"); found && yv != object.UndefinedSingleton {
-					year = int32(toFloat(yv))
-				}
+			// spec ToTemporalDate: 参数必须是对象; 且必须含 "year" 字段。
+			o, ok := args[0].(*object.Object)
+			if !ok {
+				return tgType("toPlainDate requires an object")
 			}
+			yv, found := o.GetProperty("year")
+			if !found || yv == object.UndefinedSingleton {
+				return tgType("year is required")
+			}
+			year = int32(toFloat(yv))
 		}
 		d := object.ISODate{Year: year, Month: t.Month(), Day: t.Day()}
 		if !object.IsValidISODate(d) {
@@ -1308,6 +1343,9 @@ func setupTemporalPlainMonthDay(temporal *object.Object) {
 			f, ok := object.ParseTemporalMonthDayString(v.Value)
 			if !ok {
 				return tgRange("Invalid PlainMonthDay string: " + v.Value)
+			}
+			if e := calendarFromAnnotation(f.Calendar); e != nil {
+				return e
 			}
 			if _, oe := readOverflowOption(argAt(args, 1)); oe != nil {
 				return oe

@@ -774,11 +774,39 @@ func IsValidTimeZoneID(id string) bool {
 		return false
 	}
 	if off, ok := ParseTimeZoneOffsetString(id); ok {
-		// 亚分钟级偏移不是合法时区标识符。
+		// 亚分钟级偏移不是合法时区标识符; 秒分量同理 —— 时区标识符的
+		// UTCOffset 文法只到分钟 (HH / HH:MM / HHMM), "+15:59:00"、
+		// "-170100" 之类一律非法 (test262 timezone-string-sub-minute-offset 族)。
+		if !bareOffsetIDShapeOK(id) {
+			return false
+		}
 		return off%60 == 0
 	}
 	_, err := time.LoadLocation(id)
 	return err == nil
+}
+
+// bareOffsetIDShapeOK 判断裸偏移标识符形状是否只到分钟精度:
+// 合法 = ±HH、±HH:MM、±HHMM; 带秒分量或多余数字 = 非法。
+func bareOffsetIDShapeOK(s string) bool {
+	if len(s) == 0 || (s[0] != '+' && s[0] != '-') {
+		return false
+	}
+	body := s[1:]
+	switch len(body) {
+	case 2, 4:
+		for i := 0; i < len(body); i++ {
+			if body[i] < '0' || body[i] > '9' {
+				return false
+			}
+		}
+		return true
+	case 5:
+		return body[2] == ':' &&
+			body[0] >= '0' && body[0] <= '9' && body[1] >= '0' && body[1] <= '9' &&
+			body[3] >= '0' && body[3] <= '9' && body[4] >= '0' && body[4] <= '9'
+	}
+	return false
 }
 
 // ===== Duration 文法 =====

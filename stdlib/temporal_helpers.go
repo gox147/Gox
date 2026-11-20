@@ -29,13 +29,18 @@ func tgType(msg string) object.Value { return object.NewErrorWithName("TypeError
 // canonicalTimeZoneID 校验时区标识符并返回规范形式。
 // 时区标识符大小写不敏感: "uTc"/"etc/utc" 等规范化为 "UTC"。
 func canonicalTimeZoneID(id string) (string, bool) {
-	// 裸偏移串 (如 "+0330"、"-08"、"+03:30") 统一规范化为 ±HH:MM[:SS] 形式,
+	// 裸偏移串 (如 "+0330"、"-08"、"+03:30") 统一规范化为 ±HH:MM 形式,
 	// 使 equals 等比较按规范等价 (argument-valid)。仅处理**不含**小数秒
 	// (无 '.'/',' ) 且无 ISO 主体 (无 'T') 的纯偏移标识符; 其余形态
 	// (含小数秒的注解偏移等) 交给下游按各自规则报错。
 	if len(id) > 0 && (id[0] == '+' || id[0] == '-') &&
 		!strings.ContainsAny(id, "Tt.,") {
-		if off, ok := object.ParseTimeZoneOffsetString(id); ok && off%60 == 0 {
+		// sec-temporal-time-zone-identifiers: 作为**时区标识符**的 UTCOffset
+		// 文法只允许 HH / HH:MM / HHMM —— 带秒分量 ("+15:59:00"、"-170100")
+		// 一律 RangeError (test262 timezone-string-sub-minute-offset 族)。
+		// 只在能解析且形状合法时接受; 含秒或更多数字的形状交由
+		// toTimeZoneIDE 的 ParseTimeZoneOffsetString 之前拒绝。
+		if off, ok := object.ParseTimeZoneOffsetString(id); ok && off%60 == 0 && bareOffsetIDShapeOK(id) {
 			return object.FormatOffsetSecondsNumeric(off), true
 		}
 	}
@@ -47,6 +52,28 @@ func canonicalTimeZoneID(id string) (string, bool) {
 		return "UTC", true
 	}
 	return "", false
+}
+
+// bareOffsetIDShapeOK 判断裸偏移标识符形状是否只到分钟精度:
+// 合法 = ±HH、±HH:MM、±HHMM; 带秒分量或多余数字 = 非法。
+func bareOffsetIDShapeOK(s string) bool {
+	if len(s) == 0 || (s[0] != '+' && s[0] != '-') {
+		return false
+	}
+	body := s[1:]
+	if len(body) == 2 || len(body) == 4 {
+		for i := 0; i < len(body); i++ {
+			if body[i] < '0' || body[i] > '9' {
+				return false
+			}
+		}
+		return true
+	}
+	if len(body) == 5 && body[2] == ':' {
+		return (body[0] >= '0' && body[0] <= '9') && (body[1] >= '0' && body[1] <= '9') &&
+			(body[3] >= '0' && body[3] <= '9') && (body[4] >= '0' && body[4] <= '9')
+	}
+	return false
 }
 
 // tgTypeBadThis 生成统一的 "要求 this 为某类型" 错误信息。
@@ -966,16 +993,16 @@ func toTimeZoneIDE(v object.Value) (string, object.Value) {
 	if id, ok := canonicalTimeZoneID(s.Value); ok {
 		return id, nil
 	}
-	// 裸偏移字符串 ("+02:00"、"-05:00:30.5"): 规范化为偏移时区 ID。
-	// 作为时区标识符时不允许带小数秒 (即便小数部分全为 0):
-	// sec-temporal-time-zone-identifiers 的 UTCOffset 文法只到秒。
+	// 裸偏移字符串 ("+02:00"、"-05:00"): 规范化为偏移时区 ID。
+	// 作为时区标识符时 UTCOffset 文法只到分钟 (HH / HH:MM / HHMM),
+	// 小数秒与秒分量一律 RangeError (bareOffsetIDShapeOK / tzOffsetID 把关)。
 	// 仅当整个字符串就是偏移 (以 +/- 开头) 时才应用, 以免误伤
 	// 含小数偏移主体的完整 ISO 串。
 	if len(s.Value) > 0 && (s.Value[0] == '+' || s.Value[0] == '-') &&
 		(strings.ContainsRune(s.Value, '.') || strings.ContainsRune(s.Value, ',')) {
 		return "", tgRange("Trailing zeroes not allowed for sub-minute time zone identifiers")
 	}
-	if off, ok := object.ParseTimeZoneOffsetString(s.Value); ok {
+	if off, ok := object.ParseTimeZoneOffsetString(s.Value); ok && bareOffsetIDShapeOK(s.Value) {
 		return tzOffsetID(off)
 	}
 	// 尝试作为带注解/偏移的 Temporal 字符串解析，取其中的时区部分。
@@ -999,7 +1026,7 @@ func toTimeZoneIDE(v object.Value) (string, object.Value) {
 				if strings.ContainsRune(ann, '.') || strings.ContainsRune(ann, ',') {
 					return "", tgRange("Trailing zeroes not allowed for sub-minute time zone identifiers")
 				}
-				if off, ok := object.ParseTimeZoneOffsetString(ann); ok {
+				if off, ok := object.ParseTimeZoneOffsetString(ann); ok && bareOffsetIDShapeOK(ann) {
 					return tzOffsetID(off)
 				}
 				return "", tgRange("Invalid time zone: " + ann)
@@ -1510,6 +1537,15 @@ func readDateFieldsCore(o propBag, skipCalendar bool) (rawDateFields, object.Val
 func (r rawDateFields) regulate(overflow string) (object.ISODate, object.Value) {
 	if !r.hasYear || !r.hasDay || (!r.hasMonth && !r.hasMonthCode) {
 		return object.ISODate{}, tgType("missing required date fields (year, month, day)")
+	}
+	// 负数月份/日期在 overflow 之前就是非法字段
+	// (sec-temporal-preparetemporalfields 的整数范围校验;
+	// test262 negative-month-or-day 族即使 constrain 也要求 RangeError)。
+	if r.hasMonth && r.month < 1 {
+		return object.ISODate{}, tgRange("month cannot be negative or zero")
+	}
+	if r.day < 1 {
+		return object.ISODate{}, tgRange("day cannot be negative or zero")
 	}
 	y := r.year
 	m := r.month
@@ -2080,7 +2116,7 @@ func toZonedDateTimeValue(v object.Value) (*object.TemporalZonedDateTime, object
 		if _, found := t.GetProperty("timeZone"); !found {
 			return nil, tgType("argument is not a ZonedDateTime: missing timeZone")
 		}
-		raw, _, tz, rerr := readZDTFieldsRaw(t)
+		raw, off, tz, rerr := readZDTFieldsRaw(t)
 		if rerr != nil {
 			return nil, rerr
 		}
@@ -2088,14 +2124,56 @@ func toZonedDateTimeValue(v object.Value) (*object.TemporalZonedDateTime, object
 		if ferr != nil {
 			return nil, ferr
 		}
-		cands := object.GetPossibleInstantsFor(tz, dt)
-		ns, ok3 := object.DisambiguatePossibleInstants(cands, tz, dt, "compatible")
-		if !ok3 {
-			return nil, tgRange("Invalid wall-clock time")
+		// 参数包自带 offset: 按 InterpretISODateTimeOffset 默认 offset=reject
+		// 校验与 timezone 一致性 (argument-propertybag-offset-not-agreeing 族)。
+		ev := interpretISODateTimeOffset(dt, tz, object.DefaultCalendarID, off, "reject", "compatible")
+		if e, isErr := ev.(*object.Error); isErr {
+			return nil, e
 		}
-		return object.NewTemporalZonedDateTime(ns, tz, object.DefaultCalendarID), nil
+		return ev.(*object.TemporalZonedDateTime), nil
 	}
 	return nil, tgType("argument is not a ZonedDateTime")
+}
+
+// interpretISODateTimeOffset 实现规范的 InterpretISODateTimeOffset:
+// 墙钟字段 + 时区 + (可选) 属性包 offset 字符串 + offset 选项 → 精确时刻。
+//   - offset 为空或 "ignore": 按 disambiguation 从候选时刻求解 (墙钟路径)。
+//   - offset = "use": 无条件信任 offset 计算时刻。
+//   - offset = "reject": 属性包 offset 与 timezone 实际偏移不一致 → RangeError。
+//   - 其余 ("prefer"/"compatible"): 偏移一致时用 offset，否则墙钟求解。
+func interpretISODateTimeOffset(dt object.ISODateTime, tz, calendar, off, offsetOpt, disambiguation string) object.Value {
+	cands := object.GetPossibleInstantsFor(tz, dt)
+	ns, ok := object.DisambiguatePossibleInstants(cands, tz, dt, disambiguation)
+	if !ok {
+		return tgRange("Ambiguous or non-existent wall-clock time (use the disambiguation option)")
+	}
+	if !object.IsValidEpochNanos(ns) {
+		return tgRange("ZonedDateTime is outside of supported range")
+	}
+	if off == "" || offsetOpt == "ignore" {
+		return object.NewTemporalZonedDateTime(ns, tz, calendar)
+	}
+	want, okOff := object.ParseTimeZoneOffsetString(off)
+	if !okOff {
+		return tgRange(off + " is not a valid offset string")
+	}
+	// timezone 实际偏移 = 墙钟时刻 - 求解出的 UTC 时刻 (固定偏移时区下唯一)。
+	actualSec := new(big.Int).Sub(dt.EpochNanos(), ns)
+	actualSec.Div(actualSec, big.NewInt(object.NanosPerSecond))
+	if offsetOpt == "reject" {
+		if actualSec.Int64() != int64(want) {
+			return tgRange("offset is not equal to the time zone offset")
+		}
+		return object.NewTemporalZonedDateTime(ns, tz, calendar)
+	}
+	if offsetOpt == "use" || (offsetOpt == "prefer" && actualSec.Int64() == int64(want)) {
+		wns := new(big.Int).Sub(dt.EpochNanos(), big.NewInt(int64(want)*object.NanosPerSecond))
+		if !object.IsValidEpochNanos(wns) {
+			return tgRange("ZonedDateTime is outside of supported range")
+		}
+		return object.NewTemporalZonedDateTime(wns, tz, calendar)
+	}
+	return object.NewTemporalZonedDateTime(ns, tz, calendar)
 }
 
 // ===== 函数 length 修正 =====

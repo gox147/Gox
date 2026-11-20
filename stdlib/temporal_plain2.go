@@ -537,9 +537,17 @@ func setupTemporalPlainTime(temporal *object.Object) {
 		if !ok {
 			return tgType("PlainTime.prototype.with: invalid fields")
 		}
+		// spec 顺序: RejectObjectWithCalendarOrTimeZone 先于字段读取
+		// (argument-calendar-field 族: with({calendar:...}) → TypeError)。
+		if e := rejectTemporalLikeObject(o); e != nil {
+			return e
+		}
 		// spec 顺序: 先 ToTemporalTimeRecord (读字段, 非有限/非整数 → RangeError,
 		// 如 minute:Infinity), 再 GetOptionsObject (原始值 → TypeError), 最后
 		// 才做范围调节 (hour:25 受 overflow 影响)。
+		if e := requireAnyTimeField(o); e != nil {
+			return e
+		}
 		time := t.ISOTime()
 		if merr := mergeTimeInto(&time, o); merr != nil {
 			return merr
@@ -805,6 +813,9 @@ func setupTemporalPlainTime(temporal *object.Object) {
 				return tgType("PlainTime.from: unsupported argument")
 			}
 			time := object.ISOTime{}
+			if e := requireAnyTimeField(v); e != nil {
+				return e
+			}
 			if merr := mergeTimeInto(&time, v); merr != nil {
 				return merr
 			}

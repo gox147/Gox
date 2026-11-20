@@ -57,8 +57,10 @@ func setupTemporalInstant(env *object.Object) {
 		if serr := checkDurationUniformSign(d); serr != nil {
 			return serr
 		}
-		if d.HasCalendarUnits() {
-			return tgRange("Instant.add: duration with calendar units requires a relativeTo")
+		// spec ToLimitedTemporalDuration: Instant 的 add/subtract 不允许
+		// 年/月/周/**日** 分量非零 (日对无时区的时间戳而言也是不定长单位)。
+		if d.Years() != 0 || d.Months() != 0 || d.Weeks() != 0 || d.Days() != 0 {
+			return tgRange("duration with years, months, weeks, or days is not allowed for Instant arithmetic")
 		}
 		ns := new(big.Int).Add(t.Nanos(), d.TimeTotalNanos())
 		if !object.IsValidEpochNanos(ns) {
@@ -82,8 +84,8 @@ func setupTemporalInstant(env *object.Object) {
 		if serr := checkDurationUniformSign(d); serr != nil {
 			return serr
 		}
-		if d.HasCalendarUnits() {
-			return tgRange("Instant.subtract: duration with calendar units requires a relativeTo")
+		if d.HasCalendarUnits() || d.Days() != 0 {
+			return tgRange("Instant.subtract: duration with calendar units or days is not allowed")
 		}
 		ns := new(big.Int).Sub(t.Nanos(), d.TimeTotalNanos())
 		if !object.IsValidEpochNanos(ns) {

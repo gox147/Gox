@@ -471,7 +471,17 @@ func setupTemporalZonedDateTime(temporal *object.Object) {
 			}
 			tzid = tz
 		}
-		return object.NewTemporalZonedDateTime(bn.Value, tzid, object.DefaultCalendarID)
+		// 第三参 calendar: undefined 缺省; 其余值 (含 null/number/object)
+		// 按 ToTemporalCalendarIdentifier 校验 (calendar-wrong-type 族)。
+		cal := object.DefaultCalendarID
+		if len(args) > 2 && args[2] != object.UndefinedSingleton {
+			c, cErr := toCalendarIDValue(args[2])
+			if cErr != nil {
+				return cErr
+			}
+			cal = c
+		}
+		return object.NewTemporalZonedDateTime(bn.Value, tzid, cal)
 	})
 	ctor.SetProperty("name", object.NewString("ZonedDateTime"))
 	tgMarkCtorNew(ctor)
@@ -522,7 +532,7 @@ func setupTemporalZonedDateTime(temporal *object.Object) {
 			if ferr != nil {
 				return ferr
 			}
-			dis, _, fromOverflow, oe := readZDTOptionsE(argAt(args, 1))
+			dis, offOpt, fromOverflow, oe := readZDTOptionsE(argAt(args, 1))
 			if oe != nil {
 				return oe
 			}
@@ -530,16 +540,7 @@ func setupTemporalZonedDateTime(temporal *object.Object) {
 			if ferr != nil {
 				return ferr
 			}
-			// 属性包自带 offset 时直接得到精确时刻，跳过 DST 求解。
-			if off != "" {
-				want, ok := object.ParseTimeZoneOffsetString(off)
-				if !ok {
-					return tgRange("Invalid offset")
-				}
-				ns := new(big.Int).Sub(dt.EpochNanos(), big.NewInt(int64(want)*object.NanosPerSecond))
-				return object.NewTemporalZonedDateTime(ns, tz, object.DefaultCalendarID)
-			}
-			return zdtFromWallClock(dt, tz, object.DefaultCalendarID, dis, nil)
+			return interpretISODateTimeOffset(dt, tz, object.DefaultCalendarID, off, offOpt, dis)
 		}
 		return tgType("ZonedDateTime.from: unsupported argument")
 	})

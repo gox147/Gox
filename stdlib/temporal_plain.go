@@ -657,6 +657,18 @@ func mergeTimeInto(t *object.ISOTime, o propBag) object.Value {
 	return nil
 }
 
+// requireAnyTimeField 校验属性包至少出现一个时间字段
+// (spec ToTemporalTimeRecord: 全缺 → TypeError)。仅用于 PlainTime.from/with
+// 的字段包入口; toZonedDateTime 等混合包 (timeZone+plainTime) 不得套用。
+func requireAnyTimeField(o propBag) object.Value {
+	for _, k := range []string{"hour", "microsecond", "millisecond", "minute", "nanosecond", "second"} {
+		if v, found := o.GetProperty(k); found && v != object.UndefinedSingleton {
+			return nil
+		}
+	}
+	return tgType("at least one time property is required")
+}
+
 // mergeTimeFields 从属性包构造新的 ISOTime (其余字段归零)。
 func mergeTimeFields(base object.ISOTime, src object.Value) (object.ISOTime, bool) {
 	o, ok := src.(propBag)
