@@ -616,3 +616,42 @@ gpu,nofakecgo）；js/wasm 维持已知不支持（wgpu hal 无 wasm 后端）�
 go1.26.2），不进闸门、不对外。G-3 A 路径剩余与 G-1 收尾仍差硬件覆盖
 三项（三平台真机 audit+bench、swapchain 真机点亮对照数字），需真机
 runner（GPU_HARDWARE_RUNNER=true），不声称 A 路径完成。
+
+## 2026-11-21 00:00 执行窗口复跑核销（Linux x86_64 沙箱，无 GPU 硬件，全部为兜底口径：不进闸门、不对外）
+
+### 背景与范围
+
+main 自 20:00 窗口（2c75287）起漂移 2 提交至 127ee57（de847c6 为
+T8/Temporal stdlib 校验收口，127ee57 为 T3-4 启动性能 A/B 否决交付），
+两提交均不触碰 gfx 渲染代码（diff 范围 stdlib/temporal_*、tools/perf、
+app 启动侧）。按口径仍做漂移后 GPU 三轨全量复跑，纯核销运行，无 Go
+渲染代码变更。另核实 2026-11-19 侧记的「ci.yml / mobile-smoke 长红」
+已在 main 上收口：127ee57 的两条 workflow 均 success（字体扫描用例
+T3-5 侧加固生效），不再掩盖 GPU 闸门真回归。
+
+### 三轨核销（gpu-track-audit.sh --xcompile，2026-11-21 00:05）
+
+nogpu=none / wgpu=software（wgpu-software，兜底口径）/ cgo=none（骨
+架恒 ErrNotBuilt）—— 与 11-08 ~ 11-20 基线逐项一致，无漂移。交叉编译
+矩阵（CGO_ENABLED=0）6 目标全 ok：windows/amd64+arm64、
+linux/amd64+arm64（-tags gpu）、darwin/amd64+arm64（-tags
+gpu,nofakecgo）；js/wasm 维持已知不支持。
+
+### 回归与视觉闸门
+
+- `go test ./gfx`（默认轨，418.9s）ok；`GOX_GPU_PROBE=1 GOX_GPU=software
+  go test ./gfx/gpu`（wgpu 轨）ok；`go vet ./gfx/... ./cmd/gox` 干净；
+- `TestSwapchainGate`（5 道 gate）、`TestSwapchainCommitGate`（两段式
+  提交 4 例）、`TestGPUPresentPixelExact` 全绿；
+- 26 组件 CPU vs GPU 双轨快照 A/B（TestGPUSnapshotABGate/AB26，
+  软件适配器兜底口径）PASS，差异像素 0 —— Prism 视觉一致性零退化
+  （G-4 闸门未触碰）；
+- x11 swapchain e2e（GOX_GPU_X11_E2E=1 + xvfb-run，软件适配器兜底
+  口径）PASS —— 窗口化点亮链路保持可用。
+
+### 诚实口径
+
+本节全部数字为无硬件兜底口径（Linux x86_64 沙箱，wgpu-software，
+go1.26.2），不进闸门、不对外。G-3 A 路径剩余与 G-1 收尾仍差硬件覆盖
+三项（三平台真机 audit+bench、swapchain 真机点亮对照数字），需真机
+runner（GPU_HARDWARE_RUNNER=true），不声称 A 路径完成。
