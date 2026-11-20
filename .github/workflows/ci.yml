@@ -456,6 +456,29 @@ jobs:
             exit 1
           fi
 
+      # 局部槽寻址形态钉子（T3-4 第二十五批, 2026-11-20）。
+      # 它守的不是毫秒数, 而是**解释器主循环这一条指令编译成什么**。起因: 本轮
+      # 把 `frame.Locals[slot]` 改成指针表 (LocalPtrs) 寻址, 功能全绿但同机 A/B
+      # 慢 4.3%~6.4% (0/20~1/24 轮胜), 反汇编才发现两边条数一样多 —— "省一个
+      # slice 头载入"被"多一次指针表载入 + 一次比较"吃回去 (docs/performance.md
+      # §12.26)。所以把当前形态钉住: 谁的改动让局部槽访问多出一层间接, 这条就红,
+      # 逼他先做同机 A/B 再说服人。
+      #
+      # 只在 Linux 上跑: 断言的是 linux/amd64 的指令序列, 其他平台测试内部
+      # t.Skip（与 coldstart 的"缺栈跳过"同纪律）。缺 objdump 时同样 skip, 不
+      # 把环境问题做成假红。
+      - name: 局部槽寻址形态钉子（linux/amd64 指令序列）
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -uo pipefail
+          go test ./tools/perf/ -run 'TestLocalsAddressingShape' -count=1 -v 2>&1
+          rc=$?
+          if [ "$rc" -ne 0 ]; then
+            echo "::error::局部槽寻址形态变了 —— 解释器主循环的局部读写不再是无中间层的直接寻址。先读 docs/performance.md §12.26: 上一版指针表方案功能全对但慢 4.3%; 要做必须按该节口径跑 scripts/perf-ab.sh（≥16 轮 + --aa 对照）"
+            exit 1
+          fi
+
       # 证据纪律（看板 rXrGfu，2026-10-07 补）：本步曾在 macos-latest 上持续红，
       # 而 check-run 注解只有 `Process completed with exit code 1.`（未登录读不到
       # job 日志）⇒ 与 Linux 那条同款处理：自己把「失败包 + 失败用例名 + 断言明细」

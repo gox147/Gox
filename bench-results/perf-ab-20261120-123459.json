@@ -1,0 +1,63 @@
+{
+  "tool": "perf-ab.sh",
+  "generated_at": "2026-11-20T12:34:59Z",
+  "label": "A/A 对照: 同 commit 两棵干净树",
+  "bench": "Fib28PureEval",
+  "benchtime": "10x",
+  "runs": 12,
+  "base": {
+    "rev": "HEAD",
+    "commit": "9f106c1",
+    "dirty": false
+  },
+  "candidate": {
+    "commit": "9f106c1",
+    "dirty": true
+  },
+  "ns_per_op": {
+    "base_median": 136180415.0,
+    "candidate_median": 135289821.0,
+    "gain_pct": 0.6539809707585338
+  },
+  "b_per_op": {
+    "base_median": 10708103.5,
+    "candidate_median": 10708120.5
+  },
+  "allocs_per_op": {
+    "base_median": 402737.0,
+    "candidate_median": 402737.0
+  },
+  "rounds_candidate_faster": 8,
+  "threshold_pct": 5.0,
+  "verdict": "fail",
+  "samples": {
+    "base": [
+      139155645.0,
+      139520499.0,
+      137760022.0,
+      136740868.0,
+      135980919.0,
+      135278016.0,
+      135610193.0,
+      137106241.0,
+      136180781.0,
+      133230381.0,
+      134525263.0,
+      136180049.0
+    ],
+    "candidate": [
+      137030728.0,
+      133031251.0,
+      135878070.0,
+      134449238.0,
+      138205643.0,
+      134233135.0,
+      133815489.0,
+      136103801.0,
+      133704344.0,
+      134701572.0,
+      137342716.0,
+      140650783.0
+    ]
+  }
+}

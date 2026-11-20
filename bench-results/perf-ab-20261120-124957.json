@@ -1,0 +1,84 @@
+{
+  "tool": "perf-ab.sh",
+  "generated_at": "2026-11-20T12:49:57Z",
+  "label": "A/A 复现 #1 | A/A 对照 (两侧同 rev=HEAD)",
+  "bench": "Fib28PureEval",
+  "benchtime": "10x",
+  "runs": 12,
+  "base": {
+    "rev": "HEAD",
+    "commit": "9f106c1",
+    "dirty": false
+  },
+  "candidate": {
+    "commit": "9f106c1",
+    "dirty": false
+  },
+  "ns_per_op": {
+    "base_median": 136579789.5,
+    "candidate_median": 137173189.5,
+    "gain_pct": -0.4344713095344168
+  },
+  "b_per_op": {
+    "base_median": 10708059.0,
+    "candidate_median": 10707548.5
+  },
+  "allocs_per_op": {
+    "base_median": 402737.0,
+    "candidate_median": 402736.0
+  },
+  "rounds_candidate_faster": 7,
+  "rounds_counted": 12,
+  "outlier": "keep",
+  "outliers_dropped": {
+    "rounds": 0,
+    "base_samples": 0,
+    "candidate_samples": 0
+  },
+  "kept_rounds": [
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11,
+    12
+  ],
+  "threshold_pct": 0.0,
+  "verdict": "fail",
+  "samples": {
+    "base": [
+      135210609.0,
+      133457360.0,
+      138911694.0,
+      136982514.0,
+      135995076.0,
+      139342566.0,
+      136589481.0,
+      133917624.0,
+      135584870.0,
+      137941432.0,
+      138424542.0,
+      136570098.0
+    ],
+    "candidate": [
+      151361839.0,
+      140910801.0,
+      135241816.0,
+      140231809.0,
+      134538226.0,
+      135565356.0,
+      133837084.0,
+      136911419.0,
+      137434960.0,
+      137622793.0,
+      137576126.0,
+      136136609.0
+    ]
+  }
+}

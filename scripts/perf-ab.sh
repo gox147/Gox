@@ -25,6 +25,19 @@
 #   - 两侧都给干净 checkout 时用 --candidate-rev：这样"两次测量之间换了工作树
 #     内容"这类手工失误就从流程里消失了（比较的对象被钉在某个 commit 上）。
 #
+# --- 编译口径: 两侧都用**可复现构建** (T3-4 第二十五批, 2026-11-20) ---
+#
+# 此前两侧是裸 `go test -c`, 产物里带着"当时的工作目录 + 构建号 + 是否 CGO"
+# 三种随机性。实测后果: 同一棵树的两次独立编译 (同一份源码、不同 worktree 路径)
+# 产出的二进制在 fib28 上差 1.7%~4.8%, 而且**同一对二进制重复跑三天都稳定** ——
+# 也就是说它长得像代码收益, 其实是布局运气。本轮用 A/A 对照把它钉死了
+# (同 commit 两棵干净树: -0.65% / -1.05%; A/B 变体: +4.30% / +4.84% / +6.37%),
+# 详见 docs/performance.md §12.26。
+#
+# 处置: 两侧统一 `CGO_ENABLED=0 go test -c -trimpath -ldflags=-buildid=`。
+# 同源码 + 同路径下产物逐字节一致 (md5 相同), 位置效应被消掉。代价是
+# 两侧的 cgo/env 差异也不再被隐式混入 —— 这正是要的: 比的应该是代码。
+#
 # 跑法:
 #   ./scripts/perf-ab.sh                                  # 默认 Fib28PureEval, 6 轮
 #   ./scripts/perf-ab.sh --bench SetupGlobals --runs 8
@@ -34,6 +47,22 @@
 #   ./scripts/perf-ab.sh --candidate-rev perf/abA         # candidate 侧改用另一个
 #                                                         # **已提交**的 rev (干净
 #                                                         # checkout), 不读工作树
+#   ./scripts/perf-ab.sh --aa 20                          # A/A 对照: 两侧同一 rev,
+#                                                         # 用来看这套支架的分辨率
+#                                                         # (中位偏差 & 逐轮胜率)
+#   ./scripts/perf-ab.sh --outlier drop --runs 16         # 离群轮处置, 见下
+#
+# --- 离群轮 (T3-4 第二十五批实测新增) ---
+#
+# 本沙箱在夜间会出现整轮翻倍的"卡顿轮": 同一份代码 n=20 的样本里能有两三轮
+# 落在 170~210ms (平时 133~137ms)。它把**中位**也带歪 —— 12 轮的 A/A 对照
+# 实测过一次 A=158.3ms vs B=140.6ms (-11.17%), 两侧二进制逐字节相同。
+# 所以:
+#   --outlier keep (默认, 历史口径, 便于与旧 JSON 对齐)
+#   --outlier drop: **按轮**进行配对筛除 —— 同轮的 A、B 只要有一个超过本侧
+#     原始中位 × 1.15, 这一对同时丢弃 (两侧样本数仍相等, 配对性不乱)。实测
+#     "只丢一侧"会把 A/A 做成 -2.84% (A 侧恰好卡顿更多), 所以只允许成对丢。
+# 判定仍要同时看"逐轮胜率"与 --aa 的噪声范围; 单看中位小数点不算数 (§3.4.9.5)。
 #
 # 结果: bench-results/perf-ab-<UTC时间>.json + stdout 一张表。
 # 默认 base = HEAD（未提交改动与 HEAD 比）；--base <rev> 可与任意提交比。
@@ -50,6 +79,8 @@ MIN_GAIN=5
 GATE=1
 KEEP=0
 CAND_REV=""
+AA_RUNS=0
+OUTLIER="keep"
 LABEL=""
 
 while [[ $# -gt 0 ]]; do
@@ -62,12 +93,28 @@ while [[ $# -gt 0 ]]; do
     --min-gain) MIN_GAIN="$2"; shift 2 ;;
     --no-gate) GATE=0; shift ;;
     --candidate-rev) CAND_REV="$2"; shift 2 ;;
+    --aa) AA_RUNS="$2"; shift 2 ;;
+    --outlier) OUTLIER="$2"; shift 2 ;;
     --label) LABEL="$2"; shift 2 ;;
     --keep) KEEP=1; shift ;;
     -h|--help) sed -n '2,40p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "未知参数 $1 (见 --help)"; exit 1 ;;
   esac
 done
+
+if [[ "$AA_RUNS" != "0" ]]; then
+  # A/A 对照: candidate 侧钉在与 base 同一个 rev 上。RUNS 沿用 --runs。
+  # 两侧都钉在**当前 HEAD 的 commit** 上 (BASE_REV 可能是 HEAD~1 之类的相对
+  # 引用, 直接用它当 candidate 侧会变成"和它自己比"以外的语义)。
+  CAND_REV="$(git -C "$ROOT" rev-parse "$BASE_REV")"
+  MIN_GAIN=0
+  AA_LABEL="A/A 对照 (两侧同 rev=$BASE_REV)"
+  if [[ -z "$LABEL" ]]; then LABEL="$AA_LABEL"; else LABEL="$LABEL | $AA_LABEL"; fi
+fi
+
+if [[ "$OUTLIER" != "keep" && "$OUTLIER" != "drop" ]]; then
+  echo "[perf-ab] --outlier 只接受 keep / drop"; exit 2
+fi
 
 if [[ "$RUNS" -lt 3 ]]; then
   echo "[perf-ab] --runs 至少 3（交替取样少于 3 轮无法给出可信中位）" >&2
@@ -118,14 +165,14 @@ echo "==================================================================="
 
 # base 侧: 干净 checkout（工作树里未提交的改动不会混进来）
 git -C "$ROOT" worktree add --detach "$WORK/base" "$BASE_REV" >/dev/null
-( cd "$WORK/base" && GOFLAGS="-mod=mod" go test -c -o "$WORK/base.test" "$PKG" >/dev/null )
+( cd "$WORK/base" && GOFLAGS="-mod=mod" CGO_ENABLED=0 go test -c -trimpath -ldflags="-buildid=" -o "$WORK/base.test" "$PKG" >/dev/null || { echo "[perf-ab] base 侧编译失败（见上）"; exit 4; } )
 
 # candidate 侧: 显式 rev 走独立干净 checkout; 否则用当前工作树（含未提交改动）
 if [[ -n "$CAND_REV" ]]; then
   git -C "$ROOT" worktree add --detach "$WORK/cand" "$CAND_REV" >/dev/null
-  ( cd "$WORK/cand" && go test -c -o "$WORK/head.test" "$PKG" >/dev/null )
+  ( cd "$WORK/cand" && CGO_ENABLED=0 go test -c -trimpath -ldflags="-buildid=" -o "$WORK/head.test" "$PKG" >/dev/null || { echo "[perf-ab] candidate 侧编译失败（见上）"; exit 4; } )
 else
-  ( cd "$ROOT" && go test -c -o "$WORK/head.test" "$PKG" >/dev/null )
+  ( cd "$ROOT" && CGO_ENABLED=0 go test -c -trimpath -ldflags="-buildid=" -o "$WORK/head.test" "$PKG" >/dev/null || { echo "[perf-ab] candidate 侧编译失败（见上）"; exit 4; } )
 fi
 
 run_once() { # $1=binary $2=outfile
@@ -143,11 +190,11 @@ for i in $(seq 1 "$RUNS"); do
   printf 'B=%-10s\n' "$(awk '/ns\/op/{print $3}' "$WORK/b-$i.txt" | head -1)"
 done
 
-python3 - "$ROOT" "$WORK" "$RUNS" "$BASE_REV" "$BASE_SHA" "$HEAD_SHA" "$BASE_DIRTY" "$HEAD_DIRTY" "$BENCH" "$BENCHTIME" "$MIN_GAIN" "$GATE" "$LABEL" <<'PY'
+python3 - "$ROOT" "$WORK" "$RUNS" "$BASE_REV" "$BASE_SHA" "$HEAD_SHA" "$BASE_DIRTY" "$HEAD_DIRTY" "$BENCH" "$BENCHTIME" "$MIN_GAIN" "$GATE" "$LABEL" "$OUTLIER" <<'PY'
 import json, os, re, statistics, subprocess, sys, time
 
 (root, work, runs, base_rev, base_sha, head_sha, base_dirty, head_dirty,
- bench, benchtime, min_gain, gate, label) = sys.argv[1:14]
+ bench, benchtime, min_gain, gate, label, outlier) = sys.argv[1:15]
 runs = int(runs); min_gain = float(min_gain); gate = gate == "1"
 
 def parse(path):
@@ -172,14 +219,38 @@ for i in range(1, runs + 1):
 def flatten(samples, k):
     return [v for s in samples for v in s[k]]
 
-a_ns, b_ns = flatten(A, 0), flatten(B, 0)
+def pair_filter():
+    # 按轮配对筛除卡顿轮 (见文件头 --outlier)。返回保留下来的轮号列表。
+    if outlier != "drop" or runs < 6:
+        return list(range(runs))
+    a_med, b_med = statistics.median(flatten(A, 0)), statistics.median(flatten(B, 0))
+    kept = []
+    for i in range(runs):
+        av, bv = statistics.median(A[i][0]), statistics.median(B[i][0])
+        if av > a_med * 1.15 or bv > b_med * 1.15:
+            continue
+        kept.append(i)
+    if len(kept) < runs // 2:
+        return list(range(runs))
+    return kept
+
+kept_rounds = pair_filter()
+a_raw, b_raw = flatten(A, 0), flatten(B, 0)
+a_ns = [v for i in kept_rounds for v in A[i][0]]
+b_ns = [v for i in kept_rounds for v in B[i][0]]
+a_drop, b_drop = len(a_raw) - len(a_ns), len(b_raw) - len(b_ns)
 a_b, b_b = flatten(A, 1), flatten(B, 1)
 a_al, b_al = flatten(A, 2), flatten(B, 2)
 
 med_a, med_b = statistics.median(a_ns), statistics.median(b_ns)
 gain = (med_a - med_b) / med_a * 100.0
 # 配对符号检验: 逐轮"同轮两值"比较, 抵消机器漂移
-wins = sum(1 for i in range(runs) if statistics.median(B[i][0]) < statistics.median(A[i][0]))
+wins = 0
+counted = 0
+for i in kept_rounds:
+    counted += 1
+    if statistics.median(B[i][0]) < statistics.median(A[i][0]):
+        wins += 1
 med_a_al, med_b_al = statistics.median(a_al), statistics.median(b_al)
 
 print()
@@ -192,7 +263,9 @@ print(f"{'B/op (中位)':<14}{statistics.median(a_b):>14,.0f}{statistics.median(
 print(f"{'allocs/op (中位)':<12}{med_a_al:>14,.0f}{med_b_al:>14,.0f}"
       f"{(med_b_al/max(med_a_al,1)-1)*100:>11.2f}%")
 print("-------------------------------------------------------------------")
-print(f"逐轮更快: {wins}/{runs} 轮（candidate 胜）")
+print(f"逐轮更快: {wins}/{counted} 轮（candidate 胜）")
+if a_drop or b_drop:
+    print(f"离群轮: 成对丢弃 {runs - len(kept_rounds)} 轮 (A 丢 {a_drop} 个样本 / B 丢 {b_drop} 个, --outlier drop)")
 
 verdict = "PASS(达标)" if gain >= min_gain else "FAIL(未达阈值)"
 print(f"判定: 中位改善 {gain:+.2f}%，阈值 {min_gain:.2f}% ⇒ {verdict}")
@@ -210,9 +283,13 @@ out = {
     "b_per_op": {"base_median": statistics.median(a_b), "candidate_median": statistics.median(b_b)},
     "allocs_per_op": {"base_median": med_a_al, "candidate_median": med_b_al},
     "rounds_candidate_faster": wins,
+    "rounds_counted": counted,
+    "outlier": outlier,
+    "outliers_dropped": {"rounds": runs - len(kept_rounds), "base_samples": a_drop, "candidate_samples": b_drop},
+    "kept_rounds": [i + 1 for i in kept_rounds],
     "threshold_pct": min_gain,
     "verdict": "pass" if gain >= min_gain else "fail",
-    "samples": {"base": a_ns, "candidate": b_ns},
+    "samples": {"base": a_raw, "candidate": b_raw},
 }
 res_dir = os.path.join(root, "bench-results")
 os.makedirs(res_dir, exist_ok=True)
