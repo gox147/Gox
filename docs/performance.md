@@ -3246,3 +3246,48 @@ go test ./tools/perf/ -run 'AllocBudget' -count=1 -v
 ./scripts/coldstart.sh --runs 15
 for i in $(seq 20); do s=$(date +%s%N); ./gox version >/dev/null; e=$(date +%s%N); echo $(((e-s)/1000000)); done
 ```
+
+---
+
+### 12.24 T3-5 第二十四批：内建装配的键登记去掉线性扫描（收益低于分辨率，留作标定）
+
+第二十三批把 `SetupGlobals` 从 293.7µs 压到 224µs 后，剖面里还剩一块**结构性**浪费：
+`Object.DefineOwnProperty` 每次都调 `appendKey`，而 `appendKey` 用线性扫描判断
+"这个键是否已登记"——于是装配一个 40~60 个成员的对象是 O(n²) 次字符串比较
+（`Array.prototype`、`Math`、全局对象都是这种规模）。
+
+改动（`object/object_type.go`）：`DefineOwnProperty` 先判存在性，**新键直接 append**，
+已存在的键才走 `appendKey`。新键不可能已在 `InsertOrder` 里——两张表只在
+`removeKey`/`DeleteProperty` 时成对收缩，仓里没有任何路径留下"只在 InsertOrder
+里的幽灵键"。语义零改动，覆盖定义路径的代码一字未动。
+
+#### 12.24.1 A/B 数字（同机配对，`scripts/perf-ab.sh --bench SetupGlobals`）
+
+| 轮数 | base 中位 | candidate 中位 | 变化 | 逐轮胜负 |
+|---|---|---|---|---|
+| 6（`--runs 6`） | 204,902 | 200,440 | **−2.18%** | 6/6 candidate 胜 |
+| 20（`--runs 20`） | 201,280 | 201,010 | **−0.13%** | 8/20，等于掷硬币 |
+
+分配口径完全不变（1,570 allocs / 222KB，两侧一致），说明省下的只是比较与少量
+growslice，没有改变对象图。
+
+#### 12.24.2 结论：一次教科书式的"6 轮骗人"
+
+6 轮给了一个漂亮的 6/6 全胜 + 2.18%，接到 20 轮就退回噪声。这与 §3.4.9 定的
+口径完全一致：**2% 量级的改动必须 ≥20 轮，且要能解释"为什么是这个量级"**——
+本批的算术上限也对得上，`appendKey` flat 只占 `SetupGlobals` 约 2%（剖面
+`-list appendKey`：50ms/690ms），再怎么优化也不可能超过这个数。
+
+因此本批**不写进冷启动成绩单**，只作为标定：`appendKey` 线性扫描这条线的天花板
+≈2% of SetupGlobals ≈ 0.7µs of 冷启动首帧的 9ms —— 与 §12.22 的结论同向，
+"初始化侧剩下的都是分母太小"。改动保留（语义等价、代码更直白、无额外风险），
+但不作为性能证据引用。
+
+复现：
+
+```bash
+./scripts/perf-ab.sh --bench SetupGlobals --runs 20 --no-gate --label "appendKey 直追"
+```
+
+结果 JSON：`bench-results/perf-ab-20261120-000251.json`（6 轮）、
+`bench-results/perf-ab-20261120-000303.json`（20 轮）。

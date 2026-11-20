@@ -267,8 +267,22 @@ func (o *Object) DefineOwnProperty(name string, desc PropertyDescriptor) {
 	if o.Properties == nil {
 		o.Properties = make(map[string]PropertyDescriptor)
 	}
+	// 新键直接追加: 它不可能已在 InsertOrder 里 (Properties 与 InsertOrder
+	// 只在 removeKey/delete 时成对收缩, 没有任何路径留下"只在 InsertOrder
+	// 里的幽灵键"), 因此省掉 appendKey 的 O(n) 扫描。
+	//
+	// 冷启动热路径 (T3-5 第二十四批): 内建装配期 99% 以上是首次定义, 旧写法
+	// 让每次 SetBuiltinProperty 都线性扫一遍已登记键 —— Math/Array.prototype/
+	// 全局对象这类成员多的对象上是 O(n²) 次字符串比较 (本机剖面 appendKey
+	// flat 占 SetupGlobals ~2%, 且 InsertOrder 的 growslice 另计)。
+	// 覆盖定义 (defineProperty 改已存在的键) 仍走 appendKey, 语义一字不动。
+	if _, existed := o.Properties[name]; existed {
+		o.Properties[name] = desc
+		o.appendKey(name)
+		return
+	}
 	o.Properties[name] = desc
-	o.appendKey(name)
+	o.InsertOrder = append(o.InsertOrder, name)
 }
 
 // SetBuiltinProperty 以内建属性语义 (writable:true, enumerable:false,

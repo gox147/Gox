@@ -1,0 +1,51 @@
+{
+  "tool": "perf-ab.sh",
+  "generated_at": "2026-11-20T00:02:51Z",
+  "label": "T3-5 第二十四批: DefineOwnProperty 新键直追",
+  "bench": "SetupGlobals",
+  "benchtime": "10x",
+  "runs": 6,
+  "base": {
+    "rev": "HEAD",
+    "commit": "8d16f2a",
+    "dirty": false
+  },
+  "candidate": {
+    "commit": "8d16f2a",
+    "dirty": true
+  },
+  "ns_per_op": {
+    "base_median": 204902.0,
+    "candidate_median": 200440.0,
+    "gain_pct": 2.1776263774877744
+  },
+  "b_per_op": {
+    "base_median": 222402.5,
+    "candidate_median": 222402.5
+  },
+  "allocs_per_op": {
+    "base_median": 1570.0,
+    "candidate_median": 1570.0
+  },
+  "rounds_candidate_faster": 6,
+  "threshold_pct": 5.0,
+  "verdict": "fail",
+  "samples": {
+    "base": [
+      202598.0,
+      200068.0,
+      222599.0,
+      207206.0,
+      200367.0,
+      213277.0
+    ],
+    "candidate": [
+      189983.0,
+      195449.0,
+      219424.0,
+      205431.0,
+      193395.0,
+      207126.0
+    ]
+  }
+}
