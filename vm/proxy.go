@@ -283,6 +283,23 @@ func (vm *VM) proxyConstruct(proxy *object.Proxy, args []object.Value, newTarget
 			return vm.proxyConstruct(tp, args, newTarget)
 		}
 		newObj := object.NewObject()
+		// 规范 target.[[Construct]](args, newTarget) → OrdinaryCreateFrom-
+		// Constructor(newTarget) → GetPrototypeFromConstructor:
+		// Get(newTarget, "prototype") 对 proxy newTarget 须经其 get trap
+		// (trap 可在读取中撤销代理); 原型非对象时 GetFunctionRealm(newTarget)
+		// 对 revoked proxy 抛 TypeError (base-ctor-revoked-proxy 族, T5 r8dXes)。
+		// 仅 proxy newTarget 走此路径, 其余 newTarget 保持既有口径。
+		if ntp, isProxy := newTarget.(*object.Proxy); isProxy {
+			proto, perr := vm.proxyGet(ntp, "prototype", newTarget)
+			if perr != nil {
+				return nil, perr
+			}
+			if object.IsObjectLike(proto) {
+				newObj = object.NewObjectWithProto(proto)
+			} else if ntp.IsRevoked || ntp.Target == nil {
+				return nil, typeErrorThrow("Cannot construct a proxy that has been revoked")
+			}
+		}
 		result, err := vm.callFunction(proxy.Target, newObj, args)
 		if err != nil {
 			return nil, err

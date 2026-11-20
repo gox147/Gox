@@ -188,6 +188,46 @@ func GetProxyTrapMethod(handler Value, trapName string) (Value, bool) {
 	return val, true
 }
 
+// ProxyGetSymbolThroughTrap 经 proxy 的 get trap 读取 Symbol 键属性
+// (规范 Get(O, P) 对 proxy 的语义, 键以原值传给 trap)。
+// 关键点: get trap 可在读取中撤销代理 (惰性 revoke) —— trap 执行完毕后
+// 代理可能已失效, 调用方若在取值后继续做规范判定 (如 IsArray), 必须重查
+// 撤销状态 (is-concat-spreadable-is-array-proxy-revoked 族, T5 r8dXes)。
+// 返回 (值, 是否存在, thrown): thrown 非 nil 表示读取途中抛出异常, 调用方
+// 必须如实上抛, 不得静默降级。
+func ProxyGetSymbolThroughTrap(p *Proxy, sym *Symbol) (Value, bool, Value) {
+	if p.IsRevoked || p.Target == nil {
+		return nil, false, NewErrorWithName("TypeError", "Cannot perform 'get' on a proxy that has been revoked")
+	}
+	if trap := GetProxyTrap(p.Handler, "get"); trap != nil {
+		r := CallFunction(trap, p.Handler, p.Target, sym, p)
+		if r == nil {
+			return nil, false, TakeThrownValue()
+		}
+		return r, true, nil
+	}
+	// 无 get trap: 转发 target (嵌套 proxy 递归, 与 vm.proxyForwardGet 同口径)
+	if tp, ok := p.Target.(*Proxy); ok {
+		return ProxyGetSymbolThroughTrap(tp, sym)
+	}
+	if desc, found := LookupSymbolPropertyDescriptorChain(p.Target, sym); found {
+		if acc, isAcc := desc.Value.(*Accessor); isAcc {
+			if acc.Getter != nil && IsCallable(acc.Getter) {
+				gv := CallFunction(acc.Getter, p.Target)
+				if gv == nil {
+					return nil, false, TakeThrownValue()
+				}
+				return gv, true, nil
+			}
+			return nil, false, nil
+		}
+		if desc.Value != nil {
+			return desc.Value, true, nil
+		}
+	}
+	return nil, false, nil
+}
+
 // IsProxy 判断值是否为代理。
 func IsProxy(v Value) bool {
 	_, ok := v.(*Proxy)

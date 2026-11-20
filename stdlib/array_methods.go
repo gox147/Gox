@@ -1334,6 +1334,22 @@ func isConcatSpreadable(v object.Value) (bool, object.Value) {
 	if !isObjectLike(v) {
 		return false, nil
 	}
+	// proxy 的 @@isConcatSpreadable 读取必须经 get trap (规范 Get(O, P)):
+	// trap 可在读取中撤销代理 (惰性 revoke), 随后的缺省 IsArray 须对
+	// revoked proxy 抛 TypeError —— 直接走静态描述符链查会绕过 trap,
+	// 撤销永远不发生 (is-concat-spreadable-is-array-proxy-revoked.js,
+	// T5 r8dXes)。
+	if p, isProxy := v.(*object.Proxy); isProxy {
+		sv, _, thrown := object.ProxyGetSymbolThroughTrap(p, object.GetGlobalSymbol("Symbol.isConcatSpreadable"))
+		if thrown != nil {
+			return false, thrown
+		}
+		if sv != nil && !isUndefinedValue(sv) {
+			return sv.IsTruthy(), nil
+		}
+		// 缺省 IsArray: revoked proxy 在此抛 TypeError (trap 内撤销生效)。
+		return isArrayValueOrThrow(v)
+	}
 	if desc, found := object.LookupSymbolPropertyDescriptorChain(v, object.GetGlobalSymbol("Symbol.isConcatSpreadable")); found {
 		var sv object.Value
 		if acc, isAcc := desc.Value.(*object.Accessor); isAcc {

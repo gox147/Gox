@@ -36,6 +36,15 @@ func setupJSON() *object.Object {
 				replacerFn = r
 			case *object.Closure:
 				replacerFn = r
+			default:
+				// 规范 JSON.stringify step 4b: replacer 是对象且不可调用时,
+				// 先 ? IsArray(replacer) —— revoked proxy 在此抛 TypeError
+				// (replacer-array-proxy-revoked 族, T5 r8dXes)。
+				if !object.IsCallable(args[1]) {
+					if p, isProxy := args[1].(*object.Proxy); isProxy && (p.IsRevoked || p.Target == nil) {
+						return object.NewErrorWithName("TypeError", "Cannot perform 'IsArray' on a proxy that has been revoked")
+					}
+				}
 			}
 		}
 
@@ -221,6 +230,13 @@ func jsValueToJSONIndent(v object.Value, currentIndent, indent string, replacerA
 	v = jsonValueWithToJSON(v)
 	if ev := object.TakeThrownValue(); ev != object.UndefinedSingleton {
 		return "", false, ev
+	}
+
+	// 规范 SerializeJSONProperty step 4a: value 为对象时先 ? IsArray(value)
+	// —— revoked proxy 在此抛 TypeError (value-object/array-proxy-revoked
+	// 族, 顶层与嵌套值共用本函数, T5 r8dXes)。
+	if p, isProxy := v.(*object.Proxy); isProxy && (p.IsRevoked || p.Target == nil) {
+		return "", false, object.NewErrorWithName("TypeError", "Cannot perform 'IsArray' on a proxy that has been revoked")
 	}
 
 	switch val := v.(type) {

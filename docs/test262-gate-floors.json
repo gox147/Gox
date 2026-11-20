@@ -10,10 +10,10 @@
       "total": 23832
     },
     "built-ins": {
-      "floor_pct": 82.0485,
-      "set_at": "2026-11-20T12:54:25Z",
+      "floor_pct": 82.0778,
+      "set_at": "2026-11-20T16:36:12Z",
       "commit": "",
-      "basis": "批末抬升：本批实际 82.3485% - 容差 0.3pp",
+      "basis": "批末抬升：本批实际 82.3778% - 容差 0.3pp",
       "total": 23879
     },
     "all": {
@@ -294,6 +294,15 @@
       "total": 47711,
       "suite": "all",
       "prev_floor_pct": 84.3162
+    },
+    {
+      "floor_pct": 82.0778,
+      "set_at": "2026-11-20T16:36:12Z",
+      "commit": "",
+      "basis": "批末抬升：本批实际 82.3778% - 容差 0.3pp",
+      "total": 23879,
+      "suite": "built-ins",
+      "prev_floor_pct": 82.0485
     }
   ]
 }
