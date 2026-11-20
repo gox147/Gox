@@ -528,3 +528,54 @@ G-1 收尾仍差硬件覆盖三项（win32/x11/cocoa 三平台真机 audit+bench
 本节全部数字为无硬件兜底口径（Linux x86_64 沙箱，wgpu-software），不进
 闸门、不对外。G-1 收尾仍差硬件覆盖三项（三平台真机 audit+bench、
 swapchain 真机点亮对照数字），需真机，不标 done。
+
+## 2026-11-20 08:00 执行窗口复跑核销（Linux x86_64 32 核沙箱，无 GPU 硬件，全部为兜底口径：不进闸门、不对外）
+
+### 背景与范围
+
+main 自 02:00 窗口（dfb9bab）起经四次提交漂移至 d4e6a04（11146db GPU
+接入层测试钉住、988067d/8d16f2a 为 T3-1/T3-4/T3-5 性能侧、d4e6a04 为
+gfx 全量 `-tags gpu` 段错误根因处置 —— GPU 探针改 `GOX_GPU_PROBE=1`
+显式 opt-in）。本窗口做漂移后首次 GPU 三轨全量核销，纯核销运行，
+无 Go 渲染代码变更。
+
+### 环境备注（后续窗口复用）
+
+本沙箱 `/usr/local/go` 默认工具链为 go1.21.4，与 go.mod（go 1.26.2）
+不匹配，直接编译报 `compile: version "go1.21.4" does not match go tool
+version "go1.26.2"`。须同时设 `PATH=/usr/local/go-new/bin:$PATH` 与
+`GOROOT=/usr/local/go-new`（只改 PATH 不改 GOROOT 会因 std 缓存交叉
+编译 6 目标全 FAIL）。2026-11-20 08:00 窗口实测记录。
+
+### 三轨核销（gpu-track-audit.sh --xcompile）
+
+nogpu=none / wgpu=software（兜底口径）/ cgo=none —— 与 11-08 ~ 11-20
+02:00 基线逐项一致，无漂移；接入面不变（swapchain 已接线真机待验、
+移动端不接入、CI gpu 跑批在位）。交叉编译矩阵（CGO_ENABLED=0）：
+windows/amd64+arm64、linux/amd64+arm64（-tags gpu）、darwin/amd64+
+arm64（-tags gpu,nofakecgo）共 6 目标全 ok；js/wasm 维持已知不支持。
+
+### 回归与视觉闸门
+
+- `go test ./gfx/gpu`（nogpu 轨）与 `go test -tags gpu ./gfx/gpu`
+  （wgpu 轨）均绿；
+- `TestGPUSnapshotAB26` PASS，差异像素阈值 0 —— Prism 视觉一致性
+  零退化维持（G-4 闸门未被本窗口触碰）；
+- `TestGPUPresentPixelExact` / `TestSwapchainGate` 全绿；
+- x11 swapchain e2e（GOX_GPU_X11_E2E=1 + xvfb-run 独立进程）PASS
+  —— 窗口化点亮链路在软件适配器兜底口径下保持可用。
+
+### CI 留证链（run 44638383349，main@d4e6a04）
+
+兜底口径 job 全 step success（守卫 / 双轨测试 / 26 组件 A/B / x11
+e2e / audit / bench），硬件口径 job 按 `GPU_HARDWARE_RUNNER` 变量
+守卫正确 skipped。同 commit 上 ci、mobile-smoke、release、
+desktop-shots 四条 workflow 亦全 success —— 11-19 02:10 观察到的
+ci.yml 与 mobile-smoke 长红（gfx 字体扫描用例）已由后续提交修复，
+main 全绿。
+
+### 诚实口径
+
+本节全部数字为无硬件兜底口径（Linux x86_64 沙箱，wgpu-software），
+不进闸门、不对外。G-1 收尾仍差硬件覆盖三项（三平台真机 audit+bench
+出可信对照数字、swapchain 真机点亮对照数字），需真机，不标 done。
