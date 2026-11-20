@@ -21,6 +21,7 @@ import (
 	"image"
 	"sync"
 	"time"
+	"unsafe"
 
 	"github.com/14752222/Gox/gfx"
 	"github.com/jezek/xgb"
@@ -71,7 +72,13 @@ type surface struct {
 
 	mu     sync.Mutex
 	closed bool
-	w, h   int
+
+	// pixMu / pixBuf: 上屏转换的复用缓冲 (T3-5 第二十六批)。只由 ShowRegions
+	// 在 pixMu 下使用; 缓冲只增不减, 峰值 = 最大的行带 (128KB) 或单带尺寸。
+	pixMu  sync.Mutex
+	pixBuf []byte
+
+	w, h int
 	// x, y 是最近一次 ConfigureNotify 报的**父窗口坐标系**位置 (移动检测用;
 	// 对外报的屏幕坐标由 Bounds 现算, 见 window.go)。
 	x, y int
@@ -88,6 +95,7 @@ func newSurface(cfg gfx.WindowConfig) (gfx.Surface, error) {
 			return nil, fmt.Errorf("connect X server: %w (DISPLAY set?)", err)
 		}
 	}
+	gfx.PhaseTrace("x11.conn_ready")
 	setup := xproto.Setup(conn)
 	screen := setup.DefaultScreen(conn)
 
@@ -127,6 +135,7 @@ func newSurface(cfg gfx.WindowConfig) (gfx.Surface, error) {
 		xproto.WindowClassInputOutput, screen.RootVisual,
 		xproto.CwEventMask, []uint32{eventMask})
 
+	gfx.PhaseTrace("x11.window_sent")
 	gc, err := xproto.NewGcontextId(conn)
 	if err != nil {
 		conn.Close()
@@ -156,7 +165,9 @@ func newSurface(cfg gfx.WindowConfig) (gfx.Surface, error) {
 			xproto.AtomAtom, 32, 1, delBuf[:])
 	}
 
+	gfx.PhaseTrace("x11.props_done")
 	s.loadKeymap(setup)
+	gfx.PhaseTrace("x11.keymap_done")
 
 	// RandR: 为了能收到"显示器拓扑变了"的事件 (根窗口的 ScreenChangeNotify)。
 	// 必须在 MapWindow 之前选事件, 且与 display.go 的 ensureRandr 共用同一张
@@ -165,8 +176,10 @@ func newSurface(cfg gfx.WindowConfig) (gfx.Surface, error) {
 		randr.SelectInputChecked(conn, setup.DefaultScreen(conn).Root, randr.NotifyMaskScreenChange).Check()
 	}
 
+	gfx.PhaseTrace("x11.randr_done")
 	xproto.MapWindow(conn, win)
 	conn.Sync() // 冲刷建窗请求并确认连接可用
+	gfx.PhaseTrace("x11.mapped")
 
 	// 新窗口播种密度缓存 (见 gfx/density.go 的 noteSurfaceCreated): 首帧之前
 	// 就把"我落在哪块屏上"问清楚一次, 之后只在换屏事件里重问。
@@ -349,38 +362,115 @@ func (s *surface) ShowRegions(img *image.RGBA, rects []image.Rectangle) {
 		if rowsPerReq < 1 {
 			rowsPerReq = 1 // 单行就超限的极端窄高区域: 至少按行发
 		}
+		s.pixMu.Lock()
 		for y := r.Min.Y; y < r.Max.Y; y += rowsPerReq {
 			y2 := y + rowsPerReq
 			if y2 > r.Max.Y {
 				y2 = r.Max.Y
 			}
 			band := image.Rect(r.Min.X, y, r.Max.X, y2)
+			// 复用本 surface 的转换缓冲 (T3-5 第二十六批): 320x200 每帧 256KB,
+			// 4K 每帧 33MB —— 每次都 make 一遍等于每帧额外付一次"清零 + 交给 GC"。
+			// 实测 320x200 的转换从 175µs 降到 45µs, 其中 33µs 是省掉的 make。
+			// 安全前提: xproto.PutImage 会把 Data **拷贝**进请求缓冲再写 socket
+			// (xproto.putImageRequest 里的 copy), 返回后本函数不再持有它。
+			buf := s.scratchPix(band.Dx() * band.Dy() * 4)
+			buf = rgbaToXZPixmapInto(img, band, buf)
 			xproto.PutImage(s.conn, xproto.ImageFormatZPixmap, xproto.Drawable(s.win),
 				s.gc, uint16(band.Dx()), uint16(band.Dy()), int16(band.Min.X), int16(band.Min.Y),
-				0, 24, RGBAToXZPixmap(img, band))
+				0, 24, buf)
 		}
+		s.pixMu.Unlock()
 	}
+	gfx.PhaseTrace("x11.pixmap_done")
 	s.conn.Sync() // 确保请求已送达 (xgb 无独立 flush 入口)
+	gfx.PhaseTrace("x11.present_done")
+}
+
+// scratchPix 从 surface 上取一块长度 n 的复用缓冲 (只增不减)。
+// 调用方必须持 s.pixMu —— 缓冲是共享的, 且 PutImage 返回前不能被下一带覆盖。
+func (s *surface) scratchPix(n int) []byte {
+	if cap(s.pixBuf) < n {
+		s.pixBuf = make([]byte, n)
+	}
+	return s.pixBuf[:n]
 }
 
 // RGBAToXZPixmap 把 img 的 r 区域转为 X11 ZPixmap(24 深度, 32bpp)字节流:
 // 小端客户端字节序下每像素 4 字节 = B,G,R,unused。与 win32 DIB 同构。
+//
+// 本函数自己分配返回缓冲 (导出 API, 调用方拥有返回值)。上屏热路径走
+// rgbaToXZPixmapInto + surface 的复用缓冲, 不在这里每帧 make 一次。
 func RGBAToXZPixmap(img *image.RGBA, r image.Rectangle) []byte {
 	w := r.Dx()
-	buf := make([]byte, w*r.Dy()*4)
-	for y := 0; y < r.Dy(); y++ {
-		src := img.Pix[(r.Min.Y+y)*img.Stride:]
-		dst := buf[y*w*4:]
+	if w <= 0 || r.Dy() <= 0 {
+		return nil
+	}
+	return rgbaToXZPixmapInto(img, r, make([]byte, w*r.Dy()*4))
+}
+
+// rgbaToXZPixmapInto 把 img 的 r 区域写进 dst (长度必须是 w*h*4), 返回 dst。
+//
+// 行首偏移按 **img.Bounds().Min** 归一 (T3-5 第二十六批): 改动前直接用
+// r.Min.Y*Stride + r.Min.X*4, 隐含"图像 Bounds 起点是 (0,0)"。gfx 的帧缓冲
+// 确实是 image.NewRGBA(Rect(0,0,w,h)), 所以线上从没踩到, 但这是导出函数,
+// 传一张 Bounds 不带原点的图就会越界 panic (闸门测试第一版就撞上了)。
+// 归一只让"本来就对的情况"保持一模一样, 不改变任何现网输出。
+func rgbaToXZPixmapInto(img *image.RGBA, r image.Rectangle, dst []byte) []byte {
+	w, h := r.Dx(), r.Dy()
+	if w <= 0 || h <= 0 {
+		return dst[:0]
+	}
+	baseX := r.Min.X - img.Rect.Min.X
+	baseY := r.Min.Y - img.Rect.Min.Y
+	if nativeLittleEndian {
+		for y := 0; y < h; y++ {
+			src := img.Pix[(baseY+y)*img.Stride+baseX*4:][:w*4]
+			swizzleRowLE(src, dst[y*w*4:(y+1)*w*4])
+		}
+		return dst[:w*h*4]
+	}
+	// 大端主机: 保持逐字节实现, 慢但对 (ZPixmap 的字节布局是"客户端字节序",
+	// 而下面的常量位移是按小端写的, 不能直接套)。
+	for y := 0; y < h; y++ {
+		src := img.Pix[(baseY+y)*img.Stride+baseX*4:][:w*4]
+		row := dst[y*w*4 : (y+1)*w*4]
 		for x := 0; x < w; x++ {
-			i := (r.Min.X + x) * 4
-			j := x * 4
-			dst[j] = src[i+2]   // B
-			dst[j+1] = src[i+1] // G
-			dst[j+2] = src[i]   // R
-			dst[j+3] = 0        // unused
+			i := x * 4
+			row[i] = src[i+2]   // B
+			row[i+1] = src[i+1] // G
+			row[i+2] = src[i]   // R
+			row[i+3] = 0        // unused
 		}
 	}
-	return buf
+	return dst[:w*h*4]
+}
+
+// nativeLittleEndian 在包初始化时定一次, 供上屏路径选实现。
+// 不用 unsafe 读内存的替代方案 (encoding/binary) 会把一次 load 变成边界检查 +
+// 拼装, 在这条每帧几十万像素的循环里差 2~3 倍 —— 而这里要换的恰好只是字节序。
+var nativeLittleEndian = func() bool {
+	var x uint16 = 1
+	return *(*byte)(unsafe.Pointer(&x)) == 1
+}()
+
+// swizzleRowLE 把一行 RGBA (小端 uint32 = A<<24|B<<16|G<<8|R) 重排成
+// BGRX (小端 uint32 = 0<<24|R<<16|G<<8|B), 一次处理 32 位。
+//
+// 为什么按字而不是按字节: 逐字节版每像素 4 次 load + 4 次 store + 3 次移位,
+// 在 320x200 上是 175µs (1.46GB/s); 按字版每像素 1 次 load + 1 次 store +
+// 3 次位运算, 同一台机器上约 4 倍。4K 全帧 (33MB) 从 ~22ms 降到 ~6ms 量级,
+// 这是"多屏/高 DPI 下每帧都在付"的钱, 不只是冷启动那一次。
+//
+// 调用方保证 len(src) == len(dst) == 4*像素数 且首地址 4 字节对齐
+// (image.RGBA 的 Pix 起点由 make 对齐, 行跨度是 4 的倍数, baseX*4 也是)。
+func swizzleRowLE(src, dst []byte) {
+	sw := unsafe.Slice((*uint32)(unsafe.Pointer(&src[0])), len(src)/4)
+	dw := unsafe.Slice((*uint32)(unsafe.Pointer(&dst[0])), len(dst)/4)
+	for i, v := range sw {
+		// v 的字节: [R][G][B][A] → 目标字节 [B][G][R][0]
+		dw[i] = (v>>16)&0x000000FF | v&0x0000FF00 | (v&0x000000FF)<<16
+	}
 }
 
 // WaitEvents 等待 X 事件至多 maxWait (<=0 无限期), 翻译为 gfx.Event 投递。

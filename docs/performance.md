@@ -3451,3 +3451,141 @@ ls bench-results/perf-ab-20261120-12*.json
 原始档（`bench-results/perf-ab-20261120-*.json`）：`-123119`（候选 20 轮）、`-123952`
 （变体 Y）、`-125129`（变体 W）、`-123459/-123713`（A/A，改造前）、
 `-124513/-124621/-124706/-124813/-124913/-124957/-125035/-125844`（A/A，改造后）。
+
+---
+
+### 12.27 T3-5 第二十六批：先给首帧一把尺子，再把每帧都在付的像素搬运砍掉一半（2026-11-21 凌晨批）
+
+§12.22 / §3.4.9 / §12.24 把冷启动的**引擎侧**连续收口之后，首帧 9ms 里剩下的
+靶子全在 GUI 侧（建窗 / 字体 / Layout / Draw / 上屏）。问题是届时只有"总数 9ms"
+一个数：知道要动 GUI，但不知道动哪一段，而 §12.26.4 又刚证明本机 A/B 对 2%
+量级的分辨力有限。**猜 + 低分辨力 = 白干**，所以本批先造尺子，再用尺子挑靶子。
+
+#### 12.27.1 尺子：`GOX_STARTUP_PHASE=1` 阶段探针
+
+`gfx/startup_phase.go` + 全链路 12 个采样点（`mount.*` / `frame.*` / `x11.*`）。
+默认**完全关闭**（一次 atomic 读就返回），由 CLI 边界读 `GOX_STARTUP_PHASE`
+显式打开 —— 与 devmode / 字体预取 / 显示预热同一条纪律：库不自己读环境变量。
+
+```bash
+GOX_STARTUP_PHASE=1 ./gox scripts/bench/coldstart_gui.js 2>&1 | grep gox-phase
+gox-phase    +1.244ms mount.enter
+gox-phase    +1.256ms x11.conn_ready
+gox-phase    +1.377ms x11.window_sent
+gox-phase    +1.782ms mount.create_done
+gox-phase    +2.382ms frame.layout_done
+gox-phase    +2.571ms frame.draw_done
+gox-phase    +2.789ms x11.pixmap_done
+gox-phase    +2.812ms x11.present_done
+gox-phase    +2.814ms frame.present_done
+```
+
+两只闸门（`gfx/startup_phase_test.go`）：关着时必须**一个字都不打**（它是默认
+路径，顺手打一行就会污染所有 GUI 脚本的 stderr）；开着时格式固定
+`gox-phase %+9.3fms <name>` —— 下一批要拿它做 A/B 解析，格式漂移会让脚本静默读不到数。
+
+**口径边界（引用时必须带上）**：零点取 `gfx` 包初始化，不是进程 exec。所以
+"进程 exec + Go runtime + 133 个包 init"那 2.8ms 不在表里，要用 §12.22.1 的
+`gox version` 墙钟单独量；探针自身每次 3~10µs，也进测量。
+
+#### 12.27.2 首帧分解（同机 9 次中位，Xvfb 1024×768，320×200 窗口）
+
+| 段 | 中位 | 说明 |
+|---|---|---|
+| 预建窗（gfx init → `mount.enter`） | **1.146 ms** | SetupGlobals + 脚本解析编译 + `h()` 建树 |
+| 建窗（`mount.enter` → `create_done`） | **0.603 ms** | 含 5 次同步往返 |
+| ├ X11 属性/原子（2×internAtom + 2×ChangeProperty） | 0.145 ms | 各一次 RT |
+| ├ 键盘映射（GetKeyboardMapping） | 0.086 ms | 只在首次按键时需要 |
+| ├ RandR 选事件（QueryExtension + SelectInput.Check） | 0.088 ms | 2 次 RT |
+| └ MapWindow + Sync | 0.170 ms | |
+| Layout | **0.690 ms** | 含等字体后台预取 |
+| Draw | **0.193 ms** | |
+| 上屏（含像素搬运） | **0.241 ms** | 本轮靶子 |
+| └ 像素搬运 + PutImage | 0.217 ms | |
+| └ Sync | 0.026 ms | |
+| **首帧总计（gfx init → 上屏）** | **2.914 ms** | 与外部 9ms 的差额见 12.27.1 的口径边界 |
+
+顺带量到一条与 §12.22 不一致的事实，记在这里免得下一批再按旧数算账：
+`SetupGlobals` 在**冷进程里**（`eval.setupglobals_done - eval.compile_done`）约
+**0.49ms**，是 bench 里 224µs 的两倍多 —— bench 跑 3000 轮时页与分支预测早就热了。
+所以"引擎侧上限 2.9%"是针对**热基准**的算术，冷进程里那块的分母实际更大；
+这不改变"惰性化不值得做"的结论（它要动的是同一批工作），但以后拿 §12.22 的
+262µs 当分母做减法时要注意口径。
+
+#### 12.27.3 改动：像素搬运按 32 位字重排 + 复用缓冲
+
+`ShowRegions` 每帧把整帧（或每个脏区）从 RGBA 转成 X 的 BGRX 字节流，改动前是
+**逐像素 4 次 load + 4 次 store**，且每次都 `make` 一块新缓冲：
+
+| 项 | 之前 | 现在 |
+|---|---|---|
+| 循环 | 每像素 4 字节读写 | 每像素 1 次 32 位 load + 1 次 store + 3 次位运算 |
+| 缓冲 | 每带 `make` 一次（320×200 每帧 256KB，4K 每帧 33MB） | `surface.pixBuf` 复用，只增不减 |
+| 字节序 | 硬编码小端假设 | 包初始化判定一次，大端主机走原来的逐字节实现 |
+
+370 行那段"为什么按字"不是修辞：`make` 一块 256KB 并且清零，比它省下的位运算
+贵得多 —— 分离测量是 44.5µs（纯重排，5.7GB/s）对 77µs（含 make），差了 33µs。
+
+| 口径（同机） | 之前 | 现在 | 变化 |
+|---|---|---|---|
+| 320×200 转换（微基准，3 轮中位） | 175.0–183.4µs | **50.9–60.7µs**（0 allocs） | **−70%** |
+| 4K 全帧 `ShowRegions`（`BenchmarkPresent4K_CPU_X11`，5x，8 轮交替） | 28,337,278 ns/op | **13,593,028 ns/op** | **−52.03%，8/8 轮胜** |
+| 4K 脏区 512×512（20x，8 轮交替） | 894,422 ns/op | **452,272 ns/op** | **−49.43%，8/8 轮胜** |
+| 进程级首帧（320×200，20 轮配对） | 8.18 ms | **7.96 ms** | −2.75%，13/20 轮胜 |
+
+原始档：`bench-results/perf-ab-20261120-160839.json`（4K 全帧）、
+`...-160852.json`（4K 脏区）。
+
+**首帧那 −0.22ms 要克制地读**：方向与预测一致（上屏段 0.365→0.241ms），但
+13/20 的胜率在 §12.26.4 给出的分辨率边缘。真正站得住的收益是**每帧**的：
+4K 全帧从 28ms 到 13.6ms 意味着"高 DPI / 多屏下能不能用"这一档被直接改变，
+而它同时还在首帧路径上（用户第一次看见窗口的那一帧也要过这条）。
+
+#### 12.27.4 留痕：闸门第一版就把一个旧 bug 撞出来了
+
+`RGBAToXZPixmap` 原实现用 `r.Min.Y*Stride + r.Min.X*4` 定位，隐含"图像 Bounds
+起点是 (0,0)"。gfx 的帧缓冲确实是 `image.NewRGBA(Rect(0,0,w,h))`，所以线上
+从没踩到；但这是**导出函数**，传一张 `Bounds` 不带原点的图就 `slice bounds out of
+range`（闸门用它做 case 3 时直接 panic）。
+
+处置：行首偏移按 `img.Bounds().Min` 归一。对"本来就对的情况"输出逐字节不变
+（case 1/2 覆盖整图、子矩形、奇数宽、非零起点），对非零原点从 panic 变成正确 ——
+这条属于"优化顺带把边界守住"，不是行为变更，所以没另开提交。
+
+闸门本身（`gfx/x11/pixelswap_gate_test.go`）用"旧实现当基准"的方式钉死：
+`referenceSwizzle` 是改动前逐字节实现的原样拷贝，新实现必须在任意宽度（1..16，
+含奇数）、任意子矩形、任意起点下与它**逐字节一致**。手写几个期望值是不够的 ——
+按 32 位字重排最容易错的正是"宽度为奇数 / 子矩形起点不在行首"这两类。
+
+#### 12.27.5 本轮没有动的三块（留给下一批，附已量好的价格）
+
+| 靶子 | 价格 | 为什么本批不动 |
+|---|---|---|
+| 键盘映射（首帧后第一批按键才需要） | 0.086ms | 要改"按键事件里同步补加载"的时序，得单独一组真按键 e2e；本批没时间做那个闸门 |
+| 2×internAtom 串行往返（可流水化） | 0.145ms 里的一半左右 | 收益 <1.5%，小于首帧支架分辨率；等尺子做得更细再动 |
+| Layout 0.69ms（含等字体预取） | 0.69ms | 需要先把"等预取"与"布局本身"分开量，否则改布局等于改等待，A/B 会互相污染 |
+
+结论按 2026-11-04 的口径写：**冷启动线本批的收益是"每帧 52%"与"首帧 ~2%"**，
+不是"首帧快一半"；对外引用必须带这一句，且 4K 数字属于多屏/高 DPI 场景，
+不能写成"普通窗口启动快 2 倍"。
+
+#### 12.27.6 复现命令
+
+```bash
+# 首帧分解（默认关闭，开着才有输出；探针自身 3~10µs）
+GOX_STARTUP_PHASE=1 ./gox scripts/bench/coldstart_gui.js 2>&1 | grep gox-phase
+
+# 转换闸门（改动前后都必须绿）+ 两条微基准
+go test ./gfx/x11/ -run 'RGBAToXZ' -count=1 -v
+go test ./gfx/x11/ -run '^$' -bench 'RGBAToXZPixmap' -benchtime 500x -count 3
+
+# 探针闸门（关着不许出声 / 开着格式固定）
+go test ./gfx/ -run 'StartupPhase' -count=1 -v
+
+# 4K 上屏 A/B（需 4K Xvfb；本仓口径 ≥8 轮交替）
+Xvfb :96 -screen 0 3840x2160x24 &
+DISPLAY=:96 ./scripts/perf-ab.sh --pkg ./gfx --bench 'BenchmarkPresent4K_CPU_X11$' \
+  --benchtime 5x --runs 8 --no-gate --label "上屏 4K 全帧"
+DISPLAY=:96 ./scripts/perf-ab.sh --pkg ./gfx --bench 'BenchmarkPresent4K_CPU_X11_Dirty' \
+  --benchtime 20x --runs 8 --no-gate --label "上屏 4K 脏区"
+```

@@ -48,6 +48,12 @@ func main() {
 	// 建窗时后台预热默认字体 (T3-5 第十六批): 库默认关闭, 由这里显式打开 —
 	// 只有"真的要开窗"的进程才付这份后台 I/O, 且它盖在建窗的 socket 往返上。
 	gfx.EnableFontPrefetch()
+	// 首帧阶段探针 (T3-5 第二十六批): 默认关闭; 只在显式要求时往 stderr 打
+	// 各阶段相对时刻 (gfx.PhaseTrace 的开关)。同样是 CLI 边界读环境变量 ——
+	// 库不自己读, 否则"被链接进某进程"就会改变它的 stderr。
+	if os.Getenv("GOX_STARTUP_PHASE") != "" {
+		gfx.EnableStartupPhase()
+	}
 	// 建窗用的显示连接提前建好 (T3-5 第十八批): 必须排在字体预取之前生效 ——
 	// 两者都在"脚本 import gx/gfx"那一刻触发, 顺序见 gfx/display_prewarm.go。
 	// 同样默认关闭, 由 CLI 边界显式打开 (库不因为被链接就连显示服务器)。

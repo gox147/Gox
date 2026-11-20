@@ -1,0 +1,72 @@
+{
+  "tool": "perf-ab.sh",
+  "generated_at": "2026-11-20T16:08:52Z",
+  "label": "T3-5 二十六批: 上屏 4K 脏区 512x512",
+  "bench": "BenchmarkPresent4K_CPU_X11_Dirty",
+  "benchtime": "20x",
+  "runs": 8,
+  "base": {
+    "rev": "HEAD",
+    "commit": "127ee57",
+    "dirty": false
+  },
+  "candidate": {
+    "commit": "127ee57",
+    "dirty": true
+  },
+  "ns_per_op": {
+    "base_median": 894422.0,
+    "candidate_median": 452271.5,
+    "gain_pct": 49.43421561634217
+  },
+  "b_per_op": {
+    "base_median": 0.0,
+    "candidate_median": 0.0
+  },
+  "allocs_per_op": {
+    "base_median": 0.0,
+    "candidate_median": 0.0
+  },
+  "rounds_candidate_faster": 8,
+  "rounds_counted": 8,
+  "outlier": "keep",
+  "outliers_dropped": {
+    "rounds": 0,
+    "base_samples": 0,
+    "candidate_samples": 0
+  },
+  "kept_rounds": [
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8
+  ],
+  "threshold_pct": 5.0,
+  "verdict": "pass",
+  "samples": {
+    "base": [
+      917902.0,
+      894889.0,
+      916194.0,
+      865525.0,
+      889881.0,
+      905509.0,
+      893955.0,
+      872561.0
+    ],
+    "candidate": [
+      469908.0,
+      466479.0,
+      425759.0,
+      436525.0,
+      470575.0,
+      438064.0,
+      399042.0,
+      495977.0
+    ]
+  }
+}

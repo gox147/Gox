@@ -1,0 +1,72 @@
+{
+  "tool": "perf-ab.sh",
+  "generated_at": "2026-11-20T16:08:39Z",
+  "label": "T3-5 二十六批: 上屏 4K 全帧 (字级重排+复用缓冲)",
+  "bench": "BenchmarkPresent4K_CPU_X11$",
+  "benchtime": "5x",
+  "runs": 8,
+  "base": {
+    "rev": "HEAD",
+    "commit": "127ee57",
+    "dirty": false
+  },
+  "candidate": {
+    "commit": "127ee57",
+    "dirty": true
+  },
+  "ns_per_op": {
+    "base_median": 28337277.5,
+    "candidate_median": 13593028.0,
+    "gain_pct": 52.03128458617805
+  },
+  "b_per_op": {
+    "base_median": 0.0,
+    "candidate_median": 0.0
+  },
+  "allocs_per_op": {
+    "base_median": 0.0,
+    "candidate_median": 0.0
+  },
+  "rounds_candidate_faster": 8,
+  "rounds_counted": 8,
+  "outlier": "keep",
+  "outliers_dropped": {
+    "rounds": 0,
+    "base_samples": 0,
+    "candidate_samples": 0
+  },
+  "kept_rounds": [
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8
+  ],
+  "threshold_pct": 5.0,
+  "verdict": "pass",
+  "samples": {
+    "base": [
+      29269647.0,
+      28308601.0,
+      29888449.0,
+      27904765.0,
+      29741449.0,
+      27652204.0,
+      28356986.0,
+      28317569.0
+    ],
+    "candidate": [
+      14247425.0,
+      13945391.0,
+      13060307.0,
+      13778349.0,
+      12961454.0,
+      13477623.0,
+      13143781.0,
+      13708433.0
+    ]
+  }
+}

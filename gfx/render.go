@@ -1741,6 +1741,7 @@ func (a *app) redraw() {
 
 	if full {
 		Layout(root, w, h)
+		PhaseTrace("frame.layout_done")
 		// 平台视频表面 (S8) 在**本帧布局算完之后**对齐 (见 video.go):
 		// 它是叠在窗口之上的另一层, 不参与脏矩形 diff, 位置就是刚刚算出的 Box。
 		flushVideoSurfaces(a)
@@ -1754,7 +1755,9 @@ func (a *app) redraw() {
 		FillRect(a.img, Rect{0, 0, w, h}, white)
 		Draw(a.img, root)
 		a.drawFocusRing(a.img)
+		PhaseTrace("frame.draw_done")
 		a.presentSurface().ShowRegions(a.img, nil)
+		PhaseTrace("frame.present_done")
 		devFrameTick(true)
 		return
 	}
@@ -2160,6 +2163,7 @@ func Mount(root *GuiNode, cfg WindowConfig) (*Window, error) {
 		return nil, fmt.Errorf("no window backend available on this platform")
 	}
 	runtime.LockOSThread()
+	PhaseTrace("mount.enter")
 
 	// 默认字体在后台与建窗并行加载 (T3-5 第十六批, 见 font_prefetch.go):
 	// 字体初始化是首次文本测量的一次性开销 (本机 1.78ms), 与 X11 握手没有
@@ -2174,6 +2178,7 @@ func Mount(root *GuiNode, cfg WindowConfig) (*Window, error) {
 	if err != nil {
 		return nil, fmt.Errorf("create window: %w", err)
 	}
+	PhaseTrace("mount.create_done")
 	// 呈现包装器 (GPU 合成 / 软媒体视频帧) 在建窗之后、首帧之前套上: 事件/
 	// 尺寸/窗口操作仍走平台 Surface (a.surface), 只有 Show/ShowRegions 与
 	// 事件等待换成包装面 (a.present, 见 presentSurface)。包装失败时链上跳过
@@ -2217,5 +2222,6 @@ func Mount(root *GuiNode, cfg WindowConfig) (*Window, error) {
 	}
 
 	a.redraw() // 首帧
+	PhaseTrace("mount.first_frame_done")
 	return win, nil
 }
